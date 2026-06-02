@@ -11,6 +11,8 @@
 [![Issues](https://img.shields.io/github/issues/Julflips/nerv-printer-addon)](https://github.com/Julflips/nerv-printer-addon/issues)
 [![Downloads](https://img.shields.io/github/downloads/Julflips/nerv-printer-addon/total)](https://github.com/Julflips/nerv-printer-addon/releases)
 [![Stars](https://img.shields.io/github/stars/Julflips/nerv-printer-addon)](https://github.com/Julflips/nerv-printer-addon/stargazers)
+<br><br>
+[![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/UeDVMhTT4A)
 </div>
 
 ## Carpet (Flat) Printer
