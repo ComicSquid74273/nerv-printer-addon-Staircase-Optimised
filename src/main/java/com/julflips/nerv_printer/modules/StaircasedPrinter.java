@@ -476,7 +476,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     File mapFile;
 
     public StaircasedPrinter() {
-        super(Addon.CATEGORY, "staircased-printer", "Automatically builds full-block maps with staircasing from nbt files.");
+        super(Addon.CATEGORY, "fullblock-printer", "Automatically builds fullblock maps with optional staircasing from nbt files.");
     }
 
     @Override
@@ -933,7 +933,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         // Swap into Hotbar
         if (toBeSwappedSlot != -1) {
-            Utils.swapIntoHotbar(toBeSwappedSlot, availableHotBarSlots);
+            swapIntoHotbar(toBeSwappedSlot);
             toBeSwappedSlot = -1;
             if (postSwapDelay.get() != 0) {
                 timeoutTicks = postSwapDelay.get();
@@ -1012,7 +1012,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 if (SlaveSystem.isSlave() && checkpoints.isEmpty()) {
                     refillMiningInventory();
                 } else {
-                    HashMap<Item, Integer> requiredItems = getRequiredItems(mapCorner, workingInterval, availableSlots.size(), map);
+                    HashMap<Item, Integer> requiredItems = getRequiredItems();
                     Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
                     refillBuildingInventory(invInformation.getRight());
                 }
@@ -1251,7 +1251,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void refillBuildingInventory(HashMap<Item, Integer> invMaterial) {
         //Fills restockList with required build materials
         restockList.clear();
-        HashMap<Item, Integer> requiredItems = getRequiredItems(mapCorner, workingInterval, availableSlots.size(), map);
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
         for (Item item : invMaterial.keySet()) {
             int oldAmount = requiredItems.remove(item);
             requiredItems.put(item, oldAmount - invMaterial.get(item));
@@ -1633,7 +1633,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private int getDumpSlot() {
-        HashMap<Item, Integer> requiredItems = getRequiredItems(mapCorner, workingInterval, availableSlots.size(), map);
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
         Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
         if (invInformation.getLeft().isEmpty()) {
             return -1;
@@ -1641,11 +1641,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return invInformation.getLeft().get(0);
     }
 
-    public HashMap<Item, Integer> getRequiredItems(BlockPos mapCorner, Pair<Integer, Integer> interval, int availableSlotsSize, Pair<Block, Integer>[][] map) {
+    private HashMap<Item, Integer> getRequiredItems() {
         //Calculate the next items to restock
         //Iterate over map. Player has to be able to see the complete map area
         HashMap<Item, Integer> requiredItems = new HashMap<>();
-        for (int x = interval.getLeft(); x <= interval.getRight(); x++) {
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x++) {
             for (int z = 0; z < 128; z++) {
                 BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(x, map[x][z].getRight(), z));
                 if (blockState.isAir() && map[x][z] != null) {
@@ -1654,7 +1654,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     if (!requiredItems.containsKey(material)) requiredItems.put(material, 0);
                     requiredItems.put(material, requiredItems.get(material) + 1);
                     //Check if the item fits into inventory. If not, undo the last increment and return
-                    if (Utils.stacksRequired(requiredItems.values()) > availableSlotsSize) {
+                    if (Utils.stacksRequired(requiredItems.values()) > availableSlots.size()) {
                         requiredItems.put(material, requiredItems.get(material) - 1);
                         return requiredItems;
                     }
@@ -1662,6 +1662,102 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
         return requiredItems;
+    }
+
+    private void swapIntoHotbar(int slot) {
+        Map<Item, Integer> itemSlot = new HashMap<>();
+        Map<Item, Integer> itemDistance = new HashMap<>();
+        Map<Item, Integer> itemFrequency = new HashMap<>();
+
+        int targetSlot = availableHotBarSlots.get(0);
+
+        // Scan hotbar
+        for (int hotbarSlot : availableHotBarSlots) {
+            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
+            if (!stack.isEmpty()) {
+                Item item = stack.getItem();
+                itemSlot.put(item, hotbarSlot);
+                itemDistance.put(item, -1); // -1 = never used
+                itemFrequency.put(item, 0);
+            } else {
+                targetSlot = hotbarSlot;
+                break;
+            }
+        }
+
+        // PRIORITY 1: empty slot → instant choice
+        if (mc.player.getInventory().getStack(targetSlot).isEmpty()) {
+            Utils.performSwap(slot, targetSlot);
+            return;
+        }
+
+        // Get blocks until next use of items in hotbar
+        int blockCounter = 0;
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x++) {
+            for (int z = 0; z < 128; z++) {
+                if (!Utils.isInInterval(workingInterval, x)) break;
+                blockCounter++;
+
+                BlockState state = MapAreaCache.getCachedBlockState(mapCorner.add(x, map[x][z].getRight(), z));
+                if (state.isAir()) {
+                    Block block = map[x][z].getLeft();
+                    if (block == null) continue;
+
+                    Item item = block.asItem();
+
+                    if (itemDistance.containsKey(item) &&
+                        itemDistance.get(item) == -1) {
+                        itemDistance.put(item, blockCounter);
+                    }
+                }
+            }
+        }
+
+        // Count frequency of items in hotbar
+        for (int hotbarSlot : availableHotBarSlots) {
+            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
+            if (!stack.isEmpty()) {
+                Item item = stack.getItem();
+                itemFrequency.put(item, itemFrequency.get(item) + 1);
+            }
+        }
+
+        // Choose best candidate
+        Item bestItem = null;
+        int bestDistance = -2; // lower than -1
+        int bestFrequency = -1;
+
+        for (Item item : itemSlot.keySet()) {
+            int distance = itemDistance.get(item); // -1 = never used
+            int frequency = itemFrequency.get(item);
+
+            boolean better = false;
+
+            // PRIORITY 2: never used (-1)
+            if (distance == -1 && bestDistance != -1) {
+                better = true;
+            }
+            // PRIORITY 3: hotbar frequency
+            else if (frequency > bestFrequency) {
+                better = true;
+            }
+            // PRIORITY 4: distance to next use
+            else if (frequency == bestFrequency && distance > bestDistance && bestDistance != -1) {
+                better = true;
+            }
+
+            if (better) {
+                bestItem = item;
+                bestDistance = distance;
+                bestFrequency = frequency;
+            }
+        }
+
+        if (bestItem != null) {
+            targetSlot = itemSlot.get(bestItem);
+        }
+
+        Utils.performSwap(slot, targetSlot);
     }
 
     // MapPrinter Interface for Slave Logic

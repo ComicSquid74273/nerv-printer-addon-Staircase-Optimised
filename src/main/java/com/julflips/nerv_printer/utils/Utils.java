@@ -75,37 +75,6 @@ public final class Utils {
         return slots;
     }
 
-    public static HashMap<Item, Integer> getRequiredItems(BlockPos mapCorner, Pair<Integer, Integer> interval, int linesPerRun, int availableSlotsSize, Block[][] map) {
-        //Calculate the next items to restock
-        //Iterate over map. Player has to be able to see the complete map area
-        HashMap<Item, Integer> requiredItems = new HashMap<>();
-        boolean isStartSide = true;
-        for (int x = interval.getLeft(); x <= interval.getRight(); x += linesPerRun) {
-            for (int z = 0; z < 128; z++) {
-                for (int lineBonus = 0; lineBonus < linesPerRun; lineBonus++) {
-                    int adjustedX = x + lineBonus;
-                    if (adjustedX > interval.getRight()) break;
-                    int adjustedZ = z;
-                    if (!isStartSide) adjustedZ = 127 - z;
-                    BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, adjustedZ));
-                    if (blockState.isAir() && map[adjustedX][adjustedZ] != null) {
-                        //ChatUtils.info("Add material for: " + mapCorner.add(x + lineBonus, 0, adjustedZ).toShortString());
-                        Item material = map[adjustedX][adjustedZ].asItem();
-                        if (!requiredItems.containsKey(material)) requiredItems.put(material, 0);
-                        requiredItems.put(material, requiredItems.get(material) + 1);
-                        //Check if the item fits into inventory. If not, undo the last increment and return
-                        if (stacksRequired(requiredItems.values()) > availableSlotsSize) {
-                            requiredItems.put(material, requiredItems.get(material) - 1);
-                            return requiredItems;
-                        }
-                    }
-                }
-            }
-            isStartSide = !isStartSide;
-        }
-        return requiredItems;
-    }
-
     public static Pair<ArrayList<Integer>, HashMap<Item, Integer>> getInvInformation(HashMap<Item, Integer> requiredItems, ArrayList<Integer> availableSlots) {
         //Return a list of slots to be dumped and a Hashmap of material-amount we can keep in the inventory
         ArrayList<Integer> dumpSlots = new ArrayList<>();
@@ -196,52 +165,19 @@ public final class Utils {
         return -1;
     }
 
-    public static void swapIntoHotbar(int slot, ArrayList<Integer> hotBarSlots) {
-        HashMap<Item, Integer> itemFrequency = new HashMap<>();
-        HashMap<Item, Integer> itemSlot = new HashMap<>();
-        int targetSlot = hotBarSlots.get(0);
+    public static void performSwap(int fromSlot, int toSlot) {
+        mc.player.getInventory().setSelectedSlot(toSlot);
 
-        //Search the most frequent item in the hotbar
-        for (int i : hotBarSlots) {
-            if (!mc.player.getInventory().getStack(i).isEmpty()) {
-                Item item = mc.player.getInventory().getStack(i).getItem();
-                if (!itemFrequency.containsKey(item)) {
-                    itemFrequency.put(item, 1);
-                    itemSlot.put(item, i);
-                } else {
-                    itemFrequency.put(item, itemFrequency.get(item) + 1);
-                }
-            }
-        }
-        int topFrequency = 0;
-        ArrayList<Item> topFrequencyItems = new ArrayList<>();
-        for (Item item : itemFrequency.keySet()) {
-            if (itemFrequency.get(item) > topFrequency) {
-                topFrequency = itemFrequency.get(item);
-                topFrequencyItems = new ArrayList<>(Collections.singletonList(item));
-            } else if (itemFrequency.get(item) == topFrequency) {
-                topFrequencyItems.add(item);
-            }
-        }
-        if (!topFrequencyItems.isEmpty()) {
-            Random random = new Random();
-            Item item = topFrequencyItems.get(random.nextInt(topFrequencyItems.size()));
-            targetSlot = itemSlot.get(item);
-        }
+        IClientPlayerInteractionManager cim =
+            (IClientPlayerInteractionManager) mc.interactionManager;
 
-        //Prefer emtpy slots
-        for (int i : hotBarSlots) {
-            if (mc.player.getInventory().getStack(i).isEmpty()) {
-                targetSlot = i;
-            }
-        }
-
-        //info("Swapping " + slot + " into " + targetSlot);
-        mc.player.getInventory().setSelectedSlot(targetSlot);
-
-        IClientPlayerInteractionManager cim = (IClientPlayerInteractionManager) mc.interactionManager;
-        cim.clickSlot(mc.player.currentScreenHandler.syncId, slot, targetSlot, SlotActionType.SWAP, mc.player);
-        //mc.getNetworkHandler().sendPacket(new ClickSlotC2SPacket(0, slot, targetSlot, 0, SlotActionType.SWAP, new ItemStack(Items.AIR), Int2ObjectMaps.emptyMap()));
+        cim.clickSlot(
+            mc.player.currentScreenHandler.syncId,
+            fromSlot,
+            toSlot,
+            SlotActionType.SWAP,
+            mc.player
+        );
     }
 
     public static void iterateBlocks(BlockPos startingPos, int horizontalRadius, int verticalRadius, BiConsumer<BlockPos, BlockState> function) {

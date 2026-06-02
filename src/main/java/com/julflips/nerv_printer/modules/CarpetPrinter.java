@@ -143,7 +143,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Boolean> northToSouth = sgGeneral.add(new BoolSetting.Builder()
+    private final Setting<Boolean> startNorthToSouth = sgGeneral.add(new BoolSetting.Builder()
         .name("north-to-south")
         .description("Start printing on the north side and go south. Flipped if disabled.")
         .defaultValue(true)
@@ -818,7 +818,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
         // Swap into Hotbar
         if (toBeSwappedSlot != -1) {
-            Utils.swapIntoHotbar(toBeSwappedSlot, availableHotBarSlots);
+            swapIntoHotbar(toBeSwappedSlot);
             toBeSwappedSlot = -1;
             if (postSwapDelay.get() != 0) {
                 timeoutTicks = postSwapDelay.get();
@@ -856,7 +856,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (state == State.Dumping) {
             int dumpSlot = getDumpSlot();
             if (dumpSlot == -1) {
-                HashMap<Item, Integer> requiredItems = Utils.getRequiredItems(mapCorner, workingInterval, linesPerRun.get(), availableSlots.size(), map);
+                HashMap<Item, Integer> requiredItems = getRequiredItems();
                 Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
                 refillInventory(invInformation.getRight());
                 state = State.Walking;
@@ -909,8 +909,8 @@ public class CarpetPrinter extends Module implements MapPrinter {
             checkpoints.remove(0);
             switch (checkpointAction.getLeft()) {
                 case "lineEnd":
-                    boolean atCornerSide = goal.z == mapCorner.toCenterPos().z;
-                    calculateBuildingPath(atCornerSide, false);
+                    boolean reachedNorthSide = goal.z == mapCorner.toCenterPos().z;
+                    calculateBuildingPath(reachedNorthSide, false);
                     ArrayList<BlockPos> newErrors = Utils.getInvalidPlacements(mapCorner, workingInterval, map, knownErrors);
                     for (BlockPos errorPos : newErrors) {
                         BlockPos relativePos = errorPos.subtract(mapCorner);
@@ -1109,7 +1109,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
     private void refillInventory(HashMap<Item, Integer> invMaterial) {
         //Fills restockList with required items
         restockList.clear();
-        HashMap<Item, Integer> requiredItems = Utils.getRequiredItems(mapCorner, workingInterval, linesPerRun.get(), availableSlots.size(), map);
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
         for (Item item : invMaterial.keySet()) {
             int oldAmount = requiredItems.remove(item);
             requiredItems.put(item, oldAmount - invMaterial.get(item));
@@ -1228,17 +1228,17 @@ public class CarpetPrinter extends Module implements MapPrinter {
 
     // Path and Building Management
 
-    private void calculateBuildingPath(boolean cornerSide, boolean sprintFirst) {
+    private void calculateBuildingPath(boolean startNorthSide, boolean sprintFirst) {
         //Iterate over map and skip completed lines. Player has to be able to see the complete map area
         //Fills checkpoints list
-        boolean isStartSide = cornerSide;
+        boolean northToSouth = startNorthSide;
         checkpoints.clear();
         for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x += linesPerRun.get()) {
             if (!Utils.isInInterval(workingInterval, x)) continue;
             boolean lineFinished = true;
             for (int lineBonus = 0; lineBonus < linesPerRun.get(); lineBonus++) {
                 int adjustedX = x + lineBonus;
-                if (adjustedX > workingInterval.getRight()) break;
+                if (!Utils.isInInterval(workingInterval, adjustedX)) break;
                 for (int z = 0; z < 128; z++) {
                     BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, z));
                     if (blockState.isAir() && map[adjustedX][z] != null) {
@@ -1251,14 +1251,14 @@ public class CarpetPrinter extends Module implements MapPrinter {
             if (lineFinished) continue;
             Vec3d cp1 = mapCorner.toCenterPos().add(x, 0, 0);
             Vec3d cp2 = mapCorner.toCenterPos().add(x, 0, 127);
-            if (isStartSide) {
+            if (northToSouth) {
                 checkpoints.add(new Pair(cp1, new Pair("", null)));
                 checkpoints.add(new Pair(cp2, new Pair("lineEnd", null)));
             } else {
                 checkpoints.add(new Pair(cp2, new Pair("", null)));
                 checkpoints.add(new Pair(cp1, new Pair("lineEnd", null)));
             }
-            isStartSide = !isStartSide;
+            northToSouth = !northToSouth;
         }
         if (checkpoints.size() > 0 && sprintFirst) {
             //Make player sprint to the start of the map
@@ -1271,7 +1271,7 @@ public class CarpetPrinter extends Module implements MapPrinter {
         if (!SlaveSystem.isSlave()) SlaveSystem.startAllSlaves();
         if (availableSlots.isEmpty()) setupSlots();
         MapAreaCache.reset(mapCorner);
-        calculateBuildingPath(northToSouth.get(), true);
+        calculateBuildingPath(startNorthToSouth.get(), true);
         checkpoints.add(0, new Pair(dumpStation.getLeft(), new Pair("dump", null)));
         state = State.Walking;
     }
@@ -1321,12 +1321,170 @@ public class CarpetPrinter extends Module implements MapPrinter {
     }
 
     private int getDumpSlot() {
-        HashMap<Item, Integer> requiredItems = Utils.getRequiredItems(mapCorner, workingInterval, linesPerRun.get(), availableSlots.size(), map);
+        HashMap<Item, Integer> requiredItems = getRequiredItems();
         Pair<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
         if (invInformation.getLeft().isEmpty()) {
             return -1;
         }
         return invInformation.getLeft().get(0);
+    }
+
+    private HashMap<Item, Integer> getRequiredItems() {
+        // Calculate the next items to restock
+        HashMap<Item, Integer> requiredItems = new HashMap<>();
+        boolean northToSouth = true;
+        boolean hasFoundAir = false;
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x += linesPerRun.get()) {
+            for (int z = 0; z < 128; z++) {
+                for (int lineBonus = 0; lineBonus < linesPerRun.get(); lineBonus++) {
+                    int adjustedX = x + lineBonus;
+                    if (adjustedX > workingInterval.getRight()) break;
+                    int adjustedZ = z;
+                    if (!northToSouth) adjustedZ = 127 - z;
+                    BlockState blockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, adjustedZ));
+                    if (blockState.isAir() && map[adjustedX][adjustedZ] != null) {
+                        if (!hasFoundAir) {
+                            hasFoundAir = true;
+                            BlockState oppositeBlockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, 127 - adjustedZ));
+                            // If the first air block does not have an opposite air block, the snake pattern got reversed at some point
+                            // We reverse the search too
+                            if (!oppositeBlockState.isAir() && z < 64) {
+                                northToSouth = !northToSouth;
+                                adjustedZ = 127 - z;
+                            }
+                        }
+                        //ChatUtils.info("Add material for: " + mapCorner.add(x + lineBonus, 0, adjustedZ).toShortString());
+                        Item material = map[adjustedX][adjustedZ].asItem();
+                        if (!requiredItems.containsKey(material)) requiredItems.put(material, 0);
+                        requiredItems.put(material, requiredItems.get(material) + 1);
+                        //Check if the item fits into inventory. If not, undo the last increment and return
+                        if (Utils.stacksRequired(requiredItems.values()) > availableSlots.size()) {
+                            requiredItems.put(material, requiredItems.get(material) - 1);
+                            return requiredItems;
+                        }
+                    }
+                }
+            }
+            northToSouth = !northToSouth;
+        }
+        return requiredItems;
+    }
+
+    private void swapIntoHotbar(int slot) {
+        Map<Item, Integer> itemSlot = new HashMap<>();
+        Map<Item, Integer> blocksUntilItemUse = new HashMap<>();
+        Map<Item, Integer> itemFrequency = new HashMap<>();
+
+        int targetSlot = availableHotBarSlots.get(0);
+
+        // Scan hotbar
+        for (int hotbarSlot : availableHotBarSlots) {
+            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
+            if (!stack.isEmpty()) {
+                Item item = stack.getItem();
+                itemSlot.put(item, hotbarSlot);
+                blocksUntilItemUse.put(item, -1); // -1 = never used
+                itemFrequency.put(item, 0);
+            } else {
+                targetSlot = hotbarSlot;
+                break;
+            }
+        }
+
+        // PRIORITY 1: empty slot → instant choice
+        if (mc.player.getInventory().getStack(targetSlot).isEmpty()) {
+            Utils.performSwap(slot, targetSlot);
+            return;
+        }
+
+        // Get blocks until next use of items in hotbar
+        int blockCounter = 0;
+        boolean northToSouth = startNorthToSouth.get();
+        boolean hasFoundAir = false;
+        for (int x = workingInterval.getLeft(); x <= workingInterval.getRight(); x += linesPerRun.get()) {
+            if (!Utils.isInInterval(workingInterval, x)) continue;
+
+            for (int z = 0; z < 128; z++) {
+                for (int lineBonus = 0; lineBonus < linesPerRun.get(); lineBonus++) {
+                    int adjustedX = x + lineBonus;
+                    int adjustedZ = z;
+                    if (!northToSouth) adjustedZ = 127 - z;
+                    if (!Utils.isInInterval(workingInterval, adjustedX)) break;
+
+                    blockCounter++;
+                    BlockState state = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, adjustedZ));
+                    if (state.isAir()) {
+                        if (!hasFoundAir) {
+                            hasFoundAir = true;
+                            BlockState oppositeBlockState = MapAreaCache.getCachedBlockState(mapCorner.add(adjustedX, 0, 127 - adjustedZ));
+                            // If the first air block does not have an opposite air block, the snake pattern got reversed at some point
+                            // We reverse the search too
+                            if (!oppositeBlockState.isAir() && z < 64) {
+                                northToSouth = !northToSouth;
+                                adjustedZ = 127 - z;
+                            }
+                        }
+
+                        Block block = map[adjustedX][adjustedZ];
+                        if (block == null) continue;
+
+                        Item item = block.asItem();
+
+                        if (blocksUntilItemUse.containsKey(item) &&
+                            blocksUntilItemUse.get(item) == -1) {
+                            blocksUntilItemUse.put(item, blockCounter);
+                        }
+                    }
+                }
+            }
+            northToSouth = !northToSouth;
+        }
+
+        // Count frequency of items in hotbar
+        for (int hotbarSlot : availableHotBarSlots) {
+            ItemStack stack = mc.player.getInventory().getStack(hotbarSlot);
+            if (!stack.isEmpty()) {
+                Item item = stack.getItem();
+                itemFrequency.put(item, itemFrequency.get(item) + 1);
+            }
+        }
+
+        // Choose best candidate
+        Item bestItem = null;
+        int bestDistance = -2; // lower than -1
+        int bestFrequency = -1;
+
+        for (Item item : itemSlot.keySet()) {
+            int distance = blocksUntilItemUse.get(item); // -1 = never used
+            int frequency = itemFrequency.get(item);
+
+            boolean better = false;
+
+            // PRIORITY 2: never used (-1)
+            if (distance == -1 && bestDistance != -1) {
+                better = true;
+            }
+            // PRIORITY 3: hotbar frequency
+            else if (frequency > bestFrequency) {
+                better = true;
+            }
+            // PRIORITY 4: distance to next use
+            else if (frequency == bestFrequency && distance > bestDistance && bestDistance != -1) {
+                better = true;
+            }
+
+            if (better) {
+                bestItem = item;
+                bestDistance = distance;
+                bestFrequency = frequency;
+            }
+        }
+
+        if (bestItem != null) {
+            targetSlot = itemSlot.get(bestItem);
+        }
+
+        Utils.performSwap(slot, targetSlot);
     }
 
     // MapPrinter Interface for Slave Logic
