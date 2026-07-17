@@ -17,10 +17,17 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 public final class MapAreaCache {
     private static BlockPos mapCorner = null;
     private static Map<ChunkPos, Chunk> cachedChunks = new HashMap<>();
+    private static int minimumRelativeX = 0;
+    private static int maximumRelativeX = 127;
+    private static int minimumRelativeZ = 0;
+    private static int maximumRelativeZ = 127;
 
     public static boolean isWithingMap(BlockPos pos) {
         BlockPos relativePos = pos.subtract(mapCorner);
-        return relativePos.getX() >= 0 && relativePos.getX() < 128 && relativePos.getZ() >= 0 && relativePos.getZ() < 128;
+        return relativePos.getX() >= minimumRelativeX
+            && relativePos.getX() <= maximumRelativeX
+            && relativePos.getZ() >= minimumRelativeZ
+            && relativePos.getZ() <= maximumRelativeZ;
     }
 
     public static boolean isMapAreaClear() {
@@ -34,7 +41,24 @@ public final class MapAreaCache {
     }
 
     public static void reset(BlockPos newCorner) {
+        reset(newCorner, 0, 127, 0, 127);
+    }
+
+    public static void reset(
+        BlockPos newCorner,
+        int minimumX,
+        int maximumX,
+        int minimumZ,
+        int maximumZ
+    ) {
+        if (minimumX > maximumX || minimumZ > maximumZ) {
+            throw new IllegalArgumentException("Invalid map cache bounds.");
+        }
         mapCorner = new BlockPos(newCorner);
+        minimumRelativeX = minimumX;
+        maximumRelativeX = maximumX;
+        minimumRelativeZ = minimumZ;
+        maximumRelativeZ = maximumZ;
         cachedChunks.clear();
     }
 
@@ -53,11 +77,25 @@ public final class MapAreaCache {
         return mc.world.getBlockState(blockPos);
     }
 
+    public static boolean hasBlockData(BlockPos blockPos) {
+        int chunkX = blockPos.getX() >> 4;
+        int chunkZ = blockPos.getZ() >> 4;
+        return mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)
+            || cachedChunks.containsKey(new ChunkPos(chunkX, chunkZ));
+    }
+
     @EventHandler()
     private static void onReceivePacket(PacketEvent.Receive event) {
         if (mapCorner != null && event.packet instanceof UnloadChunkS2CPacket packet) {
             BlockPos chunkCorner = packet.pos().getStartPos();
-            if (isWithingMap(chunkCorner)) {
+            BlockPos oppositeChunkCorner = chunkCorner.add(15, 0, 15);
+            BlockPos relativeStart = chunkCorner.subtract(mapCorner);
+            BlockPos relativeEnd = oppositeChunkCorner.subtract(mapCorner);
+            boolean overlaps = relativeEnd.getX() >= minimumRelativeX
+                && relativeStart.getX() <= maximumRelativeX
+                && relativeEnd.getZ() >= minimumRelativeZ
+                && relativeStart.getZ() <= maximumRelativeZ;
+            if (overlaps) {
                 cachedChunks.put(packet.pos(), mc.world.getChunk(packet.pos().getStartPos()));
             }
         }

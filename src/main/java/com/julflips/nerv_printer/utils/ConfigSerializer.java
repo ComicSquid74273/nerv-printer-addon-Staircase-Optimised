@@ -57,7 +57,8 @@ public final class ConfigSerializer {
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict
     ) throws IOException {
         writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, null);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, null,
+            null, null, null, null);
     }
 
     public static void writeToJson(
@@ -71,10 +72,15 @@ public final class ConfigSerializer {
         Pair<Vec3d, Pair<Float, Float>> dumpStation,
         BlockPos mapCorner,
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
-        Set<ItemStack> toolSet
+        Set<ItemStack> toolSet,
+        Pair<BlockPos, Vec3d> anvil,
+        Pair<BlockPos, Vec3d> enderChest,
+        Pair<BlockPos, Vec3d> craftingTable,
+        HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests
     ) throws IOException {
         writeToJson(file, type, null, cartographyTable, finishedMapChest, usedToolChest, bed,
-            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet);
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet,
+            anvil, enderChest, craftingTable, usedToolChests);
     }
 
     public static void writeToJson(
@@ -89,7 +95,11 @@ public final class ConfigSerializer {
         Pair<Vec3d, Pair<Float, Float>> dumpStation,
         BlockPos mapCorner,
         HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
-        Set<ItemStack> toolSet
+        Set<ItemStack> toolSet,
+        Pair<BlockPos, Vec3d> anvil,
+        Pair<BlockPos, Vec3d> enderChest,
+        Pair<BlockPos, Vec3d> craftingTable,
+        HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests
     ) throws IOException {
         JsonObject root = new JsonObject();
 
@@ -99,6 +109,9 @@ public final class ConfigSerializer {
         if (finishedMapChest != null) root.add("finishedMapChest", blockPosVecPairToJson(finishedMapChest));
         if (usedToolChest != null) root.add("usedToolChest", blockPosVecPairToJson(usedToolChest));
         if (bed != null) root.add("bed", blockPosVecPairToJson(bed));
+        if (anvil != null) root.add("anvil", blockPosVecPairToJson(anvil));
+        if (enderChest != null) root.add("enderChest", blockPosVecPairToJson(enderChest));
+        if (craftingTable != null) root.add("craftingTable", blockPosVecPairToJson(craftingTable));
 
         if (mapMaterialChests != null) {
             JsonArray materialChestsArray = new JsonArray();
@@ -141,6 +154,15 @@ public final class ConfigSerializer {
                 toolSetArray.add(stackObj);
             }
             root.add("toolSet", toolSetArray);
+        }
+
+        if (usedToolChests != null) {
+            JsonObject usedToolChestsObj = new JsonObject();
+            for (Map.Entry<Item, Pair<BlockPos, Vec3d>> entry : usedToolChests.entrySet()) {
+                String itemId = Registries.ITEM.getId(entry.getKey()).toString();
+                usedToolChestsObj.add(itemId, blockPosVecPairToJson(entry.getValue()));
+            }
+            root.add("usedToolChests", usedToolChestsObj);
         }
 
         Gson gson = new GsonBuilder().setPrettyPrinting().create();

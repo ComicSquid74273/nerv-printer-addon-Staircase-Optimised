@@ -9,6 +9,27 @@ public interface MapPrinter {
 
     void mineLine(int minedLines);
 
+    default void mineLine(int minedLines, boolean pairedTraversal) {
+        mineLine(minedLines);
+    }
+
+    default void mineLine(
+        int minedLines,
+        boolean pairedTraversal,
+        boolean reserveWholePair
+    ) {
+        mineLine(minedLines, pairedTraversal);
+    }
+
+    default void mineLine(
+        int minedLines,
+        boolean pairedTraversal,
+        boolean reserveWholePair,
+        long taskId
+    ) {
+        mineLine(minedLines, pairedTraversal, reserveWholePair);
+    }
+
     void addError(BlockPos relativeBlockPos);
 
     void pause();
@@ -21,7 +42,54 @@ public interface MapPrinter {
 
     boolean getActivationReset();
 
+    default boolean isBuildingInProgress() {
+        return false;
+    }
+
+    default boolean isWorkInProgress() {
+        return isBuildingInProgress();
+    }
+
     void skipBuilding();
 
     void slaveFinished(String slave);
+
+    default void slaveFinished(String slave, long taskId) {
+        slaveFinished(slave);
+    }
+
+    default boolean slaveMined(String slave, long taskId) {
+        slaveFinished(slave, taskId);
+        return true;
+    }
+
+    default boolean slaveMined(
+        String slave,
+        long taskId,
+        boolean assignedConnectorsClear
+    ) {
+        return slaveMined(slave, taskId);
+    }
+
+    default void slaveRemoved(String slave) {
+    }
+
+    default void finishMiningCycle(long sessionId) {
+        start();
+    }
+
+    default void slaveMiningCycleFinalized(String slave, long sessionId) {
+    }
+
+    default void slaveSync(String slave) {
+    }
+
+    default void slaveResumed(String slave) {
+    }
+
+    default void slaveIntervalReady(String slave) {
+    }
+
+    default void masterRelationshipChanged() {
+    }
 }

@@ -54,10 +54,14 @@ public final class ConfigDeserializer {
         public Pair<BlockPos, Vec3d> finishedMapChest;
         public Pair<BlockPos, Vec3d> usedToolChest;
         public Pair<BlockPos, Vec3d> bed;
+        public Pair<BlockPos, Vec3d> anvil;
+        public Pair<BlockPos, Vec3d> enderChest;
+        public Pair<BlockPos, Vec3d> craftingTable;
         public ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
         public Pair<Vec3d, Pair<Float, Float>> dumpStation;
         public BlockPos mapCorner;
         public HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;
+        public HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests;
         public Set<ItemStack> toolSet;
     }
 
@@ -87,6 +91,12 @@ public final class ConfigDeserializer {
             data.usedToolChest = obj != null ? jsonToBlockPosVecPair(obj) : null;
             obj = getObj(root, "bed");
             data.bed = obj != null ? jsonToBlockPosVecPair(obj) : null;
+            obj = getObj(root, "anvil");
+            data.anvil = obj != null ? jsonToBlockPosVecPair(obj) : null;
+            obj = getObj(root, "enderChest");
+            data.enderChest = obj != null ? jsonToBlockPosVecPair(obj) : null;
+            obj = getObj(root, "craftingTable");
+            data.craftingTable = obj != null ? jsonToBlockPosVecPair(obj) : null;
 
             data.mapMaterialChests = new ArrayList<>();
             if (root.has("mapMaterialChests")) {
@@ -132,6 +142,19 @@ public final class ConfigDeserializer {
                     Identifier id = Identifier.of(o.get("item").getAsString());
                     data.toolSet.add(
                         new ItemStack(Registries.ITEM.get(id))
+                    );
+                }
+            }
+
+            data.usedToolChests = new HashMap<>();
+            if (root.has("usedToolChests")) {
+                JsonObject usedToolChestsObj = root.getAsJsonObject("usedToolChests");
+                for (String key : usedToolChestsObj.keySet()) {
+                    Identifier id = Identifier.of(key);
+                    Item item = Registries.ITEM.get(id);
+                    data.usedToolChests.put(
+                        item,
+                        jsonToBlockPosVecPair(usedToolChestsObj.getAsJsonObject(key))
                     );
                 }
             }

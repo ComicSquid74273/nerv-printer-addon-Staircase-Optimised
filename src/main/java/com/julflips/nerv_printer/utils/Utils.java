@@ -60,6 +60,21 @@ public final class Utils {
         return stacks;
     }
 
+    public static int stacksRequired(Map<Item, Integer> amounts) {
+        ArrayList<InventoryCapacity.Requirement> requirements = new ArrayList<>();
+        for (Map.Entry<Item, Integer> entry : amounts.entrySet()) {
+            requirements.add(new InventoryCapacity.Requirement(
+                entry.getValue(),
+                maximumStackSize(entry.getKey())
+            ));
+        }
+        return InventoryCapacity.slotsRequired(requirements);
+    }
+
+    public static int maximumStackSize(Item item) {
+        return new ItemStack(item).getMaxCount();
+    }
+
     public static ArrayList<Integer> getAvailableSlots(HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materials) {
         ArrayList<Integer> slots = new ArrayList<>();
         for (int slot = 0; slot < 36; slot++) {
@@ -84,8 +99,10 @@ public final class Utils {
             Item item = mc.player.getInventory().getStack(slot).getItem();
             if (requiredItems.containsKey(item)) {
                 int requiredAmount = requiredItems.get(item);
-                int requiredModulusAmount = (requiredAmount - (requiredAmount / 64) * 64);
-                if (requiredModulusAmount == 0) requiredModulusAmount = 64;
+                int maximumStackSize = maximumStackSize(item);
+                int requiredModulusAmount =
+                    requiredAmount - (requiredAmount / maximumStackSize) * maximumStackSize;
+                if (requiredModulusAmount == 0) requiredModulusAmount = maximumStackSize;
                 int stackAmount = mc.player.getInventory().getStack(slot).getCount();
                 // ChatUtils.info(material.getName().getString() + " | Required: " + requiredModulusAmount + " | Inv: " + stackAmount);
                 if (requiredAmount > 0 && requiredModulusAmount <= stackAmount) {
@@ -341,9 +358,9 @@ public final class Utils {
             .thenComparing(File::getName));                // then sort alphabetically
 
         for (File file : files) {
-            // Only check if file was used if not moving to finished folder
-            // since they are not in the map folder in that case
-            if ((!startedFiles.contains(file) || areMoved) &&
+            // Always exclude files already selected during this activation.
+            // A failed finished-folder move must never print the same map twice.
+            if (!startedFiles.contains(file) &&
                 file.isFile() && file.getName().toLowerCase().endsWith(".nbt")) {
                 startedFiles.add(file);
                 return file;

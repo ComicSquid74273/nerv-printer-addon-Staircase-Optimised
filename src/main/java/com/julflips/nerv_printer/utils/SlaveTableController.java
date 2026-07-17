@@ -62,16 +62,23 @@ public final class SlaveTableController {
         }
 
         for (String slave : SlaveSystem.slaves) {
-            WLabel name = table.add(theme.label(slave)).expandCellX().widget();
+            boolean removalPending = SlaveSystem.isRemovalPending(slave);
+            String displayName = removalPending
+                ? slave + " (removing)"
+                : slave;
+            WLabel name = table.add(theme.label(displayName)).expandCellX().widget();
 
             WCheckbox visible = table.add(theme.checkbox(SlaveSystem.activeSlavesDict.get(slave))).widget();
             visible.action = () -> {
-                SlaveSystem.activeSlavesDict.put(slave, visible.checked);
-                SlaveSystem.queueDM(slave, visible.checked ? "start" : "pause");
+                if (SlaveSystem.isRemovalPending(slave)) {
+                    rebuild();
+                    return;
+                }
+                SlaveSystem.setSlavePaused(slave, !visible.checked);
                 rebuild();
             };
 
-            if (!visible.checked) name.color = Color.GRAY;
+            if (!visible.checked || removalPending) name.color = Color.GRAY;
 
             WMinus remove = table.add(theme.confirmedMinus()).widget();
             remove.action = () -> {
