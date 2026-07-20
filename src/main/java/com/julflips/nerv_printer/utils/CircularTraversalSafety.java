@@ -133,9 +133,18 @@ public final class CircularTraversalSafety {
         if (length == 0) {
             return new HorizontalPoint(checkpointX, checkpointZ);
         }
+        double unitX = routeX / length;
+        double unitZ = routeZ / length;
+        double playerForwardProjection =
+            (playerX - checkpointX) * unitX
+                + (playerZ - checkpointZ) * unitZ;
+        double steeringForwardProjection = Math.max(
+            forwardExtension,
+            playerForwardProjection + forwardExtension
+        );
         return new HorizontalPoint(
-            checkpointX + routeX / length * forwardExtension,
-            checkpointZ + routeZ / length * forwardExtension
+            checkpointX + unitX * steeringForwardProjection,
+            checkpointZ + unitZ * steeringForwardProjection
         );
     }
 
@@ -149,11 +158,36 @@ public final class CircularTraversalSafety {
         boolean nearCheckpointCenter,
         boolean crossedCheckpointCenter
     ) {
+        return miningCheckpointProgress(
+            horizontallyOverCheckpoint,
+            stablyStandingOnCheckpoint,
+            nearCheckpointCenter,
+            crossedCheckpointCenter,
+            false
+        );
+    }
+
+    /**
+     * A committed one-block ascent keeps its forward movement until the player
+     * is stably supported by the raised route cell. Entering that cell while
+     * still airborne must not clear forward/jump input and turn the ascent into
+     * a repeated edge fall.
+     */
+    public static MiningCheckpointProgress miningCheckpointProgress(
+        boolean horizontallyOverCheckpoint,
+        boolean stablyStandingOnCheckpoint,
+        boolean nearCheckpointCenter,
+        boolean crossedCheckpointCenter,
+        boolean orderedStepUp
+    ) {
         if (!nearCheckpointCenter && !crossedCheckpointCenter) {
             return MiningCheckpointProgress.APPROACHING;
         }
         if (stablyStandingOnCheckpoint) {
             return MiningCheckpointProgress.REACHED;
+        }
+        if (orderedStepUp && horizontallyOverCheckpoint) {
+            return MiningCheckpointProgress.APPROACHING;
         }
         return horizontallyOverCheckpoint
             ? MiningCheckpointProgress.HOLD_FOR_LANDING
@@ -179,6 +213,29 @@ public final class CircularTraversalSafety {
         return orderedHorizontalCellDistance == 1
             && targetSupportY == previousSupportY + 1
             && playerHorizontalDistanceFromTarget <= 1;
+    }
+
+    /**
+     * A verified ordered ascent owns jump input until stable support confirms
+     * the landing. The generic fixed-duration jump timer is not authoritative
+     * route progress and must not release the key in the middle of an ascent.
+     */
+    public static boolean shouldHoldOrderedStepUpJump(
+        boolean targetSupportSafe,
+        boolean stablyStandingOnTarget,
+        int orderedHorizontalCellDistance,
+        int previousSupportY,
+        int targetSupportY,
+        int playerHorizontalDistanceFromTarget
+    ) {
+        return targetSupportSafe
+            && !stablyStandingOnTarget
+            && isOrderedStepUpTarget(
+                orderedHorizontalCellDistance,
+                previousSupportY,
+                targetSupportY,
+                playerHorizontalDistanceFromTarget
+            );
     }
 
     /**

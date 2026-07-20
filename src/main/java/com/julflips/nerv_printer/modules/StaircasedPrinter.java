@@ -138,6 +138,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final double U_TRAVERSAL_MINIMUM_PROGRESS = 0.10;
     private static final double U_TRAVERSAL_FORWARD_STEERING_EXTENSION =
         1.0;
+    private static final int MINING_RECOVERY_STABLE_SNAPSHOT_TICKS = 2;
     private static final int DEBUG_ACTION_BUDGET_INTERVAL_TICKS = 20;
     private static final int LOCAL_CYCLE_HEARTBEAT_TICKS = 20;
     private static final int BUILD_TOOL_CRITICAL_DURABILITY = 20;
@@ -971,6 +972,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     String pendingSlaveMiningCompletion;
     final LogisticsProgressWatchdog<LogisticsTerminal> logisticsProgressWatchdog =
         new LogisticsProgressWatchdog<>();
+    final StableRecoverySnapshotGate<BlockPos>
+        miningRecoverySnapshotGate =
+            new StableRecoverySnapshotGate<>(
+                MINING_RECOVERY_STABLE_SNAPSHOT_TICKS
+            );
     LogisticsTerminal activeLogisticsTerminal;
     double logisticsDetourStandingY;
     int logisticsDetourAttempts;
@@ -1034,6 +1040,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     String fileMasterRecoveredDimension;
     String fileMasterRecoveredMapCorner;
     boolean fileRecoveryIdentityWarning;
+    boolean miningRecoverySnapshotWaitLogged;
+    BlockPos activeOrderedMiningJumpTarget;
     StaircasedCycleCheckpointStore localCycleCheckpointStore;
     boolean localCycleRecoveryCandidate;
     int recoveredActiveMiningPair;
@@ -1301,6 +1309,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         fileMasterRecoveredDimension = null;
         fileMasterRecoveredMapCorner = null;
         fileRecoveryIdentityWarning = false;
+        miningRecoverySnapshotGate.reset();
+        miningRecoverySnapshotWaitLogged = false;
+        activeOrderedMiningJumpTarget = null;
         localCycleCheckpointStore = null;
         localCycleRecoveryCandidate = false;
         recoveredActiveMiningPair = -1;
@@ -4874,6 +4885,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (!recoverCircularBuildTraversal(inventoryWasLost)) return;
         }
         if (miningRecoveryPending) {
+            if (!hasStableGroundedMiningRecoverySnapshot(
+                "runtime teardown recovery"
+            )) {
+                stopMovement();
+                return;
+            }
             boolean inventoryWasLost = miningRecoveryNeedsTools;
             beginMiningRecovery(inventoryWasLost);
             miningRecoveryPending = false;
@@ -5015,16 +5032,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
 
-        boolean continuingCircularRouteJump =
+        boolean continuingCircularBuildJump =
             jumpTimeout > 0
                 && state == State.Walking
                 && activeCircularBuildPair >= 0
-                && (circularBuildPhase == CircularBuildPhase.OUTBOUND
-                    || circularBuildPhase == CircularBuildPhase.CONNECTOR
-                    || circularBuildPhase == CircularBuildPhase.RETURN);
+                && (circularBuildPhase
+                        == CircularBuildPhase.OUTBOUND
+                    || circularBuildPhase
+                        == CircularBuildPhase.CONNECTOR
+                    || circularBuildPhase
+                        == CircularBuildPhase.RETURN);
+        BlockPos orderedMiningJumpTarget =
+            currentOrderedMiningStepUpJumpTarget();
+        updateOrderedMiningJumpTransition(
+            orderedMiningJumpTarget
+        );
+        boolean continuingOrderedMiningJump =
+            orderedMiningJumpTarget != null;
+        boolean continuingOrderedRouteJump =
+            continuingCircularBuildJump
+                || continuingOrderedMiningJump;
         if (jumpTimeout > 0) {
             jumpTimeout--;
-            if (!continuingCircularRouteJump) {
+            if (!continuingOrderedRouteJump) {
                 Utils.setJumpPressed(true);
                 return;
             }
@@ -5501,7 +5531,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
                 return;
             }
-            if (continuingCircularRouteJump) {
+            if (continuingOrderedRouteJump) {
                 debugActiveBuildMovementTransition(
                     "jump",
                     "continuing held route jump with block actions active pair="
@@ -5528,7 +5558,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         } else {
             return;
         }
-        Utils.setJumpPressed(continuingCircularRouteJump);
+        Utils.setJumpPressed(continuingOrderedRouteJump);
         if (checkpoints.isEmpty()) {
             if (state.equals(State.MiningUTraversal)) {
                 restartCurrentMiningAssignment();
@@ -5555,19 +5585,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean followingLogisticsDetour = !checkpoints.isEmpty()
             && isLogisticsDetourCheckpoint(checkpoints.getFirst());
         if (!followingLogisticsDetour
-            && !continuingCircularRouteJump
+            && !continuingOrderedRouteJump
             && (mc.options.forwardKey.isPressed() || mc.options.backKey.isPressed())
             && jumpTimeout <= 0) {
-            boolean orderedMiningJump =
+            boolean orderedMiningRoute =
                 state == State.MiningUTraversal
                     && !checkpoints.isEmpty()
                     && isUTraversalRouteStep(
                         checkpoints.getFirst()
                     );
-            BlockPos target = orderedMiningJump
-                ? orderedAutoJumpTarget(goal)
-                : null;
-            if (!orderedMiningJump) {
+            BlockPos target = null;
+            if (!orderedMiningRoute) {
                 Direction direction =
                     Direction.fromHorizontalDegrees(
                         mc.player.getYaw()
@@ -5589,7 +5617,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     "started auto-jump obstacle="
                         + target.toShortString()
                         + " orderedGoal="
-                            + orderedMiningJump
+                            + orderedMiningRoute
                         + " raisedUEntry="
                             + isRaisedCircularBuildEntry(target)
                         + " yaw=" + mc.player.getYaw()
@@ -6177,10 +6205,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     checkpoints.add(new Pair(mc.player.getEntityPos(), new Pair<>("miningLineEnd", null)));
                     break;
                 case "removeUBlock":
-                    boolean reachAssignedTeardown =
-                        isReachAssignedUCheckpoint(
-                            currentCheckpoint
-                        );
                     activeUTraversalPreviousSupport =
                         supportBelowCheckpoint(goal);
                     uTraversalProgressWatchdog.reset();
@@ -6203,12 +6227,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                             return;
                         }
                         state = State.AwaitUBlockBreak;
-                        teardownMovementOverlapAllowed =
-                            !reachAssignedTeardown;
-                        if (reachAssignedTeardown) {
-                            jumpTimeout = 0;
-                            stopCircularMiningMotion();
-                        }
+                        teardownMovementOverlapAllowed = true;
                         TeardownBreakStatus breakStatus =
                             driveOrderedTeardownBreak(
                                 miningPos,
@@ -6385,6 +6404,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             goal = followingCircularConnector
                 ? currentCircularConnectorGoal()
                 : checkpoints.get(0).getLeft();
+            BlockPos nextOrderedMiningJumpTarget =
+                currentOrderedMiningStepUpJumpTarget();
+            if (nextOrderedMiningJumpTarget != null) {
+                updateOrderedMiningJumpTransition(
+                    nextOrderedMiningJumpTarget
+                );
+                Utils.setJumpPressed(true);
+            }
         }
 
         //Set yaw rotation
@@ -6393,7 +6420,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         // Set print mode
         String nextAction = checkpoints.get(0).getRight().getLeft();
         if (state.equals(State.MiningUTraversal)) {
-            mc.player.setSprinting(false);
+            mc.player.setSprinting(
+                isUTraversalRouteStep(checkpoints.getFirst())
+                    && sprinting.get() != SprintMode.Off
+            );
         } else if (circularBuildPhase == CircularBuildPhase.CONNECTOR
             || circularBuildPhase == CircularBuildPhase.RECOVERY
             || circularBuildPhase == CircularBuildPhase.RECOVERY_EXIT
@@ -11824,7 +11854,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
-    private BlockPos orderedAutoJumpTarget(Vec3d goal) {
+    private BlockPos currentOrderedMiningStepUpJumpTarget() {
+        if (state != State.MiningUTraversal
+            || checkpoints == null
+            || checkpoints.isEmpty()
+            || !isUTraversalRouteStep(checkpoints.getFirst())) {
+            return null;
+        }
+        Vec3d goal = checkpoints.getFirst().getLeft();
         BlockPos goalSupport = supportBelowCheckpoint(goal);
         BlockPos previousSupport =
             activeUTraversalPreviousSupport;
@@ -11839,7 +11876,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + Math.abs(
                     goalSupport.getZ() - previousSupport.getZ()
                 );
-        if (!CircularTraversalSafety.isOrderedStepUpTarget(
+        if (!CircularTraversalSafety.shouldHoldOrderedStepUpJump(
+            isSafeUCheckpointSupport(goal),
+            isGroundedOnCheckpointSupport(goal),
             orderedRouteStep,
             previousSupport.getY(),
             goalSupport.getY(),
@@ -11848,6 +11887,40 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return null;
         }
         return goalSupport;
+    }
+
+    private void updateOrderedMiningJumpTransition(
+        BlockPos target
+    ) {
+        if (Objects.equals(
+            activeOrderedMiningJumpTarget,
+            target
+        )) {
+            return;
+        }
+        if (target != null) {
+            debugLog(
+                "Movement",
+                "committed ordered U step-up target="
+                    + target.toShortString()
+                    + " previousSupport="
+                        + activeUTraversalPreviousSupport
+                    + "; holding jump until stable landing"
+            );
+            activeOrderedMiningJumpTarget =
+                new BlockPos(target);
+            return;
+        }
+        if (activeOrderedMiningJumpTarget != null) {
+            debugLog(
+                "Movement",
+                "released ordered U step-up target="
+                    + activeOrderedMiningJumpTarget
+                        .toShortString()
+                    + " player=" + mc.player.getEntityPos()
+            );
+        }
+        activeOrderedMiningJumpTarget = null;
     }
 
     private void stopMovement() {
@@ -11871,9 +11944,45 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private boolean hasStableGroundedMiningRecoverySnapshot(
+        String recovery
+    ) {
+        BlockPos support = mc.player == null
+            ? null
+            : supportBelowCheckpoint(
+                mc.player.getEntityPos()
+            );
+        boolean stable =
+            miningRecoverySnapshotGate.observe(
+                support,
+                mc.player != null
+                    && mc.player.isOnGround()
+            );
+        if (!stable && !miningRecoverySnapshotWaitLogged) {
+            debugLog(
+                "Recovery",
+                recovery
+                    + " is waiting for consecutive grounded "
+                    + "observations of one support; support="
+                    + support
+                    + " grounded="
+                    + (mc.player != null
+                        && mc.player.isOnGround())
+                    + " observations="
+                    + miningRecoverySnapshotGate
+                        .observations()
+            );
+            miningRecoverySnapshotWaitLogged = true;
+        }
+        return stable;
+    }
+
     private void freezeForRecoveryClassification() {
         stopMovement();
         jumpTimeout = 0;
+        miningRecoverySnapshotGate.reset();
+        miningRecoverySnapshotWaitLogged = false;
+        activeOrderedMiningJumpTarget = null;
         if (mc.player == null) return;
         Vec3d velocity = mc.player.getVelocity();
         mc.player.setVelocity(0, velocity.y, 0);
@@ -13176,17 +13285,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 : CircularTraversalSafety
                     .MiningCheckpointProgress.APPROACHING;
         }
-        if (orderedStepUp
-            && horizontallyOver
-            && goal.y - mc.player.getY() > 0.15) {
-            return CircularTraversalSafety
-                .MiningCheckpointProgress.APPROACHING;
-        }
         return CircularTraversalSafety.miningCheckpointProgress(
             horizontallyOver,
             stablyStanding,
             nearCheckpointCenter,
-            crossedCheckpointCenter
+            crossedCheckpointCenter,
+            orderedStepUp
         );
     }
 
@@ -19610,6 +19714,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 }
                 return;
             }
+        }
+
+        if (fileMasterRecoveredPhase
+                == MapCyclePhase.MINING
+            && !hasStableGroundedMiningRecoverySnapshot(
+                "persisted teardown recovery"
+            )) {
+            SlaveSystem.setFileMetadata(
+                FILE_META_STATUS,
+                "WAITING_FOR_STABLE_MINING_RECOVERY_SNAPSHOT"
+            );
+            stopMovement();
+            return;
         }
 
         MapCyclePhase recoveredPhase = fileMasterRecoveredPhase;

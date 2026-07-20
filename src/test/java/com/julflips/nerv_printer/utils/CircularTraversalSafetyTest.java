@@ -21,7 +21,25 @@ class CircularTraversalSafetyTest {
                 1.0
             );
 
-        assertEquals(11.5, point.x());
+        assertEquals(11.6, point.x(), 0.000_001);
+        assertEquals(20.5, point.z());
+    }
+
+    @Test
+    void crossedCheckpointSteeringRemainsAheadAfterLargeOvershoot() {
+        var point =
+            CircularTraversalSafety.orderedForwardSteeringPoint(
+                15.6,
+                20.5,
+                10.5,
+                20.5,
+                9.5,
+                20.5,
+                1.0
+            );
+
+        assertEquals(16.6, point.x(), 0.000_001);
+        assertTrue(point.x() > 15.6);
         assertEquals(20.5, point.z());
     }
 
@@ -233,6 +251,84 @@ class CircularTraversalSafetyTest {
                 156,
                 157,
                 2
+            )
+        );
+    }
+
+    @Test
+    void orderedStepUpKeepsMovingUntilStableLanding() {
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.APPROACHING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                false,
+                true,
+                false,
+                true
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.APPROACHING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                false,
+                false,
+                true,
+                true
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.REACHED,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                true,
+                true,
+                false,
+                true
+            )
+        );
+    }
+
+    @Test
+    void orderedStepUpOwnsJumpUntilTheLandingIsStable() {
+        assertTrue(
+            CircularTraversalSafety.shouldHoldOrderedStepUpJump(
+                true,
+                false,
+                1,
+                98,
+                99,
+                1
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.shouldHoldOrderedStepUpJump(
+                true,
+                false,
+                1,
+                98,
+                99,
+                0
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.shouldHoldOrderedStepUpJump(
+                true,
+                true,
+                1,
+                98,
+                99,
+                0
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.shouldHoldOrderedStepUpJump(
+                false,
+                false,
+                1,
+                98,
+                99,
+                1
             )
         );
     }
