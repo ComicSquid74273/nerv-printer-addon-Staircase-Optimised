@@ -31,8 +31,14 @@ public final class SlaveTableController {
 
         table.add(theme.label("Multi-User: "));
 
-        WButton register = table.add(theme.button("Register players in range")).widget();
-        register.action = SlaveSystem::registerSlaves;
+        if (SlaveSystem.isFileMaster()) {
+            table.add(theme.label("Configured from file-coordination settings"));
+        } else {
+            WButton register = table.add(
+                theme.button("Register players in range")
+            ).widget();
+            register.action = SlaveSystem::registerSlaves;
+        }
 
         WButton pause = table.add(theme.button("Pause all")).widget();
         pause.action = () -> {
@@ -80,11 +86,13 @@ public final class SlaveTableController {
 
             if (!visible.checked || removalPending) name.color = Color.GRAY;
 
-            WMinus remove = table.add(theme.confirmedMinus()).widget();
-            remove.action = () -> {
-                SlaveSystem.removeSlave(slave);
-                rebuild();
-            };
+            if (!SlaveSystem.isFileMaster()) {
+                WMinus remove = table.add(theme.confirmedMinus()).widget();
+                remove.action = () -> {
+                    SlaveSystem.removeSlave(slave);
+                    rebuild();
+                };
+            }
 
             table.row();
         }

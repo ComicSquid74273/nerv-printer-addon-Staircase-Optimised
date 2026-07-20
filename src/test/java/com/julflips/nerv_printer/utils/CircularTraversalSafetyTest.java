@@ -9,6 +9,40 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CircularTraversalSafetyTest {
     @Test
+    void crossedMixedHeightCheckpointKeepsOrderedForwardSteering() {
+        var point =
+            CircularTraversalSafety.orderedForwardSteeringPoint(
+                10.6,
+                20.5,
+                10.5,
+                20.5,
+                9.5,
+                20.5,
+                1.0
+            );
+
+        assertEquals(11.5, point.x());
+        assertEquals(20.5, point.z());
+    }
+
+    @Test
+    void approachingCheckpointStillSteersToItsCenter() {
+        var point =
+            CircularTraversalSafety.orderedForwardSteeringPoint(
+                9.8,
+                20.5,
+                10.5,
+                20.5,
+                9.5,
+                20.5,
+                1.0
+            );
+
+        assertEquals(10.5, point.x());
+        assertEquals(20.5, point.z());
+    }
+
+    @Test
     void generalWalkingBufferCannotMakeRemovalUnsafe() {
         assertEquals(0.15, CircularTraversalSafety.checkpointBuffer(1.0));
         assertEquals(0.15, CircularTraversalSafety.checkpointBuffer(0.2));
@@ -67,6 +101,217 @@ class CircularTraversalSafetyTest {
         assertThrows(
             IllegalArgumentException.class,
             () -> CircularTraversalSafety.checkpointBuffer(Double.NaN)
+        );
+    }
+
+    @Test
+    void crossedCheckpointNeverTurnsAnOvershotStraightRouteBackward() {
+        assertFalse(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.5, 1.49,
+                0.5, 1.5,
+                0.5, 0.5
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.5, 1.5,
+                0.5, 1.5,
+                0.5, 0.5
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.5, 1.8,
+                0.5, 1.5,
+                0.5, 0.5
+            )
+        );
+    }
+
+    @Test
+    void crossedCheckpointWorksInBothDirectionsAndAroundTurns() {
+        assertTrue(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.5, 0.2,
+                0.5, 0.5,
+                0.5, 1.5
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                1.7, 0.5,
+                1.5, 0.5,
+                0.5, 0.5
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                1.3, 0.5,
+                1.5, 0.5,
+                0.5, 0.5
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.2, 0.5,
+                0.5, 0.5,
+                1.5, 0.5
+            )
+        );
+    }
+
+    @Test
+    void crossedCheckpointRejectsDegenerateOrInvalidSegments() {
+        assertFalse(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                0.5, 0.5,
+                0.5, 0.5,
+                0.5, 0.5
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.hasCrossedCheckpointCenter(
+                Double.NaN, 0.5,
+                1.5, 0.5,
+                0.5, 0.5
+            )
+        );
+    }
+
+    @Test
+    void miningCheckpointWaitsForLandingInsteadOfReversing() {
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.HOLD_FOR_LANDING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                false,
+                false,
+                true
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.HOLD_FOR_LANDING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                false,
+                true,
+                false
+            )
+        );
+    }
+
+    @Test
+    void orderedStepUpRemainsEligibleAfterEnteringTargetCell() {
+        assertTrue(
+            CircularTraversalSafety.isOrderedStepUpTarget(
+                1,
+                156,
+                157,
+                1
+            )
+        );
+        assertTrue(
+            CircularTraversalSafety.isOrderedStepUpTarget(
+                1,
+                156,
+                157,
+                0
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.isOrderedStepUpTarget(
+                0,
+                156,
+                157,
+                0
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.isOrderedStepUpTarget(
+                1,
+                156,
+                157,
+                2
+            )
+        );
+    }
+
+    @Test
+    void miningCheckpointRequiresStableSupportBeforeItIsReached() {
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.REACHED,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                true,
+                false,
+                true
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.REACHED,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                true,
+                true,
+                false
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.APPROACHING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                false,
+                false,
+                false,
+                true
+            )
+        );
+        assertEquals(
+            CircularTraversalSafety.MiningCheckpointProgress.APPROACHING,
+            CircularTraversalSafety.miningCheckpointProgress(
+                true,
+                true,
+                false,
+                false
+            )
+        );
+    }
+
+    @Test
+    void orderedStepUpRejectsInvalidDistance() {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> CircularTraversalSafety.isOrderedStepUpTarget(
+                -1,
+                100,
+                101,
+                0
+            )
+        );
+    }
+
+    @Test
+    void routeReversalDistinguishesRecoveryFromTurnsAndStraightWalking() {
+        assertTrue(
+            CircularTraversalSafety.isRouteReversal(
+                0.5, 0.5,
+                0.5, 1.5,
+                0.5, 0.5
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.isRouteReversal(
+                0.5, 0.5,
+                0.5, 1.5,
+                0.5, 2.5
+            )
+        );
+        assertFalse(
+            CircularTraversalSafety.isRouteReversal(
+                0.5, 0.5,
+                0.5, 1.5,
+                1.5, 1.5
+            )
         );
     }
 }

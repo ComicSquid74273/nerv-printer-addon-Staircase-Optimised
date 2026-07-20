@@ -9,4 +9,12 @@ public interface IClientPlayerInteractionManager {
     float getCurrentBreakingProgress();
 
     void clickSlot(int syncId, int slotId, int button, SlotActionType actionType, PlayerEntity player);
+
+    void clickSlotWithForcedFullSync(
+        int syncId,
+        int slotId,
+        int button,
+        SlotActionType actionType,
+        PlayerEntity player
+    );
 }

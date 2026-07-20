@@ -58,7 +58,7 @@ public final class ConfigSerializer {
     ) throws IOException {
         writeToJson(file, type, reset, cartographyTable, finishedMapChest, null, null,
             mapMaterialChests, dumpStation, mapCorner, materialDict, null,
-            null, null, null, null);
+            null, null, null, null, null);
     }
 
     public static void writeToJson(
@@ -80,7 +80,31 @@ public final class ConfigSerializer {
     ) throws IOException {
         writeToJson(file, type, null, cartographyTable, finishedMapChest, usedToolChest, bed,
             mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet,
-            anvil, enderChest, craftingTable, usedToolChests);
+            anvil, enderChest, craftingTable, usedToolChests, null);
+    }
+
+    public static void writeToJson(
+        Path file,
+        String type,
+        Pair<BlockPos, Vec3d> cartographyTable,
+        Pair<BlockPos, Vec3d> finishedMapChest,
+        Pair<BlockPos, Vec3d> usedToolChest,
+        Pair<BlockPos, Vec3d> bed,
+        ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests,
+        Pair<Vec3d, Pair<Float, Float>> dumpStation,
+        BlockPos mapCorner,
+        HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict,
+        Set<ItemStack> toolSet,
+        Pair<BlockPos, Vec3d> anvil,
+        Pair<BlockPos, Vec3d> enderChest,
+        Pair<BlockPos, Vec3d> craftingTable,
+        HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests,
+        Map<Item, Integer> toolMinimumEfficiency
+    ) throws IOException {
+        writeToJson(file, type, null, cartographyTable, finishedMapChest, usedToolChest, bed,
+            mapMaterialChests, dumpStation, mapCorner, materialDict, toolSet,
+            anvil, enderChest, craftingTable, usedToolChests,
+            toolMinimumEfficiency);
     }
 
     public static void writeToJson(
@@ -99,7 +123,8 @@ public final class ConfigSerializer {
         Pair<BlockPos, Vec3d> anvil,
         Pair<BlockPos, Vec3d> enderChest,
         Pair<BlockPos, Vec3d> craftingTable,
-        HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests
+        HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests,
+        Map<Item, Integer> toolMinimumEfficiency
     ) throws IOException {
         JsonObject root = new JsonObject();
 
@@ -151,6 +176,18 @@ public final class ConfigSerializer {
             for (ItemStack stack : toolSet) {
                 JsonObject stackObj = new JsonObject();
                 stackObj.addProperty("item", Registries.ITEM.getId(stack.getItem()).toString());
+                stackObj.addProperty(
+                    "efficiency",
+                    Math.max(
+                        ToolUtils.getEfficiencyLevel(stack),
+                        toolMinimumEfficiency == null
+                            ? 0
+                            : toolMinimumEfficiency.getOrDefault(
+                                stack.getItem(),
+                                0
+                            )
+                    )
+                );
                 toolSetArray.add(stackObj);
             }
             root.add("toolSet", toolSetArray);

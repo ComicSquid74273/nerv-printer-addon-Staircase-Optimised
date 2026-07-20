@@ -26,6 +26,16 @@ class CircularMiningTraversalPlanTest {
 
         assertEquals(START, plan.entry());
         assertEquals(END, plan.exit());
+        assertEquals(
+            List.of(
+                new CircularMiningTraversalPlan.Step(0, -1),
+                new CircularMiningTraversalPlan.Step(1, 0),
+                new CircularMiningTraversalPlan.Step(2, 1),
+                new CircularMiningTraversalPlan.Step(3, 2),
+                new CircularMiningTraversalPlan.Step(4, 3)
+            ),
+            plan.steps()
+        );
         assertSafeAndComplete(cells, plan);
     }
 
@@ -40,6 +50,16 @@ class CircularMiningTraversalPlanTest {
 
         assertEquals(END, plan.entry());
         assertEquals(END, plan.exit());
+        assertEquals(
+            List.of(
+                new CircularMiningTraversalPlan.Step(4, -1),
+                new CircularMiningTraversalPlan.Step(3, -1),
+                new CircularMiningTraversalPlan.Step(2, -1),
+                new CircularMiningTraversalPlan.Step(3, 2),
+                new CircularMiningTraversalPlan.Step(4, 3)
+            ),
+            plan.steps()
+        );
         assertSafeAndComplete(cells, plan);
     }
 
@@ -54,6 +74,16 @@ class CircularMiningTraversalPlanTest {
 
         assertEquals(START, plan.entry());
         assertEquals(START, plan.exit());
+        assertEquals(
+            List.of(
+                new CircularMiningTraversalPlan.Step(0, -1),
+                new CircularMiningTraversalPlan.Step(1, -1),
+                new CircularMiningTraversalPlan.Step(2, -1),
+                new CircularMiningTraversalPlan.Step(1, 2),
+                new CircularMiningTraversalPlan.Step(0, 1)
+            ),
+            plan.steps()
+        );
         assertSafeAndComplete(cells, plan);
     }
 

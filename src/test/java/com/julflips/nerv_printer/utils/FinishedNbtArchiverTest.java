@@ -143,6 +143,108 @@ class FinishedNbtArchiverTest {
     }
 
     @Test
+    void locatesCollisionSuffixedPairByHashAfterCheckpointGap()
+        throws Exception {
+        Path source = write("recover.nbt", "new-raw");
+        Path generated = write(
+            "_generated_compact/recover_compact_circular_u.nbt",
+            "new-compact"
+        );
+        Path finished = temporaryDirectory.resolve("_finished_maps");
+        Files.createDirectories(finished);
+        Files.writeString(finished.resolve("recover.nbt"), "old-raw");
+
+        FinishedNbtArchiver.Result archived =
+            FinishedNbtArchiver.archive(
+                temporaryDirectory,
+                source,
+                generated
+            );
+        FinishedNbtArchiver.LocatedPair located =
+            FinishedNbtArchiver.locateArchivedPair(
+                temporaryDirectory,
+                "recover.nbt",
+                "recover_compact_circular_u.nbt",
+                FileFingerprint.sha256(archived.archivedSource())
+            ).orElseThrow();
+
+        assertEquals(1, located.collisionIndex());
+        assertEquals(archived.archivedSource(), located.archivedSource());
+        assertEquals(
+            archived.archivedGenerated(),
+            located.archivedGenerated()
+        );
+    }
+
+    @Test
+    void archivedHashRecoveryFailsClosedWhenTwoCandidatesMatch()
+        throws Exception {
+        Path finished = temporaryDirectory.resolve("_finished_maps");
+        Files.createDirectories(finished);
+        Files.writeString(finished.resolve("ambiguous.nbt"), "same");
+        Files.writeString(finished.resolve("ambiguous (1).nbt"), "same");
+
+        assertThrows(
+            IOException.class,
+            () -> FinishedNbtArchiver.locateArchivedPair(
+                temporaryDirectory,
+                "ambiguous.nbt",
+                null,
+                FileFingerprint.sha256(
+                    finished.resolve("ambiguous.nbt")
+                )
+            )
+        );
+    }
+
+    @Test
+    void hashRecoveryCompletesPartnerAfterProcessDiesBetweenMoves()
+        throws Exception {
+        Path source = write("interrupted.nbt", "raw");
+        Path generated = write(
+            "_generated_compact/interrupted_compact_circular_u.nbt",
+            "compact"
+        );
+        String sourceHash = FileFingerprint.sha256(source);
+        AtomicInteger moves = new AtomicInteger();
+
+        assertThrows(
+            AssertionError.class,
+            () -> FinishedNbtArchiver.archive(
+                temporaryDirectory,
+                source,
+                generated,
+                (moveSource, destination, options) -> {
+                    if (moves.getAndIncrement() == 1) {
+                        throw new AssertionError("simulated process death");
+                    }
+                    Files.move(moveSource, destination, options);
+                }
+            )
+        );
+
+        Path reservedGenerated = temporaryDirectory.resolve(
+            "_finished_maps/interrupted_compact_circular_u.nbt"
+        );
+        assertTrue(Files.exists(reservedGenerated));
+        assertEquals(0L, Files.size(reservedGenerated));
+        assertTrue(Files.exists(generated));
+
+        FinishedNbtArchiver.LocatedPair recovered =
+            FinishedNbtArchiver.locateArchivedPair(
+                temporaryDirectory,
+                "interrupted.nbt",
+                "interrupted_compact_circular_u.nbt",
+                sourceHash
+            ).orElseThrow();
+
+        assertEquals("compact", Files.readString(
+            recovered.archivedGenerated().orElseThrow()
+        ));
+        assertFalse(Files.exists(generated));
+    }
+
+    @Test
     void deduplicatesTheSameFileUsedForBothRoles() throws Exception {
         Path source = write("already-compact.nbt", "one-file");
 

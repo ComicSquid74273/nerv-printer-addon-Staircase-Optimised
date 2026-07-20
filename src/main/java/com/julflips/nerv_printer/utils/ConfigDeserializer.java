@@ -63,6 +63,7 @@ public final class ConfigDeserializer {
         public HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;
         public HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests;
         public Set<ItemStack> toolSet;
+        public HashMap<Item, Integer> toolMinimumEfficiency;
     }
 
     private static JsonObject getObj(JsonObject root, String key) {
@@ -136,12 +137,21 @@ public final class ConfigDeserializer {
             }
 
             data.toolSet = new HashSet<>();
+            data.toolMinimumEfficiency = new HashMap<>();
             if (root.has("toolSet")) {
                 for (JsonElement e : root.getAsJsonArray("toolSet")) {
                     JsonObject o = e.getAsJsonObject();
                     Identifier id = Identifier.of(o.get("item").getAsString());
+                    Item item = Registries.ITEM.get(id);
                     data.toolSet.add(
-                        new ItemStack(Registries.ITEM.get(id))
+                        new ItemStack(item)
+                    );
+                    data.toolMinimumEfficiency.merge(
+                        item,
+                        o.has("efficiency")
+                            ? Math.max(0, o.get("efficiency").getAsInt())
+                            : 0,
+                        Math::max
                     );
                 }
             }

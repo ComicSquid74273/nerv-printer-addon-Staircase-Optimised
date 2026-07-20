@@ -92,34 +92,33 @@ public final class Utils {
 
     public static Pair<ArrayList<Integer>, HashMap<Item, Integer>> getInvInformation(HashMap<Item, Integer> requiredItems, ArrayList<Integer> availableSlots) {
         //Return a list of slots to be dumped and a Hashmap of material-amount we can keep in the inventory
-        ArrayList<Integer> dumpSlots = new ArrayList<>();
-        HashMap<Item, Integer> materialInInv = new HashMap<>();
+        ArrayList<InventoryKeepAllocator.StackEntry<Item>> inventoryStacks =
+            new ArrayList<>();
         for (int slot : availableSlots) {
-            if (mc.player.getInventory().getStack(slot).isEmpty()) continue;
-            Item item = mc.player.getInventory().getStack(slot).getItem();
-            if (requiredItems.containsKey(item)) {
-                int requiredAmount = requiredItems.get(item);
-                int maximumStackSize = maximumStackSize(item);
-                int requiredModulusAmount =
-                    requiredAmount - (requiredAmount / maximumStackSize) * maximumStackSize;
-                if (requiredModulusAmount == 0) requiredModulusAmount = maximumStackSize;
-                int stackAmount = mc.player.getInventory().getStack(slot).getCount();
-                // ChatUtils.info(material.getName().getString() + " | Required: " + requiredModulusAmount + " | Inv: " + stackAmount);
-                if (requiredAmount > 0 && requiredModulusAmount <= stackAmount) {
-                    int oldEntry = requiredItems.remove(item);
-                    requiredItems.put(item, Math.max(0, oldEntry - stackAmount));
-                    if (materialInInv.containsKey(item)) {
-                        oldEntry = materialInInv.remove(item);
-                        materialInInv.put(item, oldEntry + stackAmount);
-                    } else {
-                        materialInInv.put(item, stackAmount);
-                    }
-                    continue;
-                }
-            }
-            dumpSlots.add(slot);
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty()) continue;
+            inventoryStacks.add(
+                new InventoryKeepAllocator.StackEntry<>(
+                    slot,
+                    stack.getItem(),
+                    stack.getCount(),
+                    stack.getMaxDamage() > 0
+                        ? Math.max(
+                            0,
+                            stack.getMaxDamage() - stack.getDamage()
+                        )
+                        : 0
+                )
+            );
         }
-        return new Pair(dumpSlots, materialInInv);
+        InventoryKeepAllocator.Allocation<Item> allocation =
+            InventoryKeepAllocator.allocate(requiredItems, inventoryStacks);
+        requiredItems.clear();
+        requiredItems.putAll(allocation.missingDemand());
+        return new Pair<>(
+            new ArrayList<>(allocation.dumpSlots()),
+            new HashMap<>(allocation.keptCounts())
+        );
     }
 
     public static File getMinecraftDirectory() {
@@ -193,6 +192,35 @@ public final class Utils {
             fromSlot,
             toSlot,
             SlotActionType.SWAP,
+            mc.player
+        );
+    }
+
+    public static void performAuthoritativeSwap(
+        int fromSlot,
+        int toSlot
+    ) {
+        performAuthoritativeInventoryClick(
+            mc.player.currentScreenHandler.syncId,
+            fromSlot,
+            toSlot,
+            SlotActionType.SWAP
+        );
+    }
+
+    public static void performAuthoritativeInventoryClick(
+        int syncId,
+        int slotId,
+        int button,
+        SlotActionType actionType
+    ) {
+        IClientPlayerInteractionManager cim =
+            (IClientPlayerInteractionManager) mc.interactionManager;
+        cim.clickSlotWithForcedFullSync(
+            syncId,
+            slotId,
+            button,
+            actionType,
             mc.player
         );
     }

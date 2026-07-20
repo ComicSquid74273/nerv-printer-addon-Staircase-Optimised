@@ -2,6 +2,7 @@ package com.julflips.nerv_printer.interfaces;
 
 import net.minecraft.util.Pair;
 import net.minecraft.util.math.BlockPos;
+import com.julflips.nerv_printer.utils.MapCyclePhase;
 
 public interface MapPrinter {
 
@@ -91,5 +92,17 @@ public interface MapPrinter {
     }
 
     default void masterRelationshipChanged() {
+    }
+
+    default void prepareFileRecovery(
+        MapCyclePhase phase,
+        long recoveryToken
+    ) {
+    }
+
+    default void slaveFileRecoveryReady(
+        String slave,
+        long recoveryToken
+    ) {
     }
 }

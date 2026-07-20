@@ -73,6 +73,149 @@ public final class FinishedNbtArchiver {
         }
     }
 
+    public record LocatedPair(
+        Path archivedSource,
+        Optional<Path> archivedGenerated,
+        int collisionIndex
+    ) {
+        public LocatedPair {
+            Objects.requireNonNull(archivedSource, "archivedSource");
+            Objects.requireNonNull(
+                archivedGenerated,
+                "archivedGenerated"
+            );
+            if (collisionIndex < 0) {
+                throw new IllegalArgumentException(
+                    "collisionIndex cannot be negative."
+                );
+            }
+        }
+    }
+
+    /**
+     * Recovers an archive destination after a process stopped between the
+     * filesystem move and its coordination checkpoint. The source digest is
+     * authoritative because a pre-existing finished file can force a numeric
+     * suffix. Ambiguous digest matches fail closed.
+     */
+    public static Optional<LocatedPair> locateArchivedPair(
+        Path mapFolder,
+        String logicalSourceName,
+        String logicalGeneratedName,
+        String sourceSha256
+    ) throws IOException {
+        Objects.requireNonNull(mapFolder, "mapFolder");
+        requireSimpleFileName(logicalSourceName, "logical source");
+        if (logicalGeneratedName != null) {
+            requireSimpleFileName(
+                logicalGeneratedName,
+                "logical generated file"
+            );
+        }
+        if (!FileFingerprint.isSha256(sourceSha256)) {
+            throw new IllegalArgumentException(
+                "sourceSha256 must be a lowercase SHA-256 digest."
+            );
+        }
+
+        Path finishedDirectory = normalize(mapFolder)
+            .resolve(FINISHED_DIRECTORY_NAME);
+        if (!Files.isDirectory(finishedDirectory)) {
+            return Optional.empty();
+        }
+
+        List<LocatedSource> matches = new ArrayList<>();
+        try (var entries = Files.list(finishedDirectory)) {
+            for (Path candidate : entries
+                .filter(path -> Files.isRegularFile(
+                    path,
+                    LinkOption.NOFOLLOW_LINKS
+                ))
+                .toList()) {
+                OptionalInt collisionIndex = collisionIndexForName(
+                    logicalSourceName,
+                    candidate.getFileName().toString()
+                );
+                if (collisionIndex.isEmpty()) continue;
+                if (sourceSha256.equals(
+                    FileFingerprint.sha256(candidate)
+                )) {
+                    matches.add(
+                        new LocatedSource(
+                            candidate,
+                            collisionIndex.getAsInt()
+                        )
+                    );
+                }
+            }
+        }
+        if (matches.isEmpty()) return Optional.empty();
+        if (matches.size() > 1) {
+            throw new IOException(
+                "Multiple archived NBTs match logical source "
+                    + logicalSourceName + " and its SHA-256."
+            );
+        }
+
+        LocatedSource source = matches.getFirst();
+        Optional<Path> generated;
+        if (logicalGeneratedName == null) {
+            generated = Optional.empty();
+        } else if (logicalGeneratedName.equals(logicalSourceName)) {
+            generated = Optional.of(source.path());
+        } else {
+            Path generatedPath = finishedDirectory.resolve(
+                suffixedName(
+                    logicalGeneratedName,
+                    source.collisionIndex()
+                )
+            );
+            if (Files.isRegularFile(
+                generatedPath,
+                LinkOption.NOFOLLOW_LINKS
+            ) && Files.size(generatedPath) == 0L) {
+                Path originalGenerated = normalize(mapFolder)
+                    .resolve("_generated_compact")
+                    .resolve(logicalGeneratedName)
+                    .normalize();
+                if (!Files.isRegularFile(
+                    originalGenerated,
+                    LinkOption.NOFOLLOW_LINKS
+                ) || Files.size(originalGenerated) == 0L) {
+                    throw new IOException(
+                        "Archived source was found, but its generated "
+                            + "destination is an incomplete reservation and "
+                            + "the original generated NBT is unavailable: "
+                            + generatedPath
+                    );
+                }
+                moveWithAtomicFallback(
+                    originalGenerated,
+                    generatedPath,
+                    Files::move,
+                    StandardCopyOption.REPLACE_EXISTING
+                );
+            }
+            if (!Files.isRegularFile(
+                generatedPath,
+                LinkOption.NOFOLLOW_LINKS
+            ) || Files.size(generatedPath) == 0L) {
+                throw new IOException(
+                    "Archived source was found, but its generated compact "
+                        + "pair is missing or empty: " + generatedPath
+                );
+            }
+            generated = Optional.of(generatedPath);
+        }
+        return Optional.of(
+            new LocatedPair(
+                source.path(),
+                generated,
+                source.collisionIndex()
+            )
+        );
+    }
+
     /**
      * Archives {@code sourceNbt} plus {@code generatedCompactNbt}, when
      * supplied. Passing the same file for both arguments moves it only once
@@ -218,6 +361,9 @@ public final class FinishedNbtArchiver {
     private record MovePair(Path source, Path destination) {
     }
 
+    private record LocatedSource(Path path, int collisionIndex) {
+    }
+
     private static Path normalize(Path path) {
         return path.toAbsolutePath().normalize();
     }
@@ -312,6 +458,50 @@ public final class FinishedNbtArchiver {
         return fileName.substring(0, extensionIndex)
             + suffix
             + fileName.substring(extensionIndex);
+    }
+
+    private static OptionalInt collisionIndexForName(
+        String logicalName,
+        String candidateName
+    ) {
+        if (candidateName.equals(logicalName)) return OptionalInt.of(0);
+        int extensionIndex = logicalName.lastIndexOf('.');
+        String base = extensionIndex <= 0
+            ? logicalName
+            : logicalName.substring(0, extensionIndex);
+        String extension = extensionIndex <= 0
+            ? ""
+            : logicalName.substring(extensionIndex);
+        String prefix = base + " (";
+        if (!candidateName.startsWith(prefix)
+            || !candidateName.endsWith(")" + extension)) {
+            return OptionalInt.empty();
+        }
+        int numberEnd = candidateName.length() - extension.length() - 1;
+        String number = candidateName.substring(
+            prefix.length(),
+            numberEnd
+        );
+        try {
+            int parsed = Integer.parseInt(number);
+            return parsed > 0
+                ? OptionalInt.of(parsed)
+                : OptionalInt.empty();
+        } catch (NumberFormatException ignored) {
+            return OptionalInt.empty();
+        }
+    }
+
+    private static void requireSimpleFileName(String name, String label) {
+        Objects.requireNonNull(name, label);
+        if (name.isBlank()
+            || !Path.of(name).getFileName().toString().equals(name)
+            || name.contains("/")
+            || name.contains("\\")) {
+            throw new IllegalArgumentException(
+                label + " must be a simple file name."
+            );
+        }
     }
 
     private static void deleteReservations(
