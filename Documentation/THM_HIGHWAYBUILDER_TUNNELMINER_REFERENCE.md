@@ -173,11 +173,17 @@ Movement overlap is also bounded by the next ordered support's conservative
 reach window, so sprinting cannot outrun an acknowledged progressive target.
 Unexpected live reach loss enters stable-ground local U recovery instead of
 discarding the shared route and immediately starting endpoint navigation.
-If remote teardown is interrupted after removing a neighboring U prefix, its
-continuous remaining suffix stays eligible for reassignment to the next U with
-a complete monotonic reach proof. It is forced into an opposite-end traversal
-only when no other selected route can safely finish the remainder; the U under
-the recovering player always retains mandatory local ownership.
+Cross-U teardown computes complete monotonic reach schedules in both map
+directions. Host selection is based on greatest global uncovered-lane coverage,
+not the first unfinished U: a middle host can own earlier and later U lanes, and
+a later host can replace an earlier host when it proves more complete coverage.
+A redundancy pass removes nonmandatory hosts made unnecessary by the final host
+set, after which every skipped U is assigned wholly to one selected host. If
+remote teardown is interrupted after removing a neighboring U prefix, its
+continuous remaining suffix stays eligible for reassignment to any selected U
+with a complete monotonic reach proof. It is forced into an opposite-end
+traversal only when no selected route can safely finish the remainder; the U
+under the recovering player always retains mandatory local ownership.
 
 Managed hotbar swaps, chest restocks, dump throws, and used-tool deposits are
 bounded server-confirmed transactions. Teardown restocking counts usable worn tools

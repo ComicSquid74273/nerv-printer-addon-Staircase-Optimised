@@ -59,6 +59,93 @@ class ReachOptimizedTeardownPlanTest {
     }
 
     @Test
+    void middleTraversalWinsWhenItCoversEarlierAndLaterLanes() {
+        var plan = ReachOptimizedTeardownPlan.create(
+            List.of(
+                route(0, "lane-0"),
+                route(1, "lane-1"),
+                route(2, "lane-2")
+            ),
+            (targets, destination) -> {
+                String source = targets.getFirst();
+                boolean reachable =
+                    (destination == 0
+                        && source.equals("lane-1"))
+                        || (destination == 1
+                            && (source.equals("lane-0")
+                                || source.equals("lane-2")));
+                return reachable
+                    ? Optional.of(List.of(0))
+                    : Optional.empty();
+            }
+        );
+
+        assertEquals(List.of(1), plan.traversalRouteIndices());
+        assertEquals(Map.of(0, 1, 2, 1), plan.routeAssignments());
+    }
+
+    @Test
+    void laterTraversalWinsEvenWhenEarliestCanSaveOneLane() {
+        var plan = ReachOptimizedTeardownPlan.create(
+            List.of(
+                route(0, "lane-0"),
+                route(1, "lane-1"),
+                route(2, "lane-2"),
+                route(3, "lane-3")
+            ),
+            (targets, destination) -> {
+                String source = targets.getFirst();
+                boolean reachable =
+                    (destination == 0
+                        && source.equals("lane-1"))
+                        || (destination == 3
+                            && !source.equals("lane-3"));
+                return reachable
+                    ? Optional.of(List.of(0))
+                    : Optional.empty();
+            }
+        );
+
+        assertEquals(List.of(3), plan.traversalRouteIndices());
+        assertEquals(
+            Map.of(0, 3, 1, 3, 2, 3),
+            plan.routeAssignments()
+        );
+    }
+
+    @Test
+    void removesAnEarlierHostWhenLaterHostsMakeItRedundant() {
+        var plan = ReachOptimizedTeardownPlan.create(
+            List.of(
+                route(0, "lane-0"),
+                route(1, "lane-1"),
+                route(2, "lane-2"),
+                route(3, "lane-3"),
+                route(4, "lane-4")
+            ),
+            (targets, destination) -> {
+                int source = Integer.parseInt(
+                    targets.getFirst().substring("lane-".length())
+                );
+                boolean reachable = switch (destination) {
+                    case 0 -> source == 1 || source == 2;
+                    case 3 -> source == 0 || source == 1;
+                    case 4 -> source == 2;
+                    default -> false;
+                };
+                return reachable
+                    ? Optional.of(List.of(0))
+                    : Optional.empty();
+            }
+        );
+
+        assertEquals(List.of(3, 4), plan.traversalRouteIndices());
+        assertEquals(3, plan.routeAssignments().get(0));
+        assertEquals(3, plan.routeAssignments().get(1));
+        assertEquals(4, plan.routeAssignments().get(2));
+    }
+
+    @Test
     void laterRouteMayConsumeEarliestWhenEarliestCannotSaveAnotherTraversal() {
         var plan = ReachOptimizedTeardownPlan.create(
             List.of(

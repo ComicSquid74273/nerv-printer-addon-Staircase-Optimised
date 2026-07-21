@@ -11,6 +11,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -36,6 +37,25 @@ class StaircasedCycleCheckpointStoreTest {
             store.read()
         );
         assertTrue(Files.isRegularFile(store.stateFile()));
+    }
+
+    @Test
+    void remainsCompatibleWithLegacyPairOnlyMiningCheckpoint()
+        throws IOException {
+        StaircasedCycleCheckpointStore store =
+            StaircasedCycleCheckpointStore.open(
+                temporaryDirectory,
+                "Builder_1"
+            );
+        StaircasedCycleCheckpointStore.Snapshot snapshot =
+            miningSnapshot("Builder_1", null);
+
+        store.save(snapshot);
+
+        StaircasedCycleCheckpointStore.Snapshot restored =
+            store.read().orElseThrow();
+        assertEquals(7, restored.activeMiningPair());
+        assertNull(restored.activeMiningTargetIndex());
     }
 
     @Test
@@ -84,6 +104,11 @@ class StaircasedCycleCheckpointStoreTest {
 
     private static StaircasedCycleCheckpointStore.Snapshot
         miningSnapshot(String playerId) {
+        return miningSnapshot(playerId, 142);
+    }
+
+    private static StaircasedCycleCheckpointStore.Snapshot
+        miningSnapshot(String playerId, Integer targetIndex) {
         String hash = "a".repeat(64);
         return new StaircasedCycleCheckpointStore.Snapshot(
             StaircasedCycleCheckpointStore.SCHEMA_VERSION,
@@ -109,7 +134,7 @@ class StaircasedCycleCheckpointStoreTest {
             -1,
             "MiningUTraversal",
             7,
-            142,
+            targetIndex,
             "mining-progress",
             2000
         );

@@ -2,6 +2,7 @@ package com.julflips.nerv_printer.utils;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,7 +18,9 @@ import java.util.Optional;
  * in an endpoint-preserving removal order and one nondecreasing destination
  * support index for every target. Consequently an interrupted remote teardown
  * has removed only a prefix of that safe order and leaves one continuous
- * remainder attached to the endpoint selected by the caller.</p>
+ * remainder attached to the endpoint selected by the caller. Traversal hosts
+ * are selected by global uncovered-route coverage rather than map order, then
+ * redundant nonmandatory hosts are pruned before final assignment.</p>
  */
 public final class ReachOptimizedTeardownPlan {
     private ReachOptimizedTeardownPlan() {
@@ -130,74 +133,186 @@ public final class ReachOptimizedTeardownPlan {
             new LinkedHashMap<>();
         routes.forEach(route -> byIndex.put(route.routeIndex(), route));
 
-        HashSet<Integer> covered = new HashSet<>();
         HashSet<Integer> selected = new HashSet<>();
-        LinkedHashMap<Integer, Integer> assignments =
-            new LinkedHashMap<>();
-        LinkedHashMap<Integer, ArrayList<ScheduledTarget<K>>>
-            scheduled = new LinkedHashMap<>();
         ArrayList<Integer> completed = new ArrayList<>();
+        HashMap<ScheduleKey, Optional<List<Integer>>> scheduleCache =
+            new HashMap<>();
 
         for (Route<K> route : routes) {
             if (route.complete()) {
-                covered.add(route.routeIndex());
                 completed.add(route.routeIndex());
             } else if (route.mustTraverse()) {
                 selected.add(route.routeIndex());
-                covered.add(route.routeIndex());
-                scheduled.put(route.routeIndex(), new ArrayList<>());
             }
         }
 
-        // A mandatory recovery traversal gets first ownership of every intact
-        // route it can safely consume.
-        for (Route<K> destination : routes) {
-            if (!selected.contains(destination.routeIndex())
-                || !destination.canHostRemoteTeardown()) {
-                continue;
-            }
-            coverReachableRoutes(
-                destination,
-                routes,
-                covered,
-                assignments,
-                scheduled,
-                scheduleFinder
-            );
-        }
+        // Select the host with the greatest global uncovered coverage. A
+        // middle or later U can therefore win when it reaches lanes on both
+        // sides, even if the earliest U could save one traversal itself.
+        while (true) {
+            List<Route<K>> uncovered = routes.stream()
+                .filter(route ->
+                    !route.complete()
+                        && !isCoveredBySelected(
+                            route,
+                            selected,
+                            byIndex,
+                            scheduleFinder,
+                            scheduleCache
+                        ))
+                .toList();
+            if (uncovered.isEmpty()) break;
 
-        while (covered.size() < routes.size()) {
-            Route<K> earliest = routes.stream()
-                .filter(route -> !covered.contains(route.routeIndex()))
-                .findFirst()
+            Route<K> destination = routes.stream()
+                .filter(route ->
+                    !route.complete()
+                        && !selected.contains(route.routeIndex()))
+                .max((left, right) -> {
+                    int coverage = Integer.compare(
+                        coverageGain(
+                            left,
+                            uncovered,
+                            scheduleFinder,
+                            scheduleCache
+                        ),
+                        coverageGain(
+                            right,
+                            uncovered,
+                            scheduleFinder,
+                            scheduleCache
+                        )
+                    );
+                    if (coverage != 0) return coverage;
+                    // max() must prefer the smaller map-order index on ties.
+                    return Integer.compare(
+                        right.routeIndex(),
+                        left.routeIndex()
+                    );
+                })
                 .orElseThrow();
-
-            Route<K> destination = chooseDestination(
-                earliest,
-                routes,
-                covered,
-                scheduleFinder
-            );
+            if (coverageGain(
+                    destination,
+                    uncovered,
+                    scheduleFinder,
+                    scheduleCache
+                ) <= 0) {
+                throw new IllegalStateException(
+                    "No teardown traversal can cover an incomplete U."
+                );
+            }
             selected.add(destination.routeIndex());
-            covered.add(destination.routeIndex());
-            scheduled.putIfAbsent(
-                destination.routeIndex(),
-                new ArrayList<>()
-            );
-            coverReachableRoutes(
-                destination,
-                routes,
-                covered,
-                assignments,
-                scheduled,
-                scheduleFinder
-            );
         }
+
+        // Later selections may make an earlier greedy host redundant. Remove
+        // it only when every incomplete U still has complete proven coverage.
+        boolean removed;
+        do {
+            removed = false;
+            ArrayList<Integer> removable = new ArrayList<>(selected);
+            removable.sort(Collections.reverseOrder());
+            for (int candidate : removable) {
+                if (byIndex.get(candidate).mustTraverse()) continue;
+                HashSet<Integer> withoutCandidate =
+                    new HashSet<>(selected);
+                withoutCandidate.remove(candidate);
+                boolean allCovered = routes.stream()
+                    .filter(route -> !route.complete())
+                    .allMatch(route ->
+                        isCoveredBySelected(
+                            route,
+                            withoutCandidate,
+                            byIndex,
+                            scheduleFinder,
+                            scheduleCache
+                        ));
+                if (!allCovered) continue;
+                selected.remove(candidate);
+                removed = true;
+            }
+        } while (removed);
 
         ArrayList<Integer> traversals =
             new ArrayList<>(selected);
         Collections.sort(traversals);
         Collections.sort(completed);
+
+        LinkedHashMap<Integer, Integer> assignments =
+            new LinkedHashMap<>();
+        LinkedHashMap<Integer, ArrayList<ScheduledTarget<K>>>
+            scheduled = new LinkedHashMap<>();
+        traversals.forEach(
+            traversal -> scheduled.put(
+                traversal,
+                new ArrayList<>()
+            )
+        );
+        for (Route<K> source : routes) {
+            if (source.complete()
+                || selected.contains(source.routeIndex())) {
+                continue;
+            }
+            DestinationSchedule chosen = traversals.stream()
+                .map(destinationIndex ->
+                    scheduleFor(
+                        source,
+                        byIndex.get(destinationIndex),
+                        scheduleFinder,
+                        scheduleCache
+                    ).map(indices ->
+                        new DestinationSchedule(
+                            destinationIndex,
+                            indices,
+                            Math.abs(
+                                destinationIndex
+                                    - source.routeIndex()
+                            )
+                        )
+                    ).orElse(null)
+                )
+                .filter(Objects::nonNull)
+                .min((left, right) -> {
+                    int distance = Integer.compare(
+                        left.routeDistance(),
+                        right.routeDistance()
+                    );
+                    if (distance != 0) return distance;
+                    int leftFinish = left.supportIndices().isEmpty()
+                        ? 0 : left.supportIndices().getLast();
+                    int rightFinish = right.supportIndices().isEmpty()
+                        ? 0 : right.supportIndices().getLast();
+                    int finish = Integer.compare(
+                        leftFinish,
+                        rightFinish
+                    );
+                    if (finish != 0) return finish;
+                    return Integer.compare(
+                        left.destinationRouteIndex(),
+                        right.destinationRouteIndex()
+                    );
+                })
+                .orElseThrow(() -> new IllegalStateException(
+                    "Selected teardown hosts do not cover route "
+                        + source.routeIndex() + "."
+                ));
+            assignments.put(
+                source.routeIndex(),
+                chosen.destinationRouteIndex()
+            );
+            ArrayList<ScheduledTarget<K>> destinationTargets =
+                scheduled.get(chosen.destinationRouteIndex());
+            for (int index = 0;
+                 index < source.orderedTargets().size();
+                 index++) {
+                destinationTargets.add(
+                    new ScheduledTarget<>(
+                        source.routeIndex(),
+                        source.orderedTargets().get(index),
+                        chosen.supportIndices().get(index),
+                        index
+                    )
+                );
+            }
+        }
 
         LinkedHashMap<Integer, List<ScheduledTarget<K>>>
             immutableSchedules = new LinkedHashMap<>();
@@ -237,92 +352,20 @@ public final class ReachOptimizedTeardownPlan {
         );
     }
 
-    private static <K> Route<K> chooseDestination(
-        Route<K> earliest,
-        List<Route<K>> routes,
-        HashSet<Integer> covered,
-        ScheduleFinder<K> scheduleFinder
-    ) {
-        if (earliest.canHostRemoteTeardown()) {
-            int ownCoverage = coverageCount(
-                earliest,
-                routes,
-                covered,
-                scheduleFinder
-            );
-            // Prefer continuing from the earliest live U whenever it saves at
-            // least one additional traversal.
-            if (ownCoverage > 1) return earliest;
-        }
-
-        Route<K> best = earliest;
-        int bestCoverage = earliest.canHostRemoteTeardown()
-            ? coverageCount(
-                earliest,
-                routes,
-                covered,
-                scheduleFinder
-            )
-            : 1;
-        int bestDistance = 0;
-        for (Route<K> candidate : routes) {
-            if (candidate.complete()
-                || candidate.mustTraverse()
-                || !candidate.canHostRemoteTeardown()
-                || covered.contains(candidate.routeIndex())) {
-                continue;
-            }
-            if (candidate.routeIndex() != earliest.routeIndex()
-                && findValidatedSchedule(
-                    earliest,
-                    candidate.routeIndex(),
-                    scheduleFinder
-                ).isEmpty()) {
-                continue;
-            }
-            int coverage = coverageCount(
-                candidate,
-                routes,
-                covered,
-                scheduleFinder
-            );
-            int distance = Math.abs(
-                candidate.routeIndex() - earliest.routeIndex()
-            );
-            if (coverage > bestCoverage
-                || (coverage == bestCoverage
-                    && distance < bestDistance)
-                || (coverage == bestCoverage
-                    && distance == bestDistance
-                    && candidate.routeIndex() < best.routeIndex())) {
-                best = candidate;
-                bestCoverage = coverage;
-                bestDistance = distance;
-            }
-        }
-        return best;
-    }
-
-    private static <K> int coverageCount(
+    private static <K> int coverageGain(
         Route<K> destination,
-        List<Route<K>> routes,
-        HashSet<Integer> covered,
-        ScheduleFinder<K> scheduleFinder
+        List<Route<K>> uncovered,
+        ScheduleFinder<K> scheduleFinder,
+        Map<ScheduleKey, Optional<List<Integer>>> scheduleCache
     ) {
-        int count = covered.contains(destination.routeIndex())
-            ? 0 : 1;
-        if (!destination.canHostRemoteTeardown()) return count;
-        for (Route<K> source : routes) {
-            if (covered.contains(source.routeIndex())
-                || source.routeIndex() == destination.routeIndex()
-                || source.complete()
-                || source.mustTraverse()) {
-                continue;
-            }
-            if (findValidatedSchedule(
+        int count = 0;
+        for (Route<K> source : uncovered) {
+            if (source.routeIndex() == destination.routeIndex()
+                || scheduleFor(
                 source,
-                destination.routeIndex(),
-                scheduleFinder
+                destination,
+                scheduleFinder,
+                scheduleCache
             ).isPresent()) {
                 count++;
             }
@@ -330,52 +373,81 @@ public final class ReachOptimizedTeardownPlan {
         return count;
     }
 
-    private static <K> void coverReachableRoutes(
-        Route<K> destination,
-        List<Route<K>> routes,
-        HashSet<Integer> covered,
-        LinkedHashMap<Integer, Integer> assignments,
-        LinkedHashMap<Integer, ArrayList<ScheduledTarget<K>>> scheduled,
-        ScheduleFinder<K> scheduleFinder
+    private static <K> boolean isCoveredBySelected(
+        Route<K> source,
+        HashSet<Integer> selected,
+        Map<Integer, Route<K>> byIndex,
+        ScheduleFinder<K> scheduleFinder,
+        Map<ScheduleKey, Optional<List<Integer>>> scheduleCache
     ) {
-        if (!destination.canHostRemoteTeardown()) return;
-        ArrayList<ScheduledTarget<K>> destinationTargets =
-            scheduled.computeIfAbsent(
-                destination.routeIndex(),
-                ignored -> new ArrayList<>()
-            );
-        for (Route<K> source : routes) {
-            if (covered.contains(source.routeIndex())
-                || source.routeIndex() == destination.routeIndex()
-                || source.complete()
-                || source.mustTraverse()) {
-                continue;
+        if (selected.contains(source.routeIndex())) return true;
+        if (source.mustTraverse()) return false;
+        for (int destinationIndex : selected) {
+            if (scheduleFor(
+                source,
+                byIndex.get(destinationIndex),
+                scheduleFinder,
+                scheduleCache
+            ).isPresent()) {
+                return true;
             }
-            Optional<List<Integer>> schedule =
-                findValidatedSchedule(
-                    source,
-                    destination.routeIndex(),
-                    scheduleFinder
-                );
-            if (schedule.isEmpty()) continue;
+        }
+        return false;
+    }
 
-            covered.add(source.routeIndex());
-            assignments.put(
-                source.routeIndex(),
-                destination.routeIndex()
-            );
-            for (int index = 0;
-                 index < source.orderedTargets().size();
-                 index++) {
-                destinationTargets.add(
-                    new ScheduledTarget<>(
-                        source.routeIndex(),
-                        source.orderedTargets().get(index),
-                        schedule.get().get(index),
-                        index
-                    )
+    private static <K> Optional<List<Integer>> scheduleFor(
+        Route<K> source,
+        Route<K> destination,
+        ScheduleFinder<K> scheduleFinder,
+        Map<ScheduleKey, Optional<List<Integer>>> scheduleCache
+    ) {
+        if (source.routeIndex() == destination.routeIndex()
+            || source.complete()
+            || source.mustTraverse()
+            || !destination.canHostRemoteTeardown()) {
+            return Optional.empty();
+        }
+        ScheduleKey key = new ScheduleKey(
+            source.routeIndex(),
+            destination.routeIndex()
+        );
+        return scheduleCache.computeIfAbsent(
+            key,
+            ignored -> findValidatedSchedule(
+                source,
+                destination.routeIndex(),
+                scheduleFinder
+            )
+        );
+    }
+
+    private record ScheduleKey(
+        int sourceRouteIndex,
+        int destinationRouteIndex
+    ) {
+        private ScheduleKey {
+            if (sourceRouteIndex < 0
+                || destinationRouteIndex < 0
+                || sourceRouteIndex == destinationRouteIndex) {
+                throw new IllegalArgumentException(
+                    "A remote teardown schedule requires distinct routes."
                 );
             }
+        }
+    }
+
+    private record DestinationSchedule(
+        int destinationRouteIndex,
+        List<Integer> supportIndices,
+        int routeDistance
+    ) {
+        private DestinationSchedule {
+            if (destinationRouteIndex < 0 || routeDistance < 0) {
+                throw new IllegalArgumentException(
+                    "A teardown destination has invalid route indices."
+                );
+            }
+            supportIndices = List.copyOf(supportIndices);
         }
     }
 

@@ -879,6 +879,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         optimizedDeferredMiningRouteAssignments;
     boolean circularMiningOptimizationReady;
     int preferredRecoveredMiningPair;
+    DurableTeardownRecoveryCursor.Cursor retainedTeardownRecoveryCursor;
     HashSet<BlockPos> confirmedBuildTargetsThisRun;
     HashSet<BlockPos> optionalPendingPlacements;
     TpsScaledActionBudget workActionBudget;
@@ -1156,6 +1157,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         optimizedDeferredMiningRouteAssignments = new HashMap<>();
         circularMiningOptimizationReady = false;
         preferredRecoveredMiningPair = -1;
+        retainedTeardownRecoveryCursor = null;
         confirmedBuildTargetsThisRun = new HashSet<>();
         optionalPendingPlacements = new HashSet<>();
         workActionBudget = createWorkActionBudget();
@@ -8377,6 +8379,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
             }
         }
+        if (traversal.owner() == OrderedUTraversalOwner.TEARDOWN) {
+            BlockPos confirmedSupport = supportPath.get(
+                activeCircularRouteSupportIndex
+            );
+            if (isConfirmedActiveOrderedUSupport(
+                traversal,
+                confirmedSupport
+            )) {
+                rememberConfirmedTeardownSupport(
+                    traversal,
+                    confirmedSupport
+                );
+            }
+        }
         OrderedUTraversalMovement.MovementDecision<BlockPos> decision =
             progress.movement();
         if (decision.status()
@@ -13325,6 +13341,144 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private DurableTeardownRecoveryCursor.Cursor teardownRecoveryCursor(
+        CircularMiningLocalSupport support
+    ) {
+        if (support == null) return null;
+        return new DurableTeardownRecoveryCursor.Cursor(
+            support.pairIndex(),
+            support.targetIndex()
+        );
+    }
+
+    private DurableTeardownRecoveryCursor.Cursor
+        activeOrderedTeardownRecoveryCursor() {
+        if (state != State.MiningUTraversal
+            || !activeContinuousTeardownArmed
+            || teardownScaffoldPhase != TeardownScaffoldPhase.NONE
+            || compactPlan == null
+            || mapCorner == null
+            || activeContinuousTeardownPair < 0
+            || activeContinuousTeardownPair
+                >= compactPlan.pairRoutes().size()
+            || activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex
+                >= activeContinuousTeardownStages.size()) {
+            return null;
+        }
+
+        CompactCircularNbtPlan.PairRoute route =
+            compactPlan.pairRoutes().get(
+                activeContinuousTeardownPair
+            );
+        BlockPos support = activeContinuousTeardownStages.get(
+            activeCircularRouteSupportIndex
+        ).support();
+        int targetIndex = circularPairTargets(route).indexOf(
+            support.subtract(mapCorner)
+        );
+        if (targetIndex < 0
+            || !isAuthoritativeRemainingTeardownSupport(
+                route,
+                targetIndex
+            )) {
+            return null;
+        }
+        return new DurableTeardownRecoveryCursor.Cursor(
+            route.pairIndex(),
+            targetIndex
+        );
+    }
+
+    private void rememberConfirmedTeardownSupport(
+        ActiveOrderedUTraversal traversal,
+        BlockPos support
+    ) {
+        if (traversal == null
+            || traversal.owner() != OrderedUTraversalOwner.TEARDOWN
+            || mapCorner == null) {
+            return;
+        }
+        int targetIndex = circularPairTargets(
+            traversal.route()
+        ).indexOf(support.subtract(mapCorner));
+        if (targetIndex < 0) return;
+        retainedTeardownRecoveryCursor =
+            new DurableTeardownRecoveryCursor.Cursor(
+                traversal.route().pairIndex(),
+                targetIndex
+            );
+    }
+
+    private boolean isAuthoritativeRemainingTeardownSupport(
+        CompactCircularNbtPlan.PairRoute route,
+        int targetIndex
+    ) {
+        if (route == null || mapCorner == null) return false;
+        ArrayList<BlockPos> targets = circularPairTargets(route);
+        if (targetIndex < 0 || targetIndex >= targets.size()) {
+            return false;
+        }
+        BlockPos support = mapCorner.add(targets.get(targetIndex));
+        if (!isSafeUCheckpointSupport(walkingPosition(support))) {
+            return false;
+        }
+        return CircularMiningLocalResumePlan.create(
+            targets.size(),
+            analyzeCircularMiningRoute(route),
+            targetIndex
+        ).isPresent();
+    }
+
+    private Optional<DurableTeardownRecoveryCursor.Cursor>
+        validateTeardownRecoveryCursor(
+            DurableTeardownRecoveryCursor.Cursor cursor
+        ) {
+        if (cursor == null
+            || compactPlan == null
+            || workingInterval == null
+            || cursor.pairIndex() < 0
+            || cursor.pairIndex()
+                >= compactPlan.pairRoutes().size()) {
+            return Optional.empty();
+        }
+        CompactCircularNbtPlan.PairRoute route =
+            compactPlan.pairRoutes().get(cursor.pairIndex());
+        if (route.outboundX() < workingInterval.getLeft()
+            || route.returnX() > workingInterval.getRight()) {
+            return Optional.empty();
+        }
+        int targetCount = circularPairTargets(route).size();
+        return DurableTeardownRecoveryCursor.validateForRecovery(
+            cursor,
+            route.pairIndex(),
+            targetCount,
+            targetIndex -> isAuthoritativeRemainingTeardownSupport(
+                route,
+                targetIndex
+            )
+        );
+    }
+
+    private boolean isRecoverablePersistedMiningPair(int pairIndex) {
+        if (compactPlan == null
+            || workingInterval == null
+            || pairIndex < 0
+            || pairIndex >= compactPlan.pairRoutes().size()) {
+            return false;
+        }
+        CompactCircularNbtPlan.PairRoute route =
+            compactPlan.pairRoutes().get(pairIndex);
+        if (route.outboundX() < workingInterval.getLeft()
+            || route.returnX() > workingInterval.getRight()) {
+            return false;
+        }
+        CircularMiningRecoveryPlan.Mode mode =
+            analyzeCircularMiningRoute(route).mode();
+        return mode != CircularMiningRecoveryPlan.Mode.COMPLETE
+            && mode != CircularMiningRecoveryPlan.Mode.FALLBACK;
+    }
+
     private boolean isSafeNorthWalkway(int x) {
         if (northWalkwayRelativeY == null
             || x < 0
@@ -17896,6 +18050,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         Optional<CircularMiningLocalSupport> localSupport =
             circularMiningLocalSupport();
+        DurableTeardownRecoveryCursor.Cursor persistedCursor =
+            recoveredActiveMiningPair >= 0
+                && recoveredActiveMiningTargetIndex >= 0
+                ? new DurableTeardownRecoveryCursor.Cursor(
+                    recoveredActiveMiningPair,
+                    recoveredActiveMiningTargetIndex
+                )
+                : null;
+        Optional<DurableTeardownRecoveryCursor.Cursor>
+            validatedPersistedCursor =
+                validateTeardownRecoveryCursor(persistedCursor);
         if (recoveringExistingMining
             && recoveredActiveMiningPair >= 0
             && localSupport.isPresent()
@@ -17912,12 +18077,37 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             toggle();
             return;
         }
+        boolean recoveredPairCanContinue =
+            recoveringExistingMining
+                && recoveredActiveMiningPair >= 0
+                && isRecoverablePersistedMiningPair(
+                    recoveredActiveMiningPair
+                );
+        if (recoveringExistingMining
+            && localSupport.isEmpty()
+            && !isAtKnownSafeBuildRecoveryLocation()) {
+            error(
+                "Persisted teardown cannot resume because the player "
+                    + "is neither on a verified remaining U route, "
+                    + "the safe north walkway, nor a registered "
+                    + "station. Stopping before diagonal movement."
+            );
+            stopMovement();
+            toggle();
+            return;
+        }
         preferredRecoveredMiningPair = localSupport
             .map(CircularMiningLocalSupport::pairIndex)
-            .orElse(-1);
-        boolean startingFromLocalSupport =
-            preferredRecoveredMiningPair >= 0;
-        if (preferredRecoveredMiningPair >= 0) {
+            .orElse(
+                recoveredPairCanContinue
+                    ? recoveredActiveMiningPair
+                    : -1
+            );
+        boolean startingFromLocalSupport = localSupport.isPresent();
+        if (localSupport.isPresent()) {
+            retainedTeardownRecoveryCursor = teardownRecoveryCursor(
+                localSupport.orElseThrow()
+            );
             debugLog(
                 "Recovery",
                 "restart is standing on verified remaining support "
@@ -17933,12 +18123,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                                 .targetIndex()
                             + ")")
             );
-        } else if (recoveringExistingMining) {
+        } else if (preferredRecoveredMiningPair >= 0) {
+            retainedTeardownRecoveryCursor =
+                validatedPersistedCursor.orElse(null);
             debugLog(
                 "Recovery",
-                "restart position is inside the map recovery zone "
-                    + "but not on a verified remaining U support; "
-                    + "routing through the selected U endpoint"
+                "restart is at a verified safe recovery location; "
+                    + "retaining persisted teardown ownership of pair "
+                    + preferredRecoveredMiningPair
+                    + (retainedTeardownRecoveryCursor == null
+                        ? " without a legacy support cursor"
+                        : " at canonical support index "
+                            + retainedTeardownRecoveryCursor
+                                .targetIndex())
+                    + " and routing through that pair's safe endpoint"
+            );
+        } else if (recoveringExistingMining) {
+            retainedTeardownRecoveryCursor = null;
+            debugLog(
+                "Recovery",
+                "the persisted teardown pair is already complete or "
+                    + "cannot form a continuous safe U; selecting the "
+                    + "next authoritative teardown assignment"
             );
         }
         recoveredActiveMiningPair = -1;
@@ -18082,8 +18288,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         info(
             "Restart recovery selected pair "
                 + preferredPair
-                + " because the player is standing on its "
-                + "verified remaining U support."
+                + " from its persisted, authoritatively validated "
+                + "teardown ownership."
         );
         return new MiningAssignment(
             route.outboundX(),
@@ -18192,6 +18398,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         currentMiningLines.addAll(assignment.lines());
         currentMiningPaired = false;
         pendingIndependentMiningLines.clear();
+
+        int assignmentPair = assignment.paired()
+            ? assignment.anchorLine() / 2
+            : -1;
+        if (retainedTeardownRecoveryCursor != null
+            && retainedTeardownRecoveryCursor.pairIndex()
+                != assignmentPair) {
+            retainedTeardownRecoveryCursor = null;
+        }
 
         boolean wholePairReserved = isWholePairAssignment(assignment);
         if (assignment.paired() && !wholePairReserved) {
@@ -18333,6 +18548,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void completeCurrentMiningAssignment() {
         if (startNextIndependentMiningLine()) return;
         resetTeardownMiningActionState();
+        retainedTeardownRecoveryCursor = null;
 
         for (int line : currentMiningLines) {
             if (isLineMined(line)) reportedMinedLines.add(line);
@@ -18426,6 +18642,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void endMining() {
         // Only executed on Master
         resetTeardownMiningActionState();
+        retainedTeardownRecoveryCursor = null;
         abandonRestockSession(true);
         miningAssignmentsActive = false;
         mapCyclePhase = MapCyclePhase.VERIFIED_CLEAR;
@@ -18441,6 +18658,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void finishMiningAfterArchive() {
         resetTeardownMiningActionState();
+        retainedTeardownRecoveryCursor = null;
         mapCyclePhase = MapCyclePhase.POST_MINING;
         if (!persistFileCoordinationCheckpoint("post-mining")) return;
         info("Finished mining map");
@@ -19685,6 +19903,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             Optional.ofNullable(
                 snapshot.activeMiningTargetIndex()
             ).orElse(-1);
+        retainedTeardownRecoveryCursor =
+            recoveredActiveMiningPair >= 0
+                && recoveredActiveMiningTargetIndex >= 0
+                ? new DurableTeardownRecoveryCursor.Cursor(
+                    recoveredActiveMiningPair,
+                    recoveredActiveMiningTargetIndex
+                )
+                : null;
         localCycleRecoveryCandidate = true;
         info(
             "Found local Staircased lifecycle checkpoint "
@@ -19974,6 +20200,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         localCycleRecoveryCandidate = false;
         recoveredActiveMiningPair = -1;
         recoveredActiveMiningTargetIndex = -1;
+        retainedTeardownRecoveryCursor = null;
         archivedSourceName = null;
         archivedPrintingName = null;
         coordinationGeneration = Math.max(0L, coordinationGeneration) + 1L;
@@ -20196,16 +20423,81 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
         }
 
-        Optional<CircularMiningLocalSupport> localSupport =
-            mapCyclePhase == MapCyclePhase.MINING
-                ? circularMiningLocalSupport()
-                : Optional.empty();
-        Integer activePair = localSupport
-            .map(CircularMiningLocalSupport::pairIndex)
-            .orElseGet(this::currentMiningPairForCheckpoint);
-        Integer activeTargetIndex = localSupport
-            .map(CircularMiningLocalSupport::targetIndex)
-            .orElse(null);
+        Integer activePair = null;
+        Integer activeTargetIndex = null;
+        if (mapCyclePhase == MapCyclePhase.MINING) {
+            Optional<CircularMiningLocalSupport> localSupport =
+                circularMiningLocalSupport();
+            DurableTeardownRecoveryCursor.Cursor liveCursor =
+                localSupport.map(this::teardownRecoveryCursor)
+                    .orElse(null);
+            DurableTeardownRecoveryCursor.Cursor orderedCursor =
+                activeOrderedTeardownRecoveryCursor();
+            DurableTeardownRecoveryCursor.Cursor retainedCursor =
+                validateTeardownRecoveryCursor(
+                    retainedTeardownRecoveryCursor
+                ).orElse(null);
+            Integer assignmentPair =
+                currentMiningPairForCheckpoint();
+            if (assignmentPair != null
+                && liveCursor != null
+                && liveCursor.pairIndex() != assignmentPair) {
+                liveCursor = null;
+            }
+            Integer checkpointPair = assignmentPair != null
+                ? assignmentPair
+                : liveCursor != null
+                    ? liveCursor.pairIndex()
+                    : orderedCursor != null
+                        ? orderedCursor.pairIndex()
+                        : retainedCursor != null
+                            ? retainedCursor.pairIndex()
+                            : preferredRecoveredMiningPair >= 0
+                                ? preferredRecoveredMiningPair
+                                : recoveredActiveMiningPair >= 0
+                                    ? recoveredActiveMiningPair
+                                    : null;
+            Optional<DurableTeardownRecoveryCursor.Cursor>
+                selectedCursor =
+                    DurableTeardownRecoveryCursor.select(
+                        liveCursor,
+                        checkpointPair,
+                        orderedCursor,
+                        retainedCursor
+                    );
+            if (selectedCursor.isPresent()) {
+                retainedTeardownRecoveryCursor =
+                    selectedCursor.orElseThrow();
+                activePair =
+                    retainedTeardownRecoveryCursor.pairIndex();
+                activeTargetIndex =
+                    retainedTeardownRecoveryCursor.targetIndex();
+                if (liveCursor == null
+                    && !"runtime-heartbeat".equals(checkpoint)) {
+                    debugLog(
+                        "Recovery",
+                        "checkpoint " + checkpoint
+                            + " retained canonical teardown cursor pair="
+                            + activePair + " supportIndex="
+                            + activeTargetIndex + " source="
+                            + (Objects.equals(
+                                orderedCursor,
+                                retainedTeardownRecoveryCursor
+                            )
+                                ? "ordered-route"
+                                : "last-confirmed")
+                    );
+                }
+            } else {
+                if (checkpointPair == null
+                    || retainedTeardownRecoveryCursor != null
+                        && retainedTeardownRecoveryCursor.pairIndex()
+                            != checkpointPair) {
+                    retainedTeardownRecoveryCursor = null;
+                }
+                activePair = checkpointPair;
+            }
+        }
 
         if (logicalSourceName == null
             || activeSourceSha256 == null
@@ -20295,6 +20587,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             localCycleRecoveryCandidate = false;
             recoveredActiveMiningPair = -1;
             recoveredActiveMiningTargetIndex = -1;
+            retainedTeardownRecoveryCursor = null;
             return true;
         } catch (IOException failure) {
             return failLocalCycleCheckpoint(
