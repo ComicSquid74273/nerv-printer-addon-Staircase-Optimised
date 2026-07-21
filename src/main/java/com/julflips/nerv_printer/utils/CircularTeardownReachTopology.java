@@ -22,7 +22,7 @@ import java.util.stream.IntStream;
  */
 public final class CircularTeardownReachTopology {
     public static final int SCHEMA_VERSION = 1;
-    public static final int ALGORITHM_VERSION = 1;
+    public static final int ALGORITHM_VERSION = 2;
 
     private CircularTeardownReachTopology() {
     }
@@ -370,7 +370,7 @@ public final class CircularTeardownReachTopology {
                      sourceIndex < source.orderedTargets().size();
                      sourceIndex++) {
                     Optional<BlockReachWindow.Window> window =
-                        BlockReachWindow.find(
+                        BlockReachWindow.findGuaranteedFromSupportCell(
                             source.orderedTargets().get(sourceIndex),
                             destination.orderedTargets(),
                             standingEyeHeight,

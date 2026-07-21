@@ -19,6 +19,7 @@ public final class CircularBuildMovementPolicy {
         ACTIVE_U_REPAIR,
         HOTBAR_SWAP_CONFIRMATION,
         NEXT_ROUTE_SUPPORT_CONFIRMATION,
+        ROUTE_TURNAROUND,
         OTHER_BUILD_ACTION
     }
 

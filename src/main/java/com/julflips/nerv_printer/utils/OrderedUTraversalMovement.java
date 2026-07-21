@@ -63,6 +63,18 @@ public final class OrderedUTraversalMovement {
         REACHED
     }
 
+    /**
+     * Runtime handoff at the intentional 180-degree pivot of an interrupted
+     * teardown route. The ordered cursor is intentionally horizontal across
+     * mixed-height terrain, so the pivot spends one tick with horizontal
+     * motion braked without adding a separate grounded-Y requirement.
+     */
+    public enum TurnaroundProgress {
+        NOT_A_TURNAROUND,
+        BRAKE_AND_MARK_SETTLED,
+        READY
+    }
+
     public record MovementDecision<T>(
         MovementStatus status,
         T requiredSupport
@@ -91,6 +103,94 @@ public final class OrderedUTraversalMovement {
         return finalSupportCellEntered
             ? EndpointProgress.REACHED
             : EndpointProgress.APPROACHING;
+    }
+
+    public static TurnaroundProgress turnaroundProgress(
+        boolean routeReversal,
+        boolean alreadySettled
+    ) {
+        if (!routeReversal) {
+            return TurnaroundProgress.NOT_A_TURNAROUND;
+        }
+        if (alreadySettled) return TurnaroundProgress.READY;
+        return TurnaroundProgress.BRAKE_AND_MARK_SETTLED;
+    }
+
+    /**
+     * Returns whether a route-derived 180-degree pivot is at or within the
+     * requested number of ordered supports. Normal U corners are not pivots.
+     */
+    public static boolean hasRouteReversalWithin(
+        List<BlockPos> orderedSupports,
+        int currentIndex,
+        int direction,
+        int lookahead
+    ) {
+        Objects.requireNonNull(orderedSupports, "orderedSupports");
+        requireDirection(direction);
+        if (currentIndex < 0 || currentIndex >= orderedSupports.size()) {
+            throw new IllegalArgumentException(
+                "The ordered U cursor is outside its support path."
+            );
+        }
+        if (lookahead < 0) {
+            throw new IllegalArgumentException(
+                "A route-reversal lookahead cannot be negative."
+            );
+        }
+        for (int distance = 0; distance <= lookahead; distance++) {
+            int index = currentIndex + distance * direction;
+            if (index < 0 || index >= orderedSupports.size()) break;
+            if (isRouteReversal(orderedSupports, index)) return true;
+        }
+        return false;
+    }
+
+    public static boolean isRouteReversal(
+        List<BlockPos> orderedSupports,
+        int index
+    ) {
+        Objects.requireNonNull(orderedSupports, "orderedSupports");
+        if (index <= 0 || index >= orderedSupports.size() - 1) {
+            return false;
+        }
+        BlockPos previous = Objects.requireNonNull(
+            orderedSupports.get(index - 1),
+            "previous support"
+        );
+        BlockPos pivot = Objects.requireNonNull(
+            orderedSupports.get(index),
+            "pivot support"
+        );
+        BlockPos next = Objects.requireNonNull(
+            orderedSupports.get(index + 1),
+            "next support"
+        );
+        return CircularTraversalSafety.isRouteReversal(
+            previous.getX() + 0.5,
+            previous.getZ() + 0.5,
+            pivot.getX() + 0.5,
+            pivot.getZ() + 0.5,
+            next.getX() + 0.5,
+            next.getZ() + 0.5
+        );
+    }
+
+    /**
+     * Structural checkpoint validation follows the frozen route endpoints.
+     * An interrupted recovery can enter and exit through the same exterior
+     * support, so endpoint ownership must not depend on those positions being
+     * distinct.
+     */
+    public static <T> boolean ownsStructuralEndpoint(
+        List<T> orderedSupports,
+        T support
+    ) {
+        Objects.requireNonNull(orderedSupports, "orderedSupports");
+        Objects.requireNonNull(support, "support");
+        return !orderedSupports.isEmpty()
+            && (support.equals(orderedSupports.getFirst())
+                || support.equals(orderedSupports.getLast()));
     }
 
     public static Progress resolve(

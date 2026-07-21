@@ -960,6 +960,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int activeContinuousTeardownStageIndex;
     boolean activeContinuousTeardownArmed;
     boolean activeContinuousTeardownRecoveryExit;
+    int activeOrderedUTeardownSettledTurnaroundIndex;
     TeardownScaffoldPhase teardownScaffoldPhase;
     ActiveTeardownScaffoldRecovery activeTeardownScaffoldRecovery;
     int activeTeardownScaffoldHotbarSlot;
@@ -1261,6 +1262,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeContinuousTeardownStageIndex = -1;
         activeContinuousTeardownArmed = false;
         activeContinuousTeardownRecoveryExit = false;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
         teardownScaffoldPhase = TeardownScaffoldPhase.NONE;
         activeTeardownScaffoldRecovery = null;
         activeTeardownScaffoldHotbarSlot = -1;
@@ -5714,6 +5716,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (!activeOrderedUMovement) {
             lastActiveBuildMovementDebugState = null;
             activeCircularRouteSupportIndex = -1;
+            activeOrderedUTeardownSettledTurnaroundIndex = -1;
         }
         if (activeOrderedUMovement) {
             if (activeCircularBuildMovement) {
@@ -8657,6 +8660,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
             }
         }
+        if (traversal.owner()
+                != OrderedUTraversalOwner.PRINTING
+            && holdForActiveOrderedUTeardownTurnaround(
+                supportPath
+            )) {
+            return false;
+        }
         OrderedUTraversalMovement.MovementDecision<BlockPos> decision =
             progress.movement();
         if (decision.status()
@@ -8694,6 +8704,50 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             : 1;
     }
 
+    private boolean holdForActiveOrderedUTeardownTurnaround(
+        List<BlockPos> supportPath
+    ) {
+        int pivotIndex = activeCircularRouteSupportIndex;
+        boolean reversal =
+            OrderedUTraversalMovement.isRouteReversal(
+                supportPath,
+                pivotIndex
+            );
+        BlockPos pivot = supportPath.get(pivotIndex);
+        OrderedUTraversalMovement.TurnaroundProgress progress =
+            OrderedUTraversalMovement.turnaroundProgress(
+                reversal,
+                activeOrderedUTeardownSettledTurnaroundIndex
+                    == pivotIndex
+            );
+        if (progress
+                == OrderedUTraversalMovement.TurnaroundProgress
+                    .NOT_A_TURNAROUND
+            || progress
+                == OrderedUTraversalMovement.TurnaroundProgress.READY) {
+            return false;
+        }
+        if (progress
+            == OrderedUTraversalMovement.TurnaroundProgress
+                .BRAKE_AND_MARK_SETTLED) {
+            activeOrderedUTeardownSettledTurnaroundIndex =
+                pivotIndex;
+        }
+        stopActiveOrderedUForAction(
+            CircularBuildMovementPolicy.HoldReason.ROUTE_TURNAROUND
+        );
+        Utils.setJumpPressed(false);
+        debugActiveOrderedUMovementTransition(
+            "turnaround",
+            "settling shared teardown route reversal pair="
+                + activeContinuousTeardownPair
+                + " cursor=" + pivotIndex
+                + " support=" + pivot.toShortString()
+                + " progress=" + progress
+        );
+        return true;
+    }
+
     private int activeCircularBuildMovementDirection() {
         return circularBuildPlacementBacktrackTarget == null
             ? 1
@@ -8710,6 +8764,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         if (traversal.owner() == OrderedUTraversalOwner.TEARDOWN) {
             if (isSafeUCheckpointSupport(walkingPosition(support))) {
+                return true;
+            }
+            if (isSafeCircularTeardownExteriorSupport(
+                traversal.route(),
+                support
+            )) {
                 return true;
             }
             if (activeContinuousTeardownStages.isEmpty()
@@ -12149,6 +12209,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 || hasUnconfirmedForeignTargetNearDeadline(3))) {
             return false;
         }
+        if (traversal.owner()
+                != OrderedUTraversalOwner.PRINTING
+            && OrderedUTraversalMovement.hasRouteReversalWithin(
+                traversal.supports(),
+                activeCircularRouteSupportIndex,
+                activeOrderedUMovementDirection(traversal),
+                3
+            )) {
+            return false;
+        }
         return !isActiveOrderedUConnectorSegment(traversal);
     }
 
@@ -14705,6 +14775,23 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (isSafeUCheckpointSupport(checkpoint.getLeft())) {
             return true;
         }
+        BlockPos requiredSupport = supportBelowCheckpoint(
+            checkpoint.getLeft()
+        );
+        ActiveOrderedUTraversal traversal = activeOrderedUTraversal();
+        if (traversal != null
+            && traversal.owner()
+                != OrderedUTraversalOwner.PRINTING
+            && OrderedUTraversalMovement.ownsStructuralEndpoint(
+                traversal.supports(),
+                requiredSupport
+            )
+            && isConfirmedActiveOrderedUSupport(
+                traversal,
+                requiredSupport
+            )) {
+            return true;
+        }
         Pair<String, BlockPos> action = checkpoint.getRight();
         if ((!action.getLeft().equals("verifyUTools")
                 && !action.getLeft().equals("resumeUTools")
@@ -14723,9 +14810,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || pairIndex >= compactPlan.pairRoutes().size()) {
             return false;
         }
-        BlockPos requiredSupport = supportBelowCheckpoint(
-            checkpoint.getLeft()
-        );
         if (activeContinuousTeardownStages.isEmpty()
             || !requiredSupport.equals(
                 activeContinuousTeardownStages.getFirst().support()
@@ -15037,7 +15121,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             )
         ));
         checkpoints.add(new Pair<>(
-            walkingPosition(endpoint),
+            walkingPosition(approach),
             new Pair<>(
                 "teardownScaffoldTaskEnd",
                 new BlockPos(route.pairIndex(), 0, 0)
@@ -15089,7 +15173,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 "activeTeardownScaffoldRecovery"
             );
         ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
-            new ArrayList<>(recovery.outwardSupports().size() + 2);
+            new ArrayList<>(recovery.outwardSupports().size() + 3);
         if (localOutwardIndex < 0) {
             stages.add(new ContinuousTeardownRoutePlan.Stage<>(
                 recovery.entryApproach(),
@@ -15130,7 +15214,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
         }
         ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
-            new ArrayList<>(recovery.outwardSupports().size() + 2);
+            new ArrayList<>(recovery.outwardSupports().size() + 3);
         if (standingOnTerminal) {
             stages.add(new ContinuousTeardownRoutePlan.Stage<>(
                 recovery.terminalCleanupTarget(),
@@ -15149,14 +15233,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             recovery.entryEndpoint(),
             List.of()
         ));
+        stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+            recovery.entryApproach(),
+            List.of()
+        ));
         activeContinuousTeardownStages = List.copyOf(stages);
         activeContinuousTeardownPair = recovery.pairIndex();
         activeContinuousTeardownStageIndex = 0;
         activeCircularRouteSupportIndex = 0;
         activeContinuousTeardownArmed = true;
         activeContinuousTeardownRecoveryExit = true;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
         checkpoints.add(new Pair<>(
-            walkingPosition(recovery.entryEndpoint()),
+            walkingPosition(recovery.entryApproach()),
             new Pair<>(
                 "uMiningRecoveryExit",
                 new BlockPos(recovery.pairIndex(), 0, 0)
@@ -15354,10 +15443,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             exit == CircularMiningTraversalPlan.Endpoint.START
                 ? route.outboundX()
                 : route.returnX();
-        BlockPos exitSupport = northWalkwaySupport(exitX);
+        BlockPos exitEndpoint = northWalkwaySupport(exitX);
         List<BlockPos> worldTargets = targets.stream()
             .map(mapCorner::add)
             .toList();
+        BlockPos finalRouteSupport = worldTargets.get(
+            traversalSteps.getLast().standIndex()
+        );
+        BlockPos exitDeparture =
+            OrderedUTraversalMovement.exitDepartureSupport(
+                exitEndpoint,
+                finalRouteSupport
+            );
         activeContinuousTeardownStages =
             ContinuousTeardownRoutePlan.create(
                 worldTargets,
@@ -15365,7 +15462,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 remoteWorldTargetsBySupport,
                 remoteResumeSupportIndex,
                 entrySupports,
-                exitSupport,
+                List.of(exitEndpoint, exitDeparture),
                 mapCorner.add(targets.get(finalRemoveIndex))
             ).stages();
         activeContinuousTeardownPair = route.pairIndex();
@@ -15373,7 +15470,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeContinuousTeardownArmed = false;
         activeContinuousTeardownRecoveryExit = false;
         checkpoints.add(new Pair<>(
-            walkingPosition(exitSupport),
+            walkingPosition(exitDeparture),
             new Pair<>("uMiningTaskEnd", null)
         ));
         state = State.MiningUTraversal;
@@ -15447,10 +15544,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 ? route.outboundX()
                 : route.returnX();
         BlockPos walkway = northWalkwaySupport(endpointX);
+        BlockPos departure = circularMiningExitDepartureSupport(
+            route,
+            egressPlan.orElseThrow().exit()
+        );
         ArrayList<
             ContinuousTeardownRoutePlan.Stage<BlockPos>
         > egressStages = new ArrayList<>(
-            supportIndices.size() + 1
+            supportIndices.size() + 2
         );
         for (int supportIndex : supportIndices) {
             egressStages.add(
@@ -15466,6 +15567,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 List.of()
             )
         );
+        egressStages.add(
+            new ContinuousTeardownRoutePlan.Stage<>(
+                departure,
+                List.of()
+            )
+        );
         activeContinuousTeardownStages =
             List.copyOf(egressStages);
         activeContinuousTeardownPair = route.pairIndex();
@@ -15473,8 +15580,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularRouteSupportIndex = 0;
         activeContinuousTeardownArmed = true;
         activeContinuousTeardownRecoveryExit = true;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
         checkpoints.add(new Pair<>(
-            walkingPosition(walkway),
+            walkingPosition(departure),
             new Pair<>(
                 "uMiningRecoveryExit",
                 new BlockPos(route.pairIndex(), 0, 0)
@@ -15766,7 +15874,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
         ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
             new ArrayList<>(
-                outward.size() + (includeTerminalEntry ? 2 : 1)
+                outward.size() + (includeTerminalEntry ? 3 : 2)
             );
         if (includeTerminalEntry) {
             stages.add(new ContinuousTeardownRoutePlan.Stage<>(
@@ -15797,11 +15905,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 List.of(outward.getFirst())
             ));
         }
+        stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+            recovery.entryApproach(),
+            List.of()
+        ));
         activeContinuousTeardownStages = List.copyOf(stages);
         activeContinuousTeardownPair = recovery.pairIndex();
         activeContinuousTeardownStageIndex = 0;
         activeCircularRouteSupportIndex = 0;
         activeContinuousTeardownRecoveryExit = false;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
     }
 
     private void completeTeardownScaffoldRecovery() {
@@ -15956,7 +16069,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ) {
         double standingEyeHeight =
             mc.player.getEyePos().y - mc.player.getY();
-        return BlockReachWindow.find(
+        return BlockReachWindow.findGuaranteedFromSupportCell(
             new BlockReachWindow.Cell(
                 target.getX(),
                 target.getY(),
@@ -16361,6 +16474,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularRouteSupportIndex = -1;
         activeContinuousTeardownArmed = false;
         activeContinuousTeardownRecoveryExit = false;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
         clearTeardownScaffoldRecoveryState();
         teardownMineFirstDispatchTick = -1L;
         teardownMineLastDispatchTick = -1L;
@@ -16424,6 +16538,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeContinuousTeardownStageIndex = 0;
         activeCircularRouteSupportIndex = 0;
         activeContinuousTeardownArmed = true;
+        activeOrderedUTeardownSettledTurnaroundIndex = -1;
         debugLog(
             category,
             "activated " + description
@@ -19158,6 +19273,49 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             endpoint,
             finalRouteSupport
         );
+    }
+
+    private BlockPos circularMiningExitDepartureSupport(
+        CompactCircularNbtPlan.PairRoute route,
+        CircularMiningTraversalPlan.Endpoint endpoint
+    ) {
+        int endpointX = endpoint
+                == CircularMiningTraversalPlan.Endpoint.START
+            ? route.outboundX()
+            : route.returnX();
+        BlockPos walkway = northWalkwaySupport(endpointX);
+        BlockPos finalRouteSupport = mapCorner.add(
+            endpoint == CircularMiningTraversalPlan.Endpoint.START
+                ? surfaceRuntimePosition(route.outboundX(), 1)
+                : surfaceRuntimePosition(route.returnX(), 1)
+        );
+        return OrderedUTraversalMovement.exitDepartureSupport(
+            walkway,
+            finalRouteSupport
+        );
+    }
+
+    private boolean isSafeCircularTeardownExteriorSupport(
+        CompactCircularNbtPlan.PairRoute route,
+        BlockPos support
+    ) {
+        for (CircularMiningTraversalPlan.Endpoint endpoint
+            : CircularMiningTraversalPlan.Endpoint.values()) {
+            BlockPos departure = circularMiningExitDepartureSupport(
+                route,
+                endpoint
+            );
+            if (!support.equals(departure)) continue;
+            int endpointX = endpoint
+                    == CircularMiningTraversalPlan.Endpoint.START
+                ? route.outboundX()
+                : route.returnX();
+            return isSafeCircularExteriorSupport(
+                endpointX,
+                departure
+            );
+        }
+        return false;
     }
 
     private boolean isSafeCircularBuildAlignment(

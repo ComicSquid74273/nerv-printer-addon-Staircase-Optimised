@@ -52,9 +52,10 @@ public final class ContinuousTeardownRoutePlan {
 
     /**
      * Builds optional entry-route stages, one internal stage per ordered
-     * standing support, and one final exit stage. Endpoint entry supplies the
-     * same approach and endpoint supports used by printing; local resume
-     * supplies only the already occupied U support. Remotely assigned targets are grouped with their
+     * standing support, and the ordered exit supports. Endpoint entry and
+     * exit supply the same exterior approach/departure plus north-walkway
+     * supports used by printing; local resume supplies only the already
+     * occupied U support. Remotely assigned targets are grouped with their
      * destination support instead of creating repeated navigation checkpoints
      * there.
      */
@@ -64,7 +65,7 @@ public final class ContinuousTeardownRoutePlan {
         Map<Integer, ? extends List<T>> remoteTargetsBySupport,
         int remoteResumeSupportIndex,
         List<T> entrySupports,
-        T exitSupport,
+        List<T> exitSupports,
         T finalBreakTarget
     ) {
         Objects.requireNonNull(
@@ -77,11 +78,16 @@ public final class ContinuousTeardownRoutePlan {
             "remoteTargetsBySupport"
         );
         Objects.requireNonNull(entrySupports, "entrySupports");
-        Objects.requireNonNull(exitSupport, "exitSupport");
+        Objects.requireNonNull(exitSupports, "exitSupports");
         Objects.requireNonNull(finalBreakTarget, "finalBreakTarget");
         if (orderedRouteTargets.isEmpty() || traversalSteps.isEmpty()) {
             throw new IllegalArgumentException(
                 "A teardown route requires targets and traversal steps."
+            );
+        }
+        if (exitSupports.isEmpty()) {
+            throw new IllegalArgumentException(
+                "A teardown route requires an exit support."
             );
         }
         if (remoteResumeSupportIndex < 0
@@ -92,7 +98,9 @@ public final class ContinuousTeardownRoutePlan {
         }
 
         ArrayList<Stage<T>> stages = new ArrayList<>(
-            traversalSteps.size() + entrySupports.size() + 1
+            traversalSteps.size()
+                + entrySupports.size()
+                + exitSupports.size()
         );
         HashSet<T> scheduledTargets = new HashSet<>();
         // Always wait until the traversal actually enters the resume support.
@@ -172,14 +180,25 @@ public final class ContinuousTeardownRoutePlan {
             stages.add(new Stage<>(support, stageTargets));
         }
 
-        addUniqueTarget(
-            new ArrayList<>(),
-            scheduledTargets,
-            finalBreakTarget
-        );
-        stages.add(
-            new Stage<>(exitSupport, List.of(finalBreakTarget))
-        );
+        for (int index = 0; index < exitSupports.size(); index++) {
+            T support = Objects.requireNonNull(
+                exitSupports.get(index),
+                "exit support"
+            );
+            List<T> breakTargets;
+            if (index == 0) {
+                ArrayList<T> finalTargets = new ArrayList<>(1);
+                addUniqueTarget(
+                    finalTargets,
+                    scheduledTargets,
+                    finalBreakTarget
+                );
+                breakTargets = finalTargets;
+            } else {
+                breakTargets = List.of();
+            }
+            stages.add(new Stage<>(support, breakTargets));
+        }
         validateFutureSupportsRemainIntact(stages);
         return new Plan<>(stages);
     }

@@ -32,7 +32,7 @@ class ContinuousTeardownRoutePlanTest {
             Map.of(),
             0,
             List.of("alignment", "walkway"),
-            "exit",
+            List.of("exit"),
             targets.get(traversal.finalRemoveIndex())
         );
 
@@ -81,7 +81,7 @@ class ContinuousTeardownRoutePlanTest {
             Map.of(1, List.of("remote0", "remote1")),
             0,
             List.of("alignment", "walkway"),
-            "exit",
+            List.of("exit"),
             targets.get(traversal.finalRemoveIndex())
         );
 
@@ -116,7 +116,7 @@ class ContinuousTeardownRoutePlanTest {
             Map.of(),
             traversal.steps().get(2).standIndex(),
             List.of("u4"),
-            "exit",
+            List.of("exit"),
             targets.get(traversal.finalRemoveIndex())
         );
 
@@ -151,7 +151,7 @@ class ContinuousTeardownRoutePlanTest {
             Map.of(2, List.of("remote2")),
             0,
             List.of("u2"),
-            "exit",
+            List.of("exit"),
             targets.get(traversal.finalRemoveIndex())
         );
 
@@ -185,7 +185,7 @@ class ContinuousTeardownRoutePlanTest {
                 Map.of(1, List.of("u0")),
                 0,
                 List.of("alignment", "walkway"),
-                "exit",
+                List.of("exit"),
                 "u1"
             )
         );
@@ -205,10 +205,56 @@ class ContinuousTeardownRoutePlanTest {
                 Map.of(0, List.of("u2")),
                 0,
                 List.of("alignment", "walkway"),
-                "exit",
+                List.of("exit"),
                 "u0"
             )
         );
+    }
+
+    @Test
+    void northExitWalksThroughWalkwayToExteriorDeparture() {
+        List<String> targets = List.of("u0", "u1", "u2");
+        CircularMiningTraversalPlan.Plan traversal =
+            CircularMiningTraversalPlan.create(
+                targets.size(),
+                CircularMiningRecoveryPlan.analyze(
+                    List.of(
+                        CircularMiningRecoveryPlan.Cell.WALKABLE,
+                        CircularMiningRecoveryPlan.Cell.WALKABLE,
+                        CircularMiningRecoveryPlan.Cell.WALKABLE
+                    )
+                )
+            );
+
+        var plan = ContinuousTeardownRoutePlan.create(
+            targets,
+            traversal.steps(),
+            Map.of(),
+            0,
+            List.of("entry-departure", "entry-walkway"),
+            List.of("exit-walkway", "exit-departure"),
+            targets.get(traversal.finalRemoveIndex())
+        );
+
+        assertEquals(
+            List.of(
+                "entry-departure",
+                "entry-walkway",
+                "u0",
+                "u1",
+                "u2",
+                "exit-walkway",
+                "exit-departure"
+            ),
+            plan.stages().stream()
+                .map(ContinuousTeardownRoutePlan.Stage::support)
+                .toList()
+        );
+        assertEquals(
+            List.of(targets.get(traversal.finalRemoveIndex())),
+            plan.stages().get(5).breakTargets()
+        );
+        assertTrue(plan.stages().getLast().breakTargets().isEmpty());
     }
 
     @Test

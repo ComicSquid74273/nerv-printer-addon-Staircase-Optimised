@@ -7,7 +7,6 @@ import java.util.HashSet;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CircularTeardownReachTopologyTest {
@@ -39,10 +38,7 @@ class CircularTeardownReachTopologyTest {
             topology.relation(2, 1).orElseThrow()
                 .preserveStartFullyReachable()
         );
-        assertFalse(
-            topology.relation(0, 2).orElseThrow()
-                .preserveStartFullyReachable()
-        );
+        assertTrue(topology.relation(0, 2).isEmpty());
     }
 
     @Test
@@ -52,7 +48,7 @@ class CircularTeardownReachTopologyTest {
                 PLAN_HASH,
                 List.of(uRoute(0, 0), uRoute(1, 2)),
                 1.62,
-                2.4
+                2.7
             );
 
         assertEquals(
@@ -70,6 +66,37 @@ class CircularTeardownReachTopologyTest {
                 1
             ).isEmpty()
         );
+    }
+
+    @Test
+    void rejectsCenterOnlyReachThatSprintingCannotGuarantee() {
+        CircularTeardownReachTopology.Snapshot topology =
+            CircularTeardownReachTopology.compile(
+                PLAN_HASH,
+                List.of(
+                    new CircularTeardownReachTopology.Route(
+                        0,
+                        List.of(new BlockReachWindow.Cell(0, 100, 4))
+                    ),
+                    new CircularTeardownReachTopology.Route(
+                        1,
+                        List.of(new BlockReachWindow.Cell(2, 100, 0))
+                    )
+                ),
+                1.62,
+                5.0
+            );
+
+        assertTrue(
+            BlockReachWindow.find(
+                new BlockReachWindow.Cell(0, 100, 4),
+                List.of(new BlockReachWindow.Cell(2, 100, 0)),
+                1.62,
+                5.0
+            ).isPresent()
+        );
+        assertTrue(topology.relation(0, 1).isEmpty());
+        assertEquals(List.of(0, 1), topology.fullMapTraversalRoutes());
     }
 
     @Test

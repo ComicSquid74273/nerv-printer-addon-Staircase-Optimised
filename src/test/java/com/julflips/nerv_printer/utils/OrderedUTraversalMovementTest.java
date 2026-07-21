@@ -126,6 +126,97 @@ class OrderedUTraversalMovementTest {
     }
 
     @Test
+    void recoveryReversalIsDetectedWithoutTreatingCornersAsPivots() {
+        List<BlockPos> recovery = List.of(
+            new BlockPos(0, 10, 0),
+            new BlockPos(0, 11, 1),
+            new BlockPos(0, 10, 2),
+            new BlockPos(0, 11, 1),
+            new BlockPos(0, 10, 0)
+        );
+        List<BlockPos> corner = List.of(
+            new BlockPos(0, 10, 0),
+            new BlockPos(0, 10, 1),
+            new BlockPos(1, 10, 1)
+        );
+
+        assertTrue(
+            OrderedUTraversalMovement.isRouteReversal(recovery, 2)
+        );
+        assertTrue(
+            OrderedUTraversalMovement.hasRouteReversalWithin(
+                recovery,
+                0,
+                1,
+                2
+            )
+        );
+        assertFalse(
+            OrderedUTraversalMovement.hasRouteReversalWithin(
+                recovery,
+                0,
+                1,
+                1
+            )
+        );
+        assertFalse(
+            OrderedUTraversalMovement.isRouteReversal(corner, 1)
+        );
+    }
+
+    @Test
+    void teardownTurnaroundUsesOneHorizontalBrakeTick() {
+        assertEquals(
+            OrderedUTraversalMovement.TurnaroundProgress
+                .NOT_A_TURNAROUND,
+            OrderedUTraversalMovement.turnaroundProgress(
+                false,
+                false
+            )
+        );
+        assertEquals(
+            OrderedUTraversalMovement.TurnaroundProgress
+                .BRAKE_AND_MARK_SETTLED,
+            OrderedUTraversalMovement.turnaroundProgress(
+                true,
+                false
+            )
+        );
+        assertEquals(
+            OrderedUTraversalMovement.TurnaroundProgress.READY,
+            OrderedUTraversalMovement.turnaroundProgress(
+                true,
+                true
+            )
+        );
+    }
+
+    @Test
+    void recoveryMayOwnTheSameExteriorSupportForEntryAndExit() {
+        BlockPos exterior = new BlockPos(0, 10, -1);
+        List<BlockPos> recovery = List.of(
+            exterior,
+            new BlockPos(0, 10, 0),
+            new BlockPos(0, 10, 1),
+            new BlockPos(0, 10, 0),
+            exterior
+        );
+
+        assertTrue(
+            OrderedUTraversalMovement.ownsStructuralEndpoint(
+                recovery,
+                exterior
+            )
+        );
+        assertFalse(
+            OrderedUTraversalMovement.ownsStructuralEndpoint(
+                recovery,
+                new BlockPos(0, 10, 1)
+            )
+        );
+    }
+
+    @Test
     void steeringUsesStraightSegmentsInsteadOfPerBlockCenters() {
         List<BlockPos> route = List.of(
             new BlockPos(0, 10, -1),
