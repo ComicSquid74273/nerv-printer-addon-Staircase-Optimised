@@ -51,6 +51,46 @@ public final class BlockReachWindow {
         double standingEyeHeight,
         double maximumReach
     ) {
+        return find(
+            target,
+            orderedSupports,
+            standingEyeHeight,
+            maximumReach,
+            false
+        );
+    }
+
+    /**
+     * Finds supports from which the target remains reachable for every
+     * horizontal eye position inside the one-block support cell.
+     *
+     * <p>This is the deadline proof used by moving placement schedules. A
+     * center-only opportunity close to the configured reach boundary is still
+     * useful for opportunistic placement, but it is not safe as the final
+     * support from which a sprinting player must complete the block.</p>
+     */
+    public static Optional<Window> findGuaranteedFromSupportCell(
+        Cell target,
+        List<Cell> orderedSupports,
+        double standingEyeHeight,
+        double maximumReach
+    ) {
+        return find(
+            target,
+            orderedSupports,
+            standingEyeHeight,
+            maximumReach,
+            true
+        );
+    }
+
+    private static Optional<Window> find(
+        Cell target,
+        List<Cell> orderedSupports,
+        double standingEyeHeight,
+        double maximumReach,
+        boolean requireWholeSupportCell
+    ) {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(orderedSupports, "orderedSupports");
         if (!Double.isFinite(standingEyeHeight)
@@ -69,8 +109,12 @@ public final class BlockReachWindow {
                 orderedSupports.get(index),
                 "support"
             );
-            double dx = support.x() - target.x();
-            double dz = support.z() - target.z();
+            double dx = Math.abs(support.x() - target.x());
+            double dz = Math.abs(support.z() - target.z());
+            if (requireWholeSupportCell) {
+                dx += 0.5;
+                dz += 0.5;
+            }
             double eyeY =
                 support.y() + 1.0 + standingEyeHeight;
             double targetCenterY = target.y() + 0.5;

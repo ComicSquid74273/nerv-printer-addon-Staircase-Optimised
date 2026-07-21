@@ -7,7 +7,9 @@ import java.util.HashSet;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CircularBuildCheckpointPlanTest {
     @Test
@@ -78,6 +80,56 @@ class CircularBuildCheckpointPlanTest {
                 "start",
                 List.of("only-one-far-end"),
                 "finish"
+            )
+        );
+    }
+
+    @Test
+    void phaseHandoffsKeepSteeringWithoutStoppingForwardMovement() {
+        assertTrue(
+            CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                CircularBuildCheckpointPlan.TraversalPhase.OUTBOUND,
+                1
+            )
+        );
+        assertTrue(
+            CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                CircularBuildCheckpointPlan.TraversalPhase.CONNECTOR,
+                1
+            )
+        );
+        assertFalse(
+            CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                CircularBuildCheckpointPlan.TraversalPhase.RETURN,
+                1
+            )
+        );
+        assertFalse(
+            CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                CircularBuildCheckpointPlan.TraversalPhase.OUTBOUND,
+                -1
+            )
+        );
+    }
+
+    @Test
+    void completeRouteCanConsumeOnlyTheFinalNorthExit() {
+        assertFalse(
+            CircularBuildCheckpointPlan.routeCompletionReachesCheckpoint(
+                false,
+                true
+            )
+        );
+        assertFalse(
+            CircularBuildCheckpointPlan.routeCompletionReachesCheckpoint(
+                true,
+                false
+            )
+        );
+        assertTrue(
+            CircularBuildCheckpointPlan.routeCompletionReachesCheckpoint(
+                true,
+                true
             )
         );
     }

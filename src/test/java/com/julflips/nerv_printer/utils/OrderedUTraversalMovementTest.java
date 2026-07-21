@@ -12,6 +12,41 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class OrderedUTraversalMovementTest {
     @Test
+    void reversesThroughTheSameVerifiedSupportRouteForPlacementBacktrack() {
+        List<BlockPos> supports = List.of(
+            new BlockPos(0, 64, 0),
+            new BlockPos(0, 64, 1),
+            new BlockPos(0, 64, 2),
+            new BlockPos(1, 64, 2)
+        );
+
+        OrderedUTraversalMovement.Progress progress =
+            OrderedUTraversalMovement.resolve(
+                supports,
+                2,
+                -1,
+                0.5,
+                1.5,
+                ignored -> true
+            );
+
+        assertEquals(1, progress.currentIndex());
+        assertEquals(
+            OrderedUTraversalMovement.MovementStatus.READY,
+            progress.movement().status()
+        );
+        assertEquals(supports.get(0), progress.movement().requiredSupport());
+        assertEquals(
+            0,
+            OrderedUTraversalMovement.steeringGoalIndex(
+                supports,
+                1,
+                -1
+            )
+        );
+    }
+
+    @Test
     void printingAndTeardownResolveTheSameSupportProgress() {
         List<BlockPos> route = List.of(
             new BlockPos(0, 10, -2),

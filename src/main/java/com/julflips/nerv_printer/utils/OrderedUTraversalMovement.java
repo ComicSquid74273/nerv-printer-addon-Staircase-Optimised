@@ -100,15 +100,38 @@ public final class OrderedUTraversalMovement {
         double playerZ,
         Predicate<? super BlockPos> isConfirmedReady
     ) {
+        return resolve(
+            orderedSupports,
+            currentIndex,
+            1,
+            playerX,
+            playerZ,
+            isConfirmedReady
+        );
+    }
+
+    public static Progress resolve(
+        List<BlockPos> orderedSupports,
+        int currentIndex,
+        int direction,
+        double playerX,
+        double playerZ,
+        Predicate<? super BlockPos> isConfirmedReady
+    ) {
         Objects.requireNonNull(orderedSupports, "orderedSupports");
         Objects.requireNonNull(isConfirmedReady, "isConfirmedReady");
+        requireDirection(direction);
         OptionalInt resolved = OrderedRouteProgressResolver.resolve(
             orderedSupports,
             currentIndex,
+            direction,
             playerX,
             playerZ
         );
-        if (resolved.isEmpty() && currentIndex > 0) {
+        int correctionIndex = currentIndex - direction;
+        if (resolved.isEmpty()
+            && correctionIndex >= 0
+            && correctionIndex < orderedSupports.size()) {
             // A server correction may put the player back on the immediately
             // previous support after the client cursor entered the next one.
             // Accept only that adjacent route cell; arbitrary backward scans
@@ -116,7 +139,7 @@ public final class OrderedUTraversalMovement {
             resolved = OrderedRouteProgressResolver.resolve(
                 orderedSupports,
                 currentIndex,
-                -1,
+                -direction,
                 playerX,
                 playerZ
             );
@@ -138,6 +161,7 @@ public final class OrderedUTraversalMovement {
             decideMovement(
                 orderedSupports,
                 resolvedIndex,
+                direction,
                 isConfirmedReady
             )
         );
@@ -177,22 +201,38 @@ public final class OrderedUTraversalMovement {
         int currentIndex,
         Predicate<? super T> isConfirmedReady
     ) {
+        return decideMovement(
+            orderedSupports,
+            currentIndex,
+            1,
+            isConfirmedReady
+        );
+    }
+
+    public static <T> MovementDecision<T> decideMovement(
+        List<T> orderedSupports,
+        int currentIndex,
+        int direction,
+        Predicate<? super T> isConfirmedReady
+    ) {
         Objects.requireNonNull(orderedSupports, "orderedSupports");
         Objects.requireNonNull(isConfirmedReady, "isConfirmedReady");
+        requireDirection(direction);
         if (currentIndex < 0 || currentIndex >= orderedSupports.size()) {
             return new MovementDecision<>(
                 MovementStatus.OFF_PATH,
                 null
             );
         }
-        if (currentIndex + 1 >= orderedSupports.size()) {
+        int nextIndex = currentIndex + direction;
+        if (nextIndex < 0 || nextIndex >= orderedSupports.size()) {
             return new MovementDecision<>(
                 MovementStatus.COMPLETE,
                 null
             );
         }
         T nextSupport = Objects.requireNonNull(
-            orderedSupports.get(currentIndex + 1),
+            orderedSupports.get(nextIndex),
             "next support"
         );
         return new MovementDecision<>(
@@ -212,27 +252,41 @@ public final class OrderedUTraversalMovement {
         List<BlockPos> orderedSupports,
         int currentIndex
     ) {
+        return steeringGoalIndex(
+            orderedSupports,
+            currentIndex,
+            1
+        );
+    }
+
+    public static int steeringGoalIndex(
+        List<BlockPos> orderedSupports,
+        int currentIndex,
+        int direction
+    ) {
         Objects.requireNonNull(orderedSupports, "orderedSupports");
+        requireDirection(direction);
         if (currentIndex < 0 || currentIndex >= orderedSupports.size()) {
             throw new IllegalArgumentException(
                 "The ordered U cursor is outside its support path."
             );
         }
-        if (currentIndex + 1 >= orderedSupports.size()) {
+        int nextIndex = currentIndex + direction;
+        if (nextIndex < 0 || nextIndex >= orderedSupports.size()) {
             return currentIndex;
         }
 
         BlockPos current = orderedSupports.get(currentIndex);
-        BlockPos next = orderedSupports.get(currentIndex + 1);
+        BlockPos next = orderedSupports.get(nextIndex);
         int directionX = next.getX() - current.getX();
         int directionZ = next.getZ() - current.getZ();
         requireHorizontalStep(directionX, directionZ);
 
-        int goalIndex = currentIndex + 1;
-        for (int index = currentIndex + 2;
-             index < orderedSupports.size();
-             index++) {
-            BlockPos previous = orderedSupports.get(index - 1);
+        int goalIndex = nextIndex;
+        for (int index = currentIndex + 2 * direction;
+             index >= 0 && index < orderedSupports.size();
+             index += direction) {
+            BlockPos previous = orderedSupports.get(index - direction);
             BlockPos candidate = orderedSupports.get(index);
             int stepX = candidate.getX() - previous.getX();
             int stepZ = candidate.getZ() - previous.getZ();
@@ -306,4 +360,13 @@ public final class OrderedUTraversalMovement {
             );
         }
     }
+
+    private static void requireDirection(int direction) {
+        if (direction != -1 && direction != 1) {
+            throw new IllegalArgumentException(
+                "Ordered U direction must be -1 or 1."
+            );
+        }
+    }
+
 }

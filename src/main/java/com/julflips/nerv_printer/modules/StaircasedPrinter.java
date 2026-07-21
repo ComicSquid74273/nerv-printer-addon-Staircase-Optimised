@@ -138,6 +138,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         TEARDOWN_REACH_POSITION_TOLERANCE = 0.20;
     private static final double
         TEARDOWN_STANDING_EYE_HEIGHT = 1.62;
+    private static final double
+        BUILD_STANDING_EYE_HEIGHT = 1.62;
     private static final int MINING_RECOVERY_STABLE_SNAPSHOT_TICKS = 2;
     private static final int DEFAULT_DEBUG_PRINT_INTERVAL_TICKS = 200;
     private static final int LOCAL_CYCLE_HEARTBEAT_TICKS = 20;
@@ -889,6 +891,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     HashSet<BlockPos> plannedDeferredMandatoryBuildTargets;
     HashMap<BlockPos, BlockReachWindow.Window>
         plannedDeferredReachWindows;
+    HashMap<BlockPos, CircularBuildReachTopology.TargetReach>
+        plannedForeignBuildReachTargets;
+    HashMap<BlockPos, BlockReachWindow.Window>
+        plannedForeignBuildReachWindows;
     HashSet<Integer> optimizedCircularTraversalPairs;
     HashMap<Integer, List<BlockPos>> optimizedDeferredBuildTargets;
     HashMap<Integer, Integer> optimizedDeferredRouteAssignments;
@@ -907,6 +913,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     Path circularTeardownReachTopologyFile;
     HashMap<BlockPos, CircularTeardownTargetReference>
         circularTeardownTargetReferences;
+    CircularBuildReachTopology.Snapshot
+        circularBuildReachTopology;
+    Path circularBuildReachTopologyFile;
+    HashMap<BlockPos, CircularBuildTargetReference>
+        circularBuildTargetReferences;
     int preferredRecoveredMiningPair;
     DurableTeardownRecoveryCursor.Cursor retainedTeardownRecoveryCursor;
     HashSet<BlockPos> confirmedBuildTargetsThisRun;
@@ -931,6 +942,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildMovementHoldReasonThisTick;
     BlockPos buildMovementRequiredSupportThisTick;
     int activeCircularRouteSupportIndex;
+    int circularBuildPlacementBacktrackSupportIndex;
+    BlockPos circularBuildPlacementBacktrackTarget;
     String lastActiveBuildMovementDebugState;
     SpeedMineSettingsSnapshot ownedSpeedMineSnapshot;
     SpeedMineOwner speedMineOwner;
@@ -1179,6 +1192,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         plannedDeferredMandatoryBuildOrder = new ArrayList<>();
         plannedDeferredMandatoryBuildTargets = new HashSet<>();
         plannedDeferredReachWindows = new HashMap<>();
+        plannedForeignBuildReachTargets = new HashMap<>();
+        plannedForeignBuildReachWindows = new HashMap<>();
         optimizedCircularTraversalPairs = new HashSet<>();
         optimizedDeferredBuildTargets = new HashMap<>();
         optimizedDeferredRouteAssignments = new HashMap<>();
@@ -1189,6 +1204,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         circularTeardownReachTopology = null;
         circularTeardownReachTopologyFile = null;
         circularTeardownTargetReferences = new HashMap<>();
+        circularBuildReachTopology = null;
+        circularBuildReachTopologyFile = null;
+        circularBuildTargetReferences = new HashMap<>();
         preferredRecoveredMiningPair = -1;
         retainedTeardownRecoveryCursor = null;
         confirmedBuildTargetsThisRun = new HashSet<>();
@@ -1220,6 +1238,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             CircularBuildMovementPolicy.HoldReason.NONE;
         buildMovementRequiredSupportThisTick = null;
         activeCircularRouteSupportIndex = -1;
+        circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackTarget = null;
         lastActiveBuildMovementDebugState = null;
         ownedSpeedMineSnapshot = null;
         speedMineOwner = SpeedMineOwner.NONE;
@@ -5679,14 +5699,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         if (activeOrderedUMovement) {
             if (activeCircularBuildMovement) {
-                runBuildActionScheduler();
+                ensureActiveOrderedUNextSupport(
+                    activeOrderedUTraversal
+                );
+                if (!buildRecoveryPending
+                    && state == State.Walking) {
+                    runBuildActionScheduler();
+                }
             } else if (activeOrderedUTraversal.owner()
                 == OrderedUTraversalOwner.TEARDOWN_SCAFFOLD
                 && teardownScaffoldPhase
                     == TeardownScaffoldPhase.BUILDING_OUTBOUND) {
                 runTeardownScaffoldPlacementScheduler();
             }
-            if (!buildMovementBlockedThisTick) {
+            if (!activeCircularBuildMovement
+                && !buildMovementBlockedThisTick) {
                 ensureActiveOrderedUNextSupport(
                     activeOrderedUTraversal
                 );
@@ -5733,7 +5760,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     "holding final shared ordered U support owner="
                         + activeOrderedUTraversal.owner()
                         + " cursor="
-                        + activeCircularRouteSupportIndex
+                            + activeCircularRouteSupportIndex
                         + " while remaining work receives server "
                         + "confirmation"
                 );
@@ -5750,6 +5777,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         boolean activeOrderedRouteComplete =
             activeOrderedUMovement
+                && activeOrderedUMovementDirection(
+                    activeOrderedUTraversal
+                ) > 0
                 && activeCircularRouteSupportIndex
                     == activeOrderedUTraversal.supports().size() - 1;
         if ((state.equals(State.Walking)
@@ -5783,11 +5813,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Vec3d checkpointGoal = followingCircularConnector
             ? currentCircularConnectorGoal()
             : checkpoints.get(0).getLeft();
-        Vec3d movementGoal = activeOrderedUMovement
-            ? currentActiveOrderedUMovementGoal(
-                activeOrderedUTraversal
-            )
-            : checkpointGoal;
+        Vec3d movementGoal = currentWalkingMovementGoal(
+            activeOrderedUTraversal,
+            checkpointGoal
+        );
         if (activeOrderedUMovement
             || followingCircularConnector
             || state == State.MiningUTraversal
@@ -5867,6 +5896,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 || isLogisticsDetourCheckpoint(checkpoints.get(0));
         String currentCheckpointAction =
             checkpoints.get(0).getRight().getLeft();
+        boolean completeCircularRouteReachesCheckpoint =
+            activeCircularBuildMovement
+                && CircularBuildCheckpointPlan
+                    .routeCompletionReachesCheckpoint(
+                        currentCheckpointAction.equals("finishPair"),
+                        activeOrderedRouteComplete
+                    );
         boolean connectorHandoffCheckpoint =
             activeCircularBuildPair >= 0
                 && (currentCheckpointAction.equals("uBuildOutboundEnd")
@@ -5886,7 +5922,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         OrderedUTraversalMovement.EndpointProgress
             printingEndpointProgress = activeCircularBuildMovement
                 ? OrderedUTraversalMovement.endpointProgress(
-                    activeOrderedRouteComplete
+                    completeCircularRouteReachesCheckpoint
                 )
                 : OrderedUTraversalMovement.EndpointProgress.APPROACHING;
         if (uEndpoint
@@ -6200,6 +6236,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         activeCircularConnectorIndex = 0;
                         activeCircularPlacementCursor = 0;
                         activeCircularRouteSupportIndex = 0;
+                        circularBuildPlacementBacktrackSupportIndex = -1;
+                        circularBuildPlacementBacktrackTarget = null;
                         releaseBuildRepairSpeedMine();
                         buildRepairController.reset();
                         circularBuildPhase = CircularBuildPhase.OUTBOUND;
@@ -6677,11 +6715,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             activeOrderedUTraversal = activeOrderedUTraversal();
             activeOrderedUMovement =
                 activeOrderedUTraversal != null;
-            movementGoal = activeOrderedUMovement
-                ? currentActiveOrderedUMovementGoal(
-                    activeOrderedUTraversal
-                )
-                : checkpointGoal;
+            movementGoal = currentWalkingMovementGoal(
+                activeOrderedUTraversal,
+                checkpointGoal
+            );
         }
 
         //Set yaw rotation
@@ -8482,10 +8519,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             toggle();
             return false;
         }
+        int movementDirection =
+            activeOrderedUMovementDirection(traversal);
         OrderedUTraversalMovement.Progress progress =
             OrderedUTraversalMovement.resolve(
                 supportPath,
                 activeCircularRouteSupportIndex,
+                movementDirection,
                 mc.player.getX(),
                 mc.player.getZ(),
                 support -> isConfirmedActiveOrderedUSupport(
@@ -8539,7 +8579,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             int previousSupportIndex =
                 activeCircularRouteSupportIndex;
             activeCircularRouteSupportIndex = nextResolvedIndex;
-            if (nextResolvedIndex < previousSupportIndex) {
+            if (nextResolvedIndex < previousSupportIndex
+                && movementDirection > 0) {
                 debugLog(
                     "Movement",
                     "reconciled server position correction owner="
@@ -8591,6 +8632,22 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildMovementRequiredSupportThisTick =
             new BlockPos(decision.requiredSupport());
         return false;
+    }
+
+    private int activeOrderedUMovementDirection(
+        ActiveOrderedUTraversal traversal
+    ) {
+        return traversal.owner() == OrderedUTraversalOwner.PRINTING
+            ? activeCircularBuildMovementDirection()
+            : 1;
+    }
+
+    private int activeCircularBuildMovementDirection() {
+        return circularBuildPlacementBacktrackSupportIndex >= 0
+            && activeCircularRouteSupportIndex
+                > circularBuildPlacementBacktrackSupportIndex
+            ? -1
+            : 1;
     }
 
     private boolean isConfirmedActiveOrderedUSupport(
@@ -8702,11 +8759,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return true;
         }
 
-        int lastIndex = Math.min(
-            supportPath.size() - 1,
-            activeCircularRouteSupportIndex + 1
+        int movementDirection =
+            activeCircularBuildMovementDirection();
+        int adjacentIndex = Math.max(
+            0,
+            Math.min(
+                supportPath.size() - 1,
+                activeCircularRouteSupportIndex + movementDirection
+            )
         );
-        for (int index = activeCircularRouteSupportIndex;
+        int firstIndex = Math.min(
+            activeCircularRouteSupportIndex,
+            adjacentIndex
+        );
+        int lastIndex = Math.max(
+            activeCircularRouteSupportIndex,
+            adjacentIndex
+        );
+        for (int index = firstIndex;
              index <= lastIndex;
              index++) {
             BlockPos support = supportPath.get(index);
@@ -9587,17 +9657,45 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         CompactCircularNbtPlan.PairRoute activeRoute
     ) {
         if (plannedCircularBuildPair != activeRoute.pairIndex()
-            || plannedDeferredMandatoryBuildOrder.isEmpty()) {
+            || plannedForeignBuildReachWindows.isEmpty()) {
             return false;
         }
 
-        for (BlockPos relative :
-            plannedDeferredMandatoryBuildOrder) {
+        LinkedHashSet<BlockPos> scheduledTargets =
+            new LinkedHashSet<>();
+        if (circularBuildPlacementBacktrackTarget != null) {
+            scheduledTargets.add(
+                circularBuildPlacementBacktrackTarget
+            );
+        }
+        scheduledTargets.addAll(
+            plannedDeferredMandatoryBuildOrder
+        );
+        plannedOptionalBuildOrder.stream()
+            .filter(plannedForeignBuildReachWindows::containsKey)
+            .forEach(scheduledTargets::add);
+
+        for (BlockPos relative : scheduledTargets) {
+            boolean mandatory =
+                plannedDeferredMandatoryBuildTargets.contains(relative);
             Block expected = buildTargets.get(relative);
             BlockPos world = mapCorner.add(relative);
             Block current = latestKnownBuildBlock(world);
-            if (expected != null && current == expected) continue;
+            if (!mandatory
+                && expected != null
+                && rejectedOptionalSwapMaterials.contains(
+                    expected.asItem()
+                )) {
+                clearCircularBuildPlacementBacktrack(relative);
+                continue;
+            }
+            if (expected != null && current == expected) {
+                clearCircularBuildPlacementBacktrack(relative);
+                continue;
+            }
             if (current != Blocks.AIR) {
+                clearCircularBuildPlacementBacktrack(relative);
+                if (!mandatory) continue;
                 warning(
                     "A deferred earlier-U target changed to an unexpected "
                         + "block at " + world.toShortString()
@@ -9610,10 +9708,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
 
             BlockReachWindow.Window window =
-                plannedDeferredReachWindows.get(relative);
+                plannedForeignBuildReachWindows.get(relative);
             if (window == null) {
                 error(
-                    "Deferred earlier-U target lost its reach deadline at "
+                    "Frozen neighboring target lost its reach deadline at "
                         + world.toShortString() + "."
                 );
                 stopBuildForAction();
@@ -9624,14 +9722,39 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             boolean inReach = isBuildPlacementInReach(world);
             boolean pending =
                 pendingPlacementLedger.isPending(world);
-            boolean atReachDeadline =
-                CircularBuildMovementPolicy
-                    .requiresDeferredPlacementHold(
+            boolean activeBacktrack = relative.equals(
+                circularBuildPlacementBacktrackTarget
+            );
+            CircularBuildMovementPolicy.ReachDeadlineAction
+                deadlineAction =
+                    CircularBuildMovementPolicy.reachDeadlineAction(
                         activeCircularRouteSupportIndex,
                         window.lastSupportIndex(),
-                        inReach
+                        inReach,
+                        activeBacktrack
                     );
-            if (atReachDeadline) {
+            if (deadlineAction
+                == CircularBuildMovementPolicy.ReachDeadlineAction
+                    .BACKTRACK_ON_ROUTE) {
+                circularBuildPlacementBacktrackSupportIndex =
+                    window.lastSupportIndex();
+                circularBuildPlacementBacktrackTarget =
+                    new BlockPos(relative);
+                debugLog(
+                    "TraversalPlan",
+                    "reversing on verified U supports pair="
+                        + activeRoute.pairIndex()
+                        + " target=" + world.toShortString()
+                        + " currentSupport="
+                            + activeCircularRouteSupportIndex
+                        + " backtrackSupport="
+                            + circularBuildPlacementBacktrackSupportIndex
+                );
+                return false;
+            }
+            if (deadlineAction
+                == CircularBuildMovementPolicy.ReachDeadlineAction
+                    .HOLD_FOR_PLACEMENT) {
                 stopBuildForAction(
                     CircularBuildMovementPolicy.HoldReason
                         .DEFERRED_U_PLACEMENT_CONFIRMATION
@@ -9639,8 +9762,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 debugLog(
                     "TraversalPlan",
                     "holding pair=" + activeRoute.pairIndex()
-                        + " for deferredTarget="
+                        + " for neighboringTarget="
                             + world.toShortString()
+                        + " tier="
+                            + (mandatory ? "MANDATORY" : "OPTIONAL")
                         + " pending=" + pending
                         + " supportCursor="
                             + activeCircularRouteSupportIndex
@@ -9654,21 +9779,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
                 return true;
             }
-            if (activeCircularRouteSupportIndex
-                    >= window.lastSupportIndex()
-                && !inReach) {
-                warning(
-                    "Circular pair " + activeRoute.pairIndex()
-                        + " passed the proven reach window for deferred "
-                        + "target " + world.toShortString()
-                        + "; returning to a safe endpoint and replanning."
-                );
-                buildRecoveryPending = true;
-                stopBuildForAction();
-                return true;
-            }
+            if (activeBacktrack) return false;
         }
         return false;
+    }
+
+    private void clearCircularBuildPlacementBacktrack(
+        BlockPos confirmedRelative
+    ) {
+        if (circularBuildPlacementBacktrackTarget == null
+            || !circularBuildPlacementBacktrackTarget.equals(
+                confirmedRelative
+            )) {
+            return;
+        }
+        debugLog(
+            "TraversalPlan",
+            "completed verified-support placement backtrack target="
+                + mapCorner.add(confirmedRelative).toShortString()
+                + " supportCursor="
+                    + activeCircularRouteSupportIndex
+        );
+        circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackTarget = null;
     }
 
     private List<PrioritizedPlacementPlanner.Target<BlockPos, Item>>
@@ -11137,6 +11270,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularBuildPair = -1;
         activeCircularConnectorIndex = -1;
         activeCircularPlacementCursor = -1;
+        circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackTarget = null;
         circularBuildRecoveryDirection = 0;
         circularBuildPhase = CircularBuildPhase.NONE;
         releaseBuildRepairSpeedMine();
@@ -11208,6 +11343,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || mc.player == null) {
             return;
         }
+        if (!ensureCircularBuildReachTopology()) return;
 
         ArrayList<
             ForwardCircularTraversalPlan.Route<BlockPos>
@@ -11262,7 +11398,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             ForwardCircularTraversalPlan.create(
                 routes,
                 (relative, destinationPair) ->
-                    deferredReachWindow(
+                    deferredDeadlineWindow(
                         relative,
                         compactPlan.pairRoutes().get(destinationPair)
                     ).isPresent(),
@@ -11315,33 +11451,83 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
-    private Optional<BlockReachWindow.Window> deferredReachWindow(
+    private Optional<BlockReachWindow.Window> deferredDeadlineWindow(
         BlockPos relativeTarget,
         CompactCircularNbtPlan.PairRoute traversalRoute
     ) {
-        BlockPos worldTarget = mapCorner.add(relativeTarget);
-        ArrayList<BlockReachWindow.Cell> supports = new ArrayList<>();
-        for (BlockPos support :
-            activeCircularBuildSupportPath(traversalRoute)) {
-            supports.add(
-                new BlockReachWindow.Cell(
-                    support.getX(),
-                    support.getY(),
-                    support.getZ()
-                )
+        return circularBuildTargetReach(
+            relativeTarget,
+            traversalRoute
+        ).flatMap(reach -> translatedBuildReachWindow(
+            reach.guaranteedSupportIndices(),
+            traversalRoute
+        ));
+    }
+
+    private Optional<CircularBuildReachTopology.TargetReach>
+        circularBuildTargetReach(
+            BlockPos relativeTarget,
+            CompactCircularNbtPlan.PairRoute traversalRoute
+        ) {
+        if (circularBuildReachTopology == null) {
+            return Optional.empty();
+        }
+        CircularBuildTargetReference reference =
+            circularBuildTargetReferences.get(relativeTarget);
+        if (reference == null
+            || reference.pairIndex() == traversalRoute.pairIndex()) {
+            return Optional.empty();
+        }
+        return circularBuildReachTopology
+            .routePlan(traversalRoute.pairIndex())
+            .target(reference.pairIndex(), reference.targetIndex());
+    }
+
+    private Optional<BlockReachWindow.Window>
+        translatedBuildReachWindow(
+            List<Integer> compiledSupportIndices,
+            CompactCircularNbtPlan.PairRoute traversalRoute
+        ) {
+        if (compiledSupportIndices.isEmpty()
+            || circularBuildReachTopology == null) {
+            return Optional.empty();
+        }
+        CircularBuildReachTopology.RoutePlan routePlan =
+            circularBuildReachTopology.routePlan(
+                traversalRoute.pairIndex()
+            );
+        List<BlockPos> activeSupports =
+            activeCircularBuildSupportPath(traversalRoute);
+        HashMap<BlockPos, Integer> activeIndices = new HashMap<>();
+        for (int index = 0; index < activeSupports.size(); index++) {
+            activeIndices.put(
+                activeSupports.get(index).subtract(mapCorner),
+                index
             );
         }
-        double standingEyeHeight =
-            mc.player.getEyePos().y - mc.player.getY();
-        return BlockReachWindow.find(
-            new BlockReachWindow.Cell(
-                worldTarget.getX(),
-                worldTarget.getY(),
-                worldTarget.getZ()
-            ),
-            supports,
-            standingEyeHeight,
-            effectiveBuildInteractionRange()
+
+        ArrayList<Integer> translated = new ArrayList<>(
+            compiledSupportIndices.size()
+        );
+        for (int compiledIndex : compiledSupportIndices) {
+            if (compiledIndex < 0
+                || compiledIndex >= routePlan.orderedSupports().size()) {
+                return Optional.empty();
+            }
+            BlockReachWindow.Cell cell =
+                routePlan.orderedSupports().get(compiledIndex);
+            Integer activeIndex = activeIndices.get(
+                new BlockPos(cell.x(), cell.y(), cell.z())
+            );
+            if (activeIndex == null) return Optional.empty();
+            translated.add(activeIndex);
+        }
+        return Optional.of(
+            new BlockReachWindow.Window(
+                translated.getFirst(),
+                translated.getLast(),
+                translated
+            )
         );
     }
 
@@ -11809,6 +11995,31 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private Vec3d currentWalkingMovementGoal(
+        ActiveOrderedUTraversal traversal,
+        Vec3d checkpointGoal
+    ) {
+        if (traversal == null) return checkpointGoal;
+        if (traversal.owner() == OrderedUTraversalOwner.PRINTING
+            && CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                switch (circularBuildPhase) {
+                    case OUTBOUND ->
+                        CircularBuildCheckpointPlan.TraversalPhase.OUTBOUND;
+                    case CONNECTOR ->
+                        CircularBuildCheckpointPlan.TraversalPhase.CONNECTOR;
+                    case RETURN ->
+                        CircularBuildCheckpointPlan.TraversalPhase.RETURN;
+                    default -> throw new IllegalStateException(
+                        "Active circular printing has no traversal phase."
+                    );
+                },
+                activeOrderedUMovementDirection(traversal)
+            )) {
+            return checkpointGoal;
+        }
+        return currentActiveOrderedUMovementGoal(traversal);
+    }
+
     private Vec3d currentActiveOrderedUMovementGoal(
         ActiveOrderedUTraversal traversal
     ) {
@@ -11820,9 +12031,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 "Active ordered U traversal has no movement goal."
             );
         }
+        int direction = activeOrderedUMovementDirection(traversal);
         int goalIndex = OrderedUTraversalMovement.steeringGoalIndex(
             supports,
-            activeCircularRouteSupportIndex
+            activeCircularRouteSupportIndex,
+            direction
         );
         return walkingPosition(supports.get(goalIndex));
     }
@@ -11834,7 +12047,36 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || sprinting.get() == SprintMode.NotPlacing) {
             return false;
         }
+        if (traversal.owner() == OrderedUTraversalOwner.PRINTING
+            && (activeOrderedUMovementDirection(traversal) < 0
+                || hasUnconfirmedForeignTargetNearDeadline(3))) {
+            return false;
+        }
         return !isActiveOrderedUConnectorSegment(traversal);
+    }
+
+    private boolean hasUnconfirmedForeignTargetNearDeadline(
+        int supportLookahead
+    ) {
+        if (supportLookahead < 0) {
+            throw new IllegalArgumentException(
+                "Placement deadline lookahead cannot be negative."
+            );
+        }
+        for (Map.Entry<BlockPos, BlockReachWindow.Window> entry
+            : plannedForeignBuildReachWindows.entrySet()) {
+            Block expected = buildTargets.get(entry.getKey());
+            if (expected == null
+                || latestKnownBuildBlock(mapCorner.add(entry.getKey()))
+                    == expected) {
+                continue;
+            }
+            int supportsRemaining =
+                entry.getValue().lastSupportIndex()
+                    - activeCircularRouteSupportIndex;
+            if (supportsRemaining <= supportLookahead) return true;
+        }
+        return false;
     }
 
     private boolean isActiveOrderedUConnectorSegment(
@@ -17095,6 +17337,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         plannedDeferredMandatoryBuildOrder.clear();
         plannedDeferredMandatoryBuildTargets.clear();
         plannedDeferredReachWindows.clear();
+        plannedForeignBuildReachTargets.clear();
+        plannedForeignBuildReachWindows.clear();
+        circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackTarget = null;
         optimizedCircularTraversalPairs.clear();
         optimizedDeferredBuildTargets.clear();
         optimizedDeferredRouteAssignments.clear();
@@ -17212,6 +17458,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         circularBuildRecoveryDirection = 0;
         circularBuildPhase = CircularBuildPhase.NONE;
         resetMapAreaCache();
+        if (circularTraversalForCurrentMap
+            && !ensureCircularBuildReachTopology()) {
+            buildingActive = false;
+            error(
+                "Circular printing cannot start without its persisted "
+                    + "per-block reach plan."
+            );
+            stopMovement();
+            toggle();
+            return;
+        }
         configurePairTraversalModes();
         if (!validateCompactWorkspace()) {
             buildingActive = false;
@@ -17320,6 +17577,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private boolean prepareCircularBuildInventoryPlan(
         CompactCircularNbtPlan.PairRoute route
     ) {
+        if (!ensureCircularBuildReachTopology()) {
+            error(
+                "Circular pair " + route.pairIndex()
+                    + " cannot be planned without its persisted "
+                    + "per-block reach topology."
+            );
+            return false;
+        }
         if (repairCurrentUPair.get()) {
             for (BlockPos relative : circularPairTargets(route)) {
                 Block expected = buildTargets.get(relative);
@@ -17452,6 +17717,33 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             deferredMandatoryTargets
         );
         plannedDeferredReachWindows.clear();
+        plannedForeignBuildReachTargets.clear();
+        plannedForeignBuildReachWindows.clear();
+        for (BlockPos relative : plannedOptionalBuildOrder) {
+            Optional<CircularBuildReachTopology.TargetReach> reach =
+                circularBuildTargetReach(relative, route);
+            if (reach.isEmpty()) {
+                error(
+                    "Frozen nearby target "
+                        + mapCorner.add(relative).toShortString()
+                        + " is absent from the persisted reach plan for "
+                        + "circular pair " + route.pairIndex() + "."
+                );
+                return false;
+            }
+            plannedForeignBuildReachTargets.put(
+                relative,
+                reach.orElseThrow()
+            );
+            Optional<BlockReachWindow.Window> deadline =
+                deferredDeadlineWindow(relative, route);
+            if (deadline.isPresent()) {
+                plannedForeignBuildReachWindows.put(
+                    relative,
+                    deadline.orElseThrow()
+                );
+            }
+        }
         for (BlockPos relative : deferredMandatoryTargets) {
             BlockPos world = mapCorner.add(relative);
             if (optionalPendingPlacements.remove(world)) {
@@ -17465,7 +17757,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
             }
             Optional<BlockReachWindow.Window> window =
-                deferredReachWindow(relative, route);
+                deferredDeadlineWindow(relative, route);
             if (window.isEmpty()) {
                 error(
                     "Deferred U target "
@@ -17478,6 +17770,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             plannedDeferredReachWindows.put(
                 relative,
                 window.get()
+            );
+            plannedForeignBuildReachTargets.put(
+                relative,
+                circularBuildTargetReach(relative, route)
+                    .orElseThrow()
+            );
+            plannedForeignBuildReachWindows.put(
+                relative,
+                window.orElseThrow()
             );
         }
         plannedBuildHotbarStackItems.clear();
@@ -17628,6 +17929,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         plannedOptionalBuildOrder.addAll(retainedOrder);
         plannedOptionalBuildTargets.clear();
         plannedOptionalBuildTargets.addAll(retainedOrder);
+        HashSet<BlockPos> retainedForeignTargets = new HashSet<>(
+            plannedDeferredMandatoryBuildTargets
+        );
+        retainedForeignTargets.addAll(retainedOrder);
+        plannedForeignBuildReachTargets.keySet().retainAll(
+            retainedForeignTargets
+        );
+        plannedForeignBuildReachWindows.keySet().retainAll(
+            retainedForeignTargets
+        );
         if (retainedForMaterial > 0) {
             plannedOptionalMaterialDemand.put(
                 material,
@@ -17717,6 +18028,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         plannedDeferredMandatoryBuildOrder.clear();
         plannedDeferredMandatoryBuildTargets.clear();
         plannedDeferredReachWindows.clear();
+        plannedForeignBuildReachTargets.clear();
+        plannedForeignBuildReachWindows.clear();
         plannedBuildHotbarStackItems.clear();
         plannedBuildMaterialHotbarSlots.clear();
         plannedBuildToolHotbarSlot = -1;
@@ -18047,6 +18360,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         CompactCircularNbtPlan.PairRoute activeRoute
     ) {
         ArrayList<BlockPos> candidates = new ArrayList<>();
+        if (circularBuildReachTopology == null) return candidates;
         HashSet<Integer> optionalColumns = new HashSet<>(
             CircularBuildHorizon.forwardOptionalColumns(
                 activeRoute.outboundX(),
@@ -18056,47 +18370,30 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 CompactCircularNbtPlan.MAP_WIDTH
             )
         );
-        for (CompactCircularNbtPlan.PairRoute futureRoute
-            : compactPlan.pairRoutes()) {
-            if (futureRoute.outboundX() <= activeRoute.returnX()
-                || !optionalColumns.contains(futureRoute.outboundX())
-                || !optionalColumns.contains(futureRoute.returnX())) {
+        CircularBuildReachTopology.RoutePlan routePlan =
+            circularBuildReachTopology.routePlan(
+                activeRoute.pairIndex()
+            );
+        for (CircularBuildReachTopology.TargetReach reach
+            : routePlan.reachableForeignTargets()) {
+            if (reach.targetRouteIndex() <= activeRoute.pairIndex()) {
                 continue;
             }
-
-            if (circularPairModes.getOrDefault(
-                futureRoute.pairIndex(),
-                false
-            )) {
-                for (BlockPos relative :
-                    circularPairTargets(futureRoute)) {
-                    addForwardOptionalTarget(relative, candidates);
-                }
+            BlockReachWindow.Cell target = reach.target();
+            BlockPos relative = new BlockPos(
+                target.x(),
+                target.y(),
+                target.z()
+            );
+            if (!optionalColumns.contains(relative.getX())) continue;
+            if (!circularPairModes.getOrDefault(
+                    reach.targetRouteIndex(),
+                    false
+                )
+                && connectorTargets.contains(relative)) {
                 continue;
             }
-
-            for (int nbtZ = 1;
-                 nbtZ <= CompactCircularNbtPlan.FAR_Z;
-                 nbtZ++) {
-                addForwardOptionalTarget(
-                    surfaceRuntimePosition(
-                        futureRoute.outboundX(),
-                        nbtZ
-                    ),
-                    candidates
-                );
-            }
-            for (int nbtZ = 1;
-                 nbtZ <= CompactCircularNbtPlan.FAR_Z;
-                 nbtZ++) {
-                addForwardOptionalTarget(
-                    surfaceRuntimePosition(
-                        futureRoute.returnX(),
-                        nbtZ
-                    ),
-                    candidates
-                );
-            }
+            addForwardOptionalTarget(relative, candidates);
         }
         return candidates;
     }
@@ -18800,6 +19097,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (pairIndex < 0 || targetIndex < 0) {
                 throw new IllegalArgumentException(
                     "Circular teardown target indices cannot be negative."
+                );
+            }
+        }
+    }
+
+    private record CircularBuildTargetReference(
+        int pairIndex,
+        int targetIndex
+    ) {
+        private CircularBuildTargetReference {
+            if (pairIndex < 0 || targetIndex < 0) {
+                throw new IllegalArgumentException(
+                    "Circular build target indices cannot be negative."
                 );
             }
         }
@@ -22560,6 +22870,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             map = generateMapArray(compactPlan);
             generateRuntimeBuildPlan(compactPlan);
             activeCompactPlanSha256 = compactPlanFingerprint();
+            loadOrCompileCircularBuildReachTopology();
             loadOrCompileCircularTeardownReachTopology();
 
             boolean sourceAlreadyArchived = mapFile.getParentFile() != null
@@ -22660,6 +22971,150 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             0.1,
             effectiveBuildInteractionRange()
                 - TEARDOWN_REACH_POSITION_TOLERANCE
+        );
+    }
+
+    private boolean ensureCircularBuildReachTopology() {
+        if (compactPlan == null
+            || activeCompactPlanSha256 == null
+            || mapFolder == null) {
+            return false;
+        }
+        double reach = effectiveBuildInteractionRange();
+        if (circularBuildReachTopology != null
+            && Objects.equals(
+                circularBuildReachTopology.compactPlanSha256(),
+                activeCompactPlanSha256
+            )
+            && Double.compare(
+                circularBuildReachTopology.standingEyeHeight(),
+                BUILD_STANDING_EYE_HEIGHT
+            ) == 0
+            && Double.compare(
+                circularBuildReachTopology.maximumReach(),
+                reach
+            ) == 0) {
+            return true;
+        }
+        try {
+            loadOrCompileCircularBuildReachTopology();
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            warning(
+                "Could not prepare the compiled circular printing reach "
+                    + "plan: " + failure.getMessage()
+            );
+            circularBuildReachTopology = null;
+            circularBuildReachTopologyFile = null;
+            circularBuildTargetReferences.clear();
+            return false;
+        }
+    }
+
+    private void loadOrCompileCircularBuildReachTopology()
+        throws IOException {
+        if (compactPlan == null
+            || activeCompactPlanSha256 == null
+            || mapFolder == null) {
+            throw new IOException(
+                "The compact NBT identity is incomplete."
+            );
+        }
+        double reach = effectiveBuildInteractionRange();
+        Path cacheFile = CircularBuildReachTopologyStore.pathFor(
+            mapFolder.toPath(),
+            activeCompactPlanSha256,
+            BUILD_STANDING_EYE_HEIGHT,
+            reach
+        );
+        CircularBuildReachTopology.Snapshot topology = null;
+        boolean loaded = false;
+        if (Files.isRegularFile(cacheFile)) {
+            try {
+                topology = CircularBuildReachTopologyStore.read(
+                    cacheFile,
+                    activeCompactPlanSha256,
+                    BUILD_STANDING_EYE_HEIGHT,
+                    reach
+                );
+                loaded = true;
+            } catch (IOException invalidCache) {
+                warning(
+                    "Rebuilding invalid circular printing reach plan "
+                        + cacheFile.getFileName() + ": "
+                        + invalidCache.getMessage()
+                );
+            }
+        }
+        if (topology == null) {
+            ArrayList<CircularBuildReachTopology.Route> routes =
+                new ArrayList<>(compactPlan.pairRoutes().size());
+            for (CompactCircularNbtPlan.PairRoute route
+                : compactPlan.pairRoutes()) {
+                List<BlockReachWindow.Cell> routeCells =
+                    circularPairTargets(route).stream()
+                        .map(position -> new BlockReachWindow.Cell(
+                            position.getX(),
+                            position.getY(),
+                            position.getZ()
+                        ))
+                        .toList();
+                routes.add(
+                    new CircularBuildReachTopology.Route(
+                        route.pairIndex(),
+                        routeCells,
+                        routeCells
+                    )
+                );
+            }
+            topology = CircularBuildReachTopology.compile(
+                activeCompactPlanSha256,
+                routes,
+                BUILD_STANDING_EYE_HEIGHT,
+                reach
+            );
+            CircularBuildReachTopologyStore.save(cacheFile, topology);
+        }
+
+        HashMap<BlockPos, CircularBuildTargetReference> references =
+            new HashMap<>();
+        for (CompactCircularNbtPlan.PairRoute route
+            : compactPlan.pairRoutes()) {
+            ArrayList<BlockPos> targets = circularPairTargets(route);
+            for (int targetIndex = 0;
+                 targetIndex < targets.size();
+                 targetIndex++) {
+                BlockPos relative = targets.get(targetIndex);
+                CircularBuildTargetReference previous = references.put(
+                    relative,
+                    new CircularBuildTargetReference(
+                        route.pairIndex(),
+                        targetIndex
+                    )
+                );
+                if (previous != null) {
+                    throw new IOException(
+                        "Circular U routes share build target "
+                            + relative.toShortString() + "."
+                    );
+                }
+            }
+        }
+        circularBuildReachTopology = topology;
+        circularBuildReachTopologyFile = cacheFile;
+        circularBuildTargetReferences.clear();
+        circularBuildTargetReferences.putAll(references);
+        int reachableTargets = topology.routePlans().stream()
+            .mapToInt(plan ->
+                plan.reachableForeignTargets().size())
+            .sum();
+        debugLog(
+            "BuildTopology",
+            (loaded ? "loaded" : "compiled and saved")
+                + " plan=" + cacheFile.getFileName()
+                + " reach="
+                    + String.format(Locale.ROOT, "%.2f", reach)
+                + " perBlockReachEntries=" + reachableTargets
         );
     }
 

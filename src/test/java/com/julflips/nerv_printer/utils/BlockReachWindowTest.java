@@ -117,6 +117,35 @@ class BlockReachWindowTest {
     }
 
     @Test
+    void distinguishesThinCenterOpportunityFromWholeCellGuarantee() {
+        BlockReachWindow.Cell target =
+            new BlockReachWindow.Cell(0, 100, 4);
+        List<BlockReachWindow.Cell> supports = List.of(
+            new BlockReachWindow.Cell(2, 100, 0),
+            new BlockReachWindow.Cell(2, 100, 1)
+        );
+
+        assertEquals(
+            List.of(0, 1),
+            BlockReachWindow.find(
+                target,
+                supports,
+                1.62,
+                5.0
+            ).orElseThrow().reachableSupportIndices()
+        );
+        assertEquals(
+            List.of(1),
+            BlockReachWindow.findGuaranteedFromSupportCell(
+                target,
+                supports,
+                1.62,
+                5.0
+            ).orElseThrow().reachableSupportIndices()
+        );
+    }
+
+    @Test
     void rejectsTargetThatNoLaterSupportCanReach() {
         assertTrue(
             BlockReachWindow.find(

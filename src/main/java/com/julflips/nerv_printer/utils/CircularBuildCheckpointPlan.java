@@ -11,6 +11,12 @@ public final class CircularBuildCheckpointPlan {
     private CircularBuildCheckpointPlan() {
     }
 
+    public enum TraversalPhase {
+        OUTBOUND,
+        CONNECTOR,
+        RETURN
+    }
+
     public record Plan<T>(
         List<T> structuralCheckpoints,
         List<T> connectorTraversalSteps
@@ -64,5 +70,37 @@ public final class CircularBuildCheckpointPlan {
             ),
             connectorPath.subList(1, connectorPath.size())
         );
+    }
+
+    /**
+     * Outbound and connector handoffs must retain their checkpoint as the
+     * steering goal until it is actually reached. Merely entering the final
+     * support cell is not enough: changing direction at that point can leave
+     * the structural checkpoint queued behind the player. Reverse movement is
+     * an ordered placement backtrack and therefore continues to use the shared
+     * route goal.
+     */
+    public static boolean checkpointOwnsSteering(
+        TraversalPhase phase,
+        int movementDirection
+    ) {
+        Objects.requireNonNull(phase, "phase");
+        if (movementDirection != -1 && movementDirection != 1) {
+            throw new IllegalArgumentException(
+                "Circular build movement direction must be -1 or 1."
+            );
+        }
+        return movementDirection > 0 && phase != TraversalPhase.RETURN;
+    }
+
+    /**
+     * Completion of the complete ordered U may satisfy only the final exterior
+     * exit. It must never consume a stale outbound or connector checkpoint.
+     */
+    public static boolean routeCompletionReachesCheckpoint(
+        boolean finalExitCheckpoint,
+        boolean completeOrderedRoute
+    ) {
+        return finalExitCheckpoint && completeOrderedRoute;
     }
 }

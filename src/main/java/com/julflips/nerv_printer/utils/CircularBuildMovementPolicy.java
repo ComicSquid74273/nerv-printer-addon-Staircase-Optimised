@@ -23,6 +23,12 @@ public final class CircularBuildMovementPolicy {
         OTHER_BUILD_ACTION
     }
 
+    public enum ReachDeadlineAction {
+        CONTINUE,
+        HOLD_FOR_PLACEMENT,
+        BACKTRACK_ON_ROUTE
+    }
+
     public static HoldReason holdReason(
         int repairTargetCount,
         boolean mandatoryHotbarSwapPending
@@ -53,8 +59,7 @@ public final class CircularBuildMovementPolicy {
      */
     public static boolean requiresDeferredPlacementHold(
         int currentSupportIndex,
-        int lastReachSupportIndex,
-        boolean currentlyReachable
+        int lastReachSupportIndex
     ) {
         if (lastReachSupportIndex < 0) {
             throw new IllegalArgumentException(
@@ -65,7 +70,39 @@ public final class CircularBuildMovementPolicy {
             0,
             lastReachSupportIndex - 1
         );
-        return currentlyReachable
-            && currentSupportIndex >= deadlineEntryIndex;
+        return currentSupportIndex >= deadlineEntryIndex;
+    }
+
+    /**
+     * Selects bounded route behavior for one still-missing frozen neighbor.
+     * A stale live-range sample cannot let forward movement consume a proven
+     * deadline. If lag has already moved beyond it, only the same ordered
+     * support path may be reversed.
+     */
+    public static ReachDeadlineAction reachDeadlineAction(
+        int currentSupportIndex,
+        int lastGuaranteedSupportIndex,
+        boolean currentlyReachable,
+        boolean alreadyBacktracking
+    ) {
+        if (lastGuaranteedSupportIndex < 0) {
+            throw new IllegalArgumentException(
+                "The last guaranteed support index cannot be negative."
+            );
+        }
+        if (alreadyBacktracking
+            && currentSupportIndex > lastGuaranteedSupportIndex) {
+            return ReachDeadlineAction.CONTINUE;
+        }
+        if (currentSupportIndex > lastGuaranteedSupportIndex
+            && !currentlyReachable) {
+            return ReachDeadlineAction.BACKTRACK_ON_ROUTE;
+        }
+        return requiresDeferredPlacementHold(
+            currentSupportIndex,
+            lastGuaranteedSupportIndex
+        )
+            ? ReachDeadlineAction.HOLD_FOR_PLACEMENT
+            : ReachDeadlineAction.CONTINUE;
     }
 }
