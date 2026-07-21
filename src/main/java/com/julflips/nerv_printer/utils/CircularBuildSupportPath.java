@@ -4,7 +4,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
-import java.util.function.Predicate;
 
 /**
  * Builds the exact ordered supports used by circular print movement.
@@ -59,96 +58,6 @@ public final class CircularBuildSupportPath {
             );
         }
         return List.copyOf(path);
-    }
-
-    public enum MovementStatus {
-        READY,
-        COMPLETE,
-        OFF_PATH,
-        WAITING_FOR_NEXT_SUPPORT
-    }
-
-    public record MovementDecision<T>(
-        MovementStatus status,
-        T requiredSupport
-    ) {
-        public MovementDecision {
-            Objects.requireNonNull(status, "status");
-            boolean requiresSupport =
-                status == MovementStatus.READY
-                    || status
-                        == MovementStatus.WAITING_FOR_NEXT_SUPPORT;
-            if (requiresSupport != (requiredSupport != null)) {
-                throw new IllegalArgumentException(
-                    "Movement status and required support disagree."
-                );
-            }
-        }
-
-        public boolean mayMove() {
-            return status == MovementStatus.READY
-                || status == MovementStatus.COMPLETE;
-        }
-    }
-
-    /**
-     * Checks only the immediate next support. A later gap is deliberately
-     * irrelevant until it becomes the next route step.
-     */
-    public static <T> MovementDecision<T> decideMovement(
-        List<T> orderedSupports,
-        T currentSupport,
-        Predicate<? super T> isConfirmedReady
-    ) {
-        Objects.requireNonNull(orderedSupports, "orderedSupports");
-        Objects.requireNonNull(currentSupport, "currentSupport");
-        Objects.requireNonNull(isConfirmedReady, "isConfirmedReady");
-        int currentIndex = orderedSupports.indexOf(currentSupport);
-        if (currentIndex < 0) {
-            return new MovementDecision<>(
-                MovementStatus.OFF_PATH,
-                null
-            );
-        }
-        return decideMovement(
-            orderedSupports,
-            currentIndex,
-            isConfirmedReady
-        );
-    }
-
-    /**
-     * Checks the immediate next support from a monotonic route cursor.
-     */
-    public static <T> MovementDecision<T> decideMovement(
-        List<T> orderedSupports,
-        int currentIndex,
-        Predicate<? super T> isConfirmedReady
-    ) {
-        Objects.requireNonNull(orderedSupports, "orderedSupports");
-        Objects.requireNonNull(isConfirmedReady, "isConfirmedReady");
-        if (currentIndex < 0 || currentIndex >= orderedSupports.size()) {
-            return new MovementDecision<>(
-                MovementStatus.OFF_PATH,
-                null
-            );
-        }
-        if (currentIndex + 1 >= orderedSupports.size()) {
-            return new MovementDecision<>(
-                MovementStatus.COMPLETE,
-                null
-            );
-        }
-        T nextSupport = Objects.requireNonNull(
-            orderedSupports.get(currentIndex + 1),
-            "next support"
-        );
-        return new MovementDecision<>(
-            isConfirmedReady.test(nextSupport)
-                ? MovementStatus.READY
-                : MovementStatus.WAITING_FOR_NEXT_SUPPORT,
-            nextSupport
-        );
     }
 
     /**

@@ -1,25 +1,33 @@
 package com.julflips.nerv_printer.utils;
 
 /**
- * Pure scheduling classification for one printing-time repair mine.
+ * Pure scheduling classification for one owned repair or teardown mine.
  *
  * <p>Meteor Speed Mine's Damage mode accelerates vanilla progressive mining,
  * but it does not make a block safe to replace with another mining target in
  * the same client tick. Only vanilla instant breaking is therefore eligible
  * for batched dispatch. Both other classifications retain one progressive
- * target until the caller observes authoritative air.</p>
+ * target until the caller observes authoritative air. Accelerated progressive
+ * work can still overlap ordered route movement while that same target remains
+ * owned and in reach; ordinary slow progressive work cannot.</p>
  */
 public enum RepairMiningClassification {
-    VANILLA_BATCH_INSTANT(true),
-    SPEED_MINE_ACCELERATED_PROGRESSIVE(false),
-    SLOW_PROGRESSIVE(false);
+    VANILLA_BATCH_INSTANT(true, true),
+    SPEED_MINE_ACCELERATED_PROGRESSIVE(false, true),
+    SLOW_PROGRESSIVE(false, false);
 
     private static final float SPEED_MINE_ACCELERATION_THRESHOLD = 0.5F;
 
     private final boolean batchDispatchAllowed;
+    private final boolean ownedRouteMovementOverlapAllowed;
 
-    RepairMiningClassification(boolean batchDispatchAllowed) {
+    RepairMiningClassification(
+        boolean batchDispatchAllowed,
+        boolean ownedRouteMovementOverlapAllowed
+    ) {
         this.batchDispatchAllowed = batchDispatchAllowed;
+        this.ownedRouteMovementOverlapAllowed =
+            ownedRouteMovementOverlapAllowed;
     }
 
     /**
@@ -55,6 +63,17 @@ public enum RepairMiningClassification {
      */
     public boolean allowsBatchDispatch() {
         return batchDispatchAllowed;
+    }
+
+    /**
+     * Whether movement may continue toward the next ordered safety boundary
+     * while this target stays owned, in reach, and progressively serviced.
+     *
+     * <p>This does not permit dispatching another target or treating local
+     * predicted air as completion.</p>
+     */
+    public boolean allowsOwnedRouteMovementOverlap() {
+        return ownedRouteMovementOverlapAllowed;
     }
 
     public boolean requiresProgressiveContinuation() {

@@ -126,21 +126,32 @@ for a rotation callback. When a facing-sensitive placement does use a deferred
 callback, it binds and re-selects its planned slot at dispatch time; another
 budgeted placement therefore cannot change its material first.
 
-The circular build alignment checkpoint is deliberately one block north of the
-validated cobblestone walkway (`Z = -2` relative to the map corner, versus
-walkway `Z = -1` and first target `Z = 0`). This is only the start alignment; the
-structural outbound and return endpoints remain unchanged. The backing support
-must be solid with two air blocks of headroom. After a raised real target is
-confirmed, route-aligned held auto-jump owns the `Y+1` entry transition and the
-next-support guard is reapplied after landing.
+The circular alignment support is derived from the ordered route itself. Starting
+at the selected north-walkway endpoint, Nerv takes the horizontal step toward the
+first U support and extends that step once in the opposite direction. There is no
+fixed north/south direction, relative-Z constant, or separate raised-entry route.
+The resulting approach support must be solid with two air blocks of headroom.
+From there, the normal forward input and generic solid-ahead/headroom auto-jump
+own both level and `Y+1` entry transitions.
 
 Recovery treats the alignment plus both north walkways as external direct-replan
 supports. This is required because the five-block scheduler may confirm several
 forward blocks while the player is still standing at the alignment. Restarting
 there must rebuild the frozen pair plan; it must not attempt an in-U egress or
 classify the alignment introduced by Nerv itself as an unknown location.
-Teardown keeps the pre-existing ordered U/independent traversal and does not use a
-spatial nearby breaker.
+Printing and teardown now instantiate the same active ordered-U movement context.
+That context alone resolves the current/next support, selects the end of the
+current straight segment, steers, applies the shared sprint policy, and continues
+the generic auto-jump. Endpoint entry follows the same ordered `approach -> north
+walkway -> first U support` path; local recovery starts from the verified occupied
+support. Teardown contributes only work released by entered support indices. It
+does not own another steering goal, per-block checkpoint loop, centering rule,
+landing rule, jump state, sprint state, velocity rule, or progress watchdog.
+Unconfirmed next support and non-overlappable progressive break work use the same
+movement hold path as blocking placement/repair work. A route plan is rejected if
+any attached break target would remove a support needed later, including after a
+recovery reversal. Tool-restock egress uses the same movement context. Teardown
+does not use a spatial nearby breaker.
 
 Active-U repair uses explicit per-position ownership and may batch multiple safe
 true-instant repairs in the current U; ordered teardown owns exactly one route
@@ -148,12 +159,45 @@ target at a time. Meteor Speed Mine is snapshotted, configured only while Nerv
 owns the applicable target, and restored exactly. `BlockUtils.canInstaBreak` is the only batch-instant
 classification; Speed Mine's damage acceleration is treated as progressive work.
 A break is complete only after a newer authoritative server observation reports
-air.
+air. Ordered teardown does not turn that acknowledgement interval into a movement
+barrier for true-instant or Speed-Mine-accelerated work: it keeps servicing the
+same owned, in-reach target while moving through verified route supports. There
+is no one-support acknowledgement boundary and multiple targets assigned to one
+reach window do not create a checkpoint hold. The single teardown action owner
+still prevents acquiring a second progressive target before authoritative air.
+Every dispatch rechecks the actual grounded support and the current/future route
+suffix; an underfoot target is deferred until it is behind the player, while a
+target required by a future route cell is rejected. Ordinary slow progressive
+mining without the owned THM Speed Mine lease continues to hold movement.
+Movement overlap is also bounded by the next ordered support's conservative
+reach window, so sprinting cannot outrun an acknowledged progressive target.
+Unexpected live reach loss enters stable-ground local U recovery instead of
+discarding the shared route and immediately starting endpoint navigation.
+If remote teardown is interrupted after removing a neighboring U prefix, its
+continuous remaining suffix stays eligible for reassignment to the next U with
+a complete monotonic reach proof. It is forced into an opposite-end traversal
+only when no other selected route can safely finish the remainder; the U under
+the recovering player always retains mandatory local ownership.
 
 Managed hotbar swaps, chest restocks, dump throws, and used-tool deposits are
 bounded server-confirmed transactions. Teardown restocking counts usable worn tools
 already carried but accepts only fresh, fully compatible chest tools for newly
-missing worst-case durability.
+missing worst-case durability. It also freezes a configurable two- or three-stack
+cobblestone reserve (default three), merges refill into carried partial stacks
+before charging new inventory slots, and confirms that reserve at every teardown
+entry.
+
+The final teardown verifier reads every target and connector directly from the
+authoritative world cache; completion reports do not suppress this scan. Sparse
+owned leftovers enter a dedicated ordered scaffold sortie rather than an unordered
+nearby breaker. The planner compares both safe north endpoints, uses only the
+closest unobstructed half of the U, direct-air-places the minimum cobblestone path
+under the shared TPS-scaled budget, and waits for newer server confirmation before
+walking onto each support. The terminal missed block is mined from the preceding
+support. The shared THM teardown owner then clears missed blocks and scaffold behind
+the returning player. A restart on that path is reconstructed from solid owned
+supports and clear headroom: complete inventory resumes locally, while an inventory
+shortfall produces a no-break egress over the intact path before restock.
 
 Nerv now gives this transaction layer an explicit phase layout instead of
 copying THM's opportunistic replacement scan. Circular printing plans against

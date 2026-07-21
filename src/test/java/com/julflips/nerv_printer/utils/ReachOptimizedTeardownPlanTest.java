@@ -134,11 +134,11 @@ class ReachOptimizedTeardownPlanTest {
     }
 
     @Test
-    void interruptedRemotePrefixRemainsRecoverableFromOppositeEndpoint() {
+    void callerSuppliedSafeOrderIsPreservedByTheRemoteSchedule() {
         var plan = ReachOptimizedTeardownPlan.create(
             List.of(
                 route(0, "host"),
-                route(1, "remote-0", "remote-1", "remote-2")
+                route(1, "remote-2", "remote-1", "remote-0")
             ),
             (targets, destination) -> destination == 0
                 ? Optional.of(List.of(0, 1, 2))
@@ -146,16 +146,41 @@ class ReachOptimizedTeardownPlanTest {
         );
 
         assertEquals(Map.of(1, 0), plan.routeAssignments());
-        var recovery = CircularMiningRecoveryPlan.analyze(
-            List.of(
-                CircularMiningRecoveryPlan.Cell.AIR,
-                CircularMiningRecoveryPlan.Cell.AIR,
-                CircularMiningRecoveryPlan.Cell.WALKABLE
-            )
-        );
         assertEquals(
-            CircularMiningRecoveryPlan.Mode.RECOVER_FROM_END,
-            recovery.mode()
+            List.of("remote-2", "remote-1", "remote-0"),
+            plan.scheduledTargetsByTraversal().get(0).stream()
+                .map(ReachOptimizedTeardownPlan.ScheduledTarget::target)
+                .toList()
+        );
+    }
+
+    @Test
+    void interruptedRemoteSuffixCanMoveToTheNextReachableHost() {
+        var plan = ReachOptimizedTeardownPlan.create(
+            List.of(
+                new ReachOptimizedTeardownPlan.Route<>(
+                    0,
+                    List.of("remaining-0", "remaining-1"),
+                    false,
+                    false
+                ),
+                route(1, "host")
+            ),
+            (targets, destination) -> destination == 1
+                && targets.getFirst().startsWith("remaining")
+                    ? Optional.of(List.of(0, 1))
+                    : Optional.empty()
+        );
+
+        assertEquals(List.of(1), plan.traversalRouteIndices());
+        assertEquals(Map.of(0, 1), plan.routeAssignments());
+        assertEquals(
+            List.of("remaining-0", "remaining-1"),
+            plan.scheduledTargetsByTraversal().get(1).stream()
+                .map(
+                    ReachOptimizedTeardownPlan.ScheduledTarget::target
+                )
+                .toList()
         );
     }
 

@@ -134,10 +134,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final int TEARDOWN_BREAK_MAX_PENDING_TICKS = 1200;
     private static final double
         TEARDOWN_REACH_POSITION_TOLERANCE = 0.20;
-    private static final int U_TRAVERSAL_NO_PROGRESS_TICKS = 40;
-    private static final double U_TRAVERSAL_MINIMUM_PROGRESS = 0.10;
-    private static final double U_TRAVERSAL_FORWARD_STEERING_EXTENSION =
-        1.0;
     private static final int MINING_RECOVERY_STABLE_SNAPSHOT_TICKS = 2;
     private static final int DEBUG_ACTION_BUDGET_INTERVAL_TICKS = 20;
     private static final int LOCAL_CYCLE_HEARTBEAT_TICKS = 20;
@@ -230,6 +226,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (!enabled) releaseTeardownSpeedMine();
         })
         .build()
+    );
+
+    private final Setting<Integer> teardownScaffoldStacks = sgGeneral.add(
+        new IntSetting.Builder()
+            .name("teardown-scaffold-stacks")
+            .description(
+                "Keep two or three cobblestone stacks during teardown. "
+                    + "After the fast pass, sparse server-missed blocks "
+                    + "are reached by the closest safe temporary U scaffold."
+            )
+            .defaultValue(3)
+            .min(2)
+            .max(3)
+            .sliderRange(2, 3)
+            .build()
     );
 
     private final Setting<Double> maxMiningRange = sgGeneral.add(new DoubleSetting.Builder()
@@ -872,6 +883,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     HashSet<BlockPos> optionalPendingPlacements;
     TpsScaledActionBudget workActionBudget;
     PendingPlacementLedger<BlockPos, Block> pendingPlacementLedger;
+    PendingPlacementLedger<BlockPos, Block>
+        teardownScaffoldPlacementLedger;
+    HashMap<BlockPos, Long>
+        teardownScaffoldSubmissionBlockSequences;
     ConfirmedHotbarSwap<Item> confirmedBuildHotbarSwap;
     boolean pendingBuildHotbarSwapMandatory;
     HashSet<Item> rejectedOptionalSwapMaterials;
@@ -893,14 +908,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     OrderedTeardownMineController<BlockPos, Block>
         teardownMineController;
     boolean teardownMovementOverlapAllowed;
-    BlockPos activeUTraversalPreviousSupport;
-    final LogisticsProgressWatchdog<BlockPos>
-        uTraversalProgressWatchdog =
-            new LogisticsProgressWatchdog<>(
-                U_TRAVERSAL_NO_PROGRESS_TICKS,
-                U_TRAVERSAL_MINIMUM_PROGRESS,
-                0
-            );
+    List<ContinuousTeardownRoutePlan.Stage<BlockPos>>
+        activeContinuousTeardownStages;
+    int activeContinuousTeardownPair;
+    int activeContinuousTeardownStageIndex;
+    boolean activeContinuousTeardownArmed;
+    boolean activeContinuousTeardownRecoveryExit;
+    TeardownScaffoldPhase teardownScaffoldPhase;
+    ActiveTeardownScaffoldRecovery activeTeardownScaffoldRecovery;
+    int activeTeardownScaffoldHotbarSlot;
+    long teardownScaffoldPlacementAttempts;
+    long confirmedTeardownScaffoldPlacements;
     long teardownMineFirstDispatchTick;
     long teardownMineLastDispatchTick;
     TpsScaledActionBudget.PauseReason lastPrintPauseReason;
@@ -1041,7 +1059,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     String fileMasterRecoveredMapCorner;
     boolean fileRecoveryIdentityWarning;
     boolean miningRecoverySnapshotWaitLogged;
-    BlockPos activeOrderedMiningJumpTarget;
     StaircasedCycleCheckpointStore localCycleCheckpointStore;
     boolean localCycleRecoveryCandidate;
     int recoveredActiveMiningPair;
@@ -1146,6 +1163,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             PLACEMENT_RETRY_TICKS,
             PLACEMENT_MAX_RETRIES
         );
+        teardownScaffoldPlacementLedger =
+            new PendingPlacementLedger<>(
+                PLACEMENT_RETRY_TICKS,
+                PLACEMENT_MAX_RETRIES
+            );
+        teardownScaffoldSubmissionBlockSequences = new HashMap<>();
         confirmedBuildHotbarSwap = new ConfirmedHotbarSwap<>();
         pendingBuildHotbarSwapMandatory = false;
         rejectedOptionalSwapMaterials = new HashSet<>();
@@ -1169,8 +1192,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         teardownMineController =
             new OrderedTeardownMineController<>();
         teardownMovementOverlapAllowed = false;
-        activeUTraversalPreviousSupport = null;
-        uTraversalProgressWatchdog.reset();
+        activeContinuousTeardownStages = List.of();
+        activeContinuousTeardownPair = -1;
+        activeContinuousTeardownStageIndex = -1;
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownRecoveryExit = false;
+        teardownScaffoldPhase = TeardownScaffoldPhase.NONE;
+        activeTeardownScaffoldRecovery = null;
+        activeTeardownScaffoldHotbarSlot = -1;
         teardownMineFirstDispatchTick = -1L;
         teardownMineLastDispatchTick = -1L;
         lastPrintPauseReason = TpsScaledActionBudget.PauseReason.NONE;
@@ -1183,6 +1212,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         miningActionTick = 0L;
         placementAttempts = 0L;
         confirmedPlacements = 0L;
+        teardownScaffoldPlacementAttempts = 0L;
+        confirmedTeardownScaffoldPlacements = 0L;
         repairBreakAttempts = 0L;
         confirmedRepairBreaks = 0L;
         teardownBreakAttempts = 0L;
@@ -1311,7 +1342,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         fileRecoveryIdentityWarning = false;
         miningRecoverySnapshotGate.reset();
         miningRecoverySnapshotWaitLogged = false;
-        activeOrderedMiningJumpTarget = null;
         localCycleCheckpointStore = null;
         localCycleRecoveryCandidate = false;
         recoveredActiveMiningPair = -1;
@@ -3665,6 +3695,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     > BUILD_TOOL_CRITICAL_DURABILITY;
         }
         if (strictMiningRestockActive
+            && requestedItem == Items.COBBLESTONE) {
+            return true;
+        }
+        if (strictMiningRestockActive
             && strictMiningInventoryPlan != null) {
             MiningToolInventoryPlan.Tool<Item, ItemStack> tool =
                 miningInventoryTool(stack, 0);
@@ -4899,6 +4933,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
         if (!reconcilePendingBuildPlacements()) return;
+        if (!reconcileTeardownScaffoldPlacements()) return;
         if (!SlaveSystem.isSlave()
             && mapCyclePhase == MapCyclePhase.MAP_DEPOSITED
             && !miningAssignmentsActive
@@ -5032,26 +5067,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
 
-        boolean continuingCircularBuildJump =
-            jumpTimeout > 0
-                && state == State.Walking
-                && activeCircularBuildPair >= 0
-                && (circularBuildPhase
-                        == CircularBuildPhase.OUTBOUND
-                    || circularBuildPhase
-                        == CircularBuildPhase.CONNECTOR
-                    || circularBuildPhase
-                        == CircularBuildPhase.RETURN);
-        BlockPos orderedMiningJumpTarget =
-            currentOrderedMiningStepUpJumpTarget();
-        updateOrderedMiningJumpTransition(
-            orderedMiningJumpTarget
-        );
-        boolean continuingOrderedMiningJump =
-            orderedMiningJumpTarget != null;
         boolean continuingOrderedRouteJump =
-            continuingCircularBuildJump
-                || continuingOrderedMiningJump;
+            jumpTimeout > 0 && hasActiveOrderedUMovement();
         if (jumpTimeout > 0) {
             jumpTimeout--;
             if (!continuingOrderedRouteJump) {
@@ -5187,12 +5204,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 && miningPos != null
                 && teardownMineController.hasOwnedTarget()))
             && miningPos != null) {
-            Block expected = buildTargets.get(
-                miningPos.subtract(mapCorner)
-            );
+            Block expected = activeTeardownExpectedBlock(miningPos);
             if (expected == null) {
                 failTeardownMining(
-                    "U mining target is absent from the NBT plan at "
+                    "U mining target has no active teardown ownership at "
                         + miningPos.toShortString() + "."
                 );
                 return;
@@ -5416,7 +5431,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             tickCircularBuildRecovery();
             return;
         }
-
         if (state == State.Walking
             && !checkpoints.isEmpty()
             && circularBuildPhase != CircularBuildPhase.CONNECTOR
@@ -5499,30 +5513,63 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 }
             }
         }
+        ActiveOrderedUTraversal activeOrderedUTraversal =
+            activeOrderedUTraversal();
+        if (state == State.MiningUTraversal
+            && activeContinuousTeardownArmed
+            && activeOrderedUTraversal == null) {
+            failTeardownMining(
+                "Active teardown lost its ordered U movement plan."
+            );
+            return;
+        }
+        boolean activeOrderedUMovement =
+            activeOrderedUTraversal != null;
         boolean activeCircularBuildMovement =
-            state == State.Walking
-                && activeCircularBuildPair >= 0
-                && (circularBuildPhase == CircularBuildPhase.OUTBOUND
-                    || circularBuildPhase
-                        == CircularBuildPhase.CONNECTOR
-                    || circularBuildPhase
-                        == CircularBuildPhase.RETURN);
-        if (!activeCircularBuildMovement) {
+            activeOrderedUMovement
+                && activeOrderedUTraversal.owner()
+                    == OrderedUTraversalOwner.PRINTING;
+        boolean activeContinuousTeardownMovement =
+            activeOrderedUMovement
+                && activeOrderedUTraversal.owner()
+                    != OrderedUTraversalOwner.PRINTING;
+        if (!activeOrderedUMovement) {
             lastActiveBuildMovementDebugState = null;
             activeCircularRouteSupportIndex = -1;
         }
-        if (activeCircularBuildMovement) {
-            runBuildActionScheduler();
+        if (activeOrderedUMovement) {
+            if (activeCircularBuildMovement) {
+                runBuildActionScheduler();
+            } else if (activeOrderedUTraversal.owner()
+                == OrderedUTraversalOwner.TEARDOWN_SCAFFOLD
+                && teardownScaffoldPhase
+                    == TeardownScaffoldPhase.BUILDING_OUTBOUND) {
+                runTeardownScaffoldPlacementScheduler();
+            }
             if (!buildMovementBlockedThisTick) {
-                ensureActiveCircularNextSupport();
+                ensureActiveOrderedUNextSupport(
+                    activeOrderedUTraversal
+                );
+            }
+            if (activeContinuousTeardownMovement
+                && !buildMovementBlockedThisTick
+                && !serviceContinuousTeardownWork()) {
+                return;
             }
             if (buildMovementBlockedThisTick) {
-                debugActiveBuildMovementTransition(
+                debugActiveOrderedUMovementTransition(
                     "hold",
-                    "holding active U movement reason="
+                    "holding shared ordered U movement reason="
                         + buildMovementHoldReasonThisTick
-                        + " pair=" + activeCircularBuildPair
-                        + " phase=" + circularBuildPhase
+                        + " owner="
+                            + activeOrderedUTraversal.owner()
+                        + (activeCircularBuildMovement
+                            ? " pair=" + activeCircularBuildPair
+                            : "")
+                        + (activeCircularBuildMovement
+                            ? " phase=" + circularBuildPhase
+                            : " routeCursor="
+                                + activeCircularRouteSupportIndex)
                         + (buildMovementRequiredSupportThisTick == null
                             ? ""
                             : " requiredSupport="
@@ -5532,25 +5579,46 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return;
             }
             if (continuingOrderedRouteJump) {
-                debugActiveBuildMovementTransition(
+                debugActiveOrderedUMovementTransition(
                     "jump",
-                    "continuing held route jump with block actions active pair="
-                        + activeCircularBuildPair + " phase="
-                        + circularBuildPhase + " remainingJumpTicks="
+                    "continuing shared route jump owner="
+                        + activeOrderedUTraversal.owner()
+                        + " remainingJumpTicks="
                         + jumpTimeout
                 );
+            } else if (activeCircularRouteSupportIndex
+                == activeOrderedUTraversal.supports().size() - 1) {
+                debugActiveOrderedUMovementTransition(
+                    "route-end",
+                    "holding final shared ordered U support owner="
+                        + activeOrderedUTraversal.owner()
+                        + " cursor="
+                        + activeCircularRouteSupportIndex
+                        + " while remaining work receives server "
+                        + "confirmation"
+                );
             } else {
-                debugActiveBuildMovementTransition(
+                debugActiveOrderedUMovementTransition(
                     "moving",
-                    "resuming active U route movement pair="
-                        + activeCircularBuildPair
-                        + " phase=" + circularBuildPhase
+                    "resuming shared ordered U movement owner="
+                        + activeOrderedUTraversal.owner()
+                        + " supportCursor="
+                            + activeCircularRouteSupportIndex
                 );
             }
         }
 
-        if (state.equals(State.Walking) || state.equals(State.MiningUTraversal)) {
+        boolean activeOrderedRouteComplete =
+            activeOrderedUMovement
+                && activeCircularRouteSupportIndex
+                    == activeOrderedUTraversal.supports().size() - 1;
+        if ((state.equals(State.Walking)
+                || state.equals(State.MiningUTraversal))
+            && !activeOrderedRouteComplete) {
             Utils.setForwardPressed(true);
+            Utils.setBackwardPressed(false);
+        } else if (activeOrderedRouteComplete) {
+            Utils.setForwardPressed(false);
             Utils.setBackwardPressed(false);
         } else if (state.equals(State.Mining)) {
             Utils.setForwardPressed(false);
@@ -5558,7 +5626,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         } else {
             return;
         }
-        Utils.setJumpPressed(continuingOrderedRouteJump);
+        Utils.setJumpPressed(
+            continuingOrderedRouteJump
+                && !activeOrderedRouteComplete
+        );
         if (checkpoints.isEmpty()) {
             if (state.equals(State.MiningUTraversal)) {
                 restartCurrentMiningAssignment();
@@ -5569,16 +5640,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean followingCircularConnector =
             state == State.Walking
                 && circularBuildPhase == CircularBuildPhase.CONNECTOR;
-        Vec3d goal = followingCircularConnector
+        Vec3d checkpointGoal = followingCircularConnector
             ? currentCircularConnectorGoal()
             : checkpoints.get(0).getLeft();
-        Vec3d circularHandoffGoal = circularBuildHandoffGoal(goal);
-        if (followingCircularConnector
+        Vec3d movementGoal = activeOrderedUMovement
+            ? currentActiveOrderedUMovementGoal(
+                activeOrderedUTraversal
+            )
+            : checkpointGoal;
+        if (activeOrderedUMovement
+            || followingCircularConnector
             || state == State.MiningUTraversal
             || activeCircularBuildPair >= 0) {
-            steerTowardGoal(goal);
-        } else if (circularHandoffGoal != null) {
-            steerTowardGoal(circularHandoffGoal);
+            steerTowardGoal(movementGoal);
         }
 
         // AutoJump logic
@@ -5588,24 +5662,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && !continuingOrderedRouteJump
             && (mc.options.forwardKey.isPressed() || mc.options.backKey.isPressed())
             && jumpTimeout <= 0) {
-            boolean orderedMiningRoute =
-                state == State.MiningUTraversal
-                    && !checkpoints.isEmpty()
-                    && isUTraversalRouteStep(
-                        checkpoints.getFirst()
-                    );
-            BlockPos target = null;
-            if (!orderedMiningRoute) {
-                Direction direction =
-                    Direction.fromHorizontalDegrees(
-                        mc.player.getYaw()
-                    );
-                if (mc.options.backKey.isPressed()) {
-                    direction = direction.getOpposite();
-                }
-                target =
-                    mc.player.getBlockPos().offset(direction);
+            Direction direction =
+                Direction.fromHorizontalDegrees(
+                    mc.player.getYaw()
+                );
+            if (mc.options.backKey.isPressed()) {
+                direction = direction.getOpposite();
             }
+            BlockPos target =
+                mc.player.getBlockPos().offset(direction);
             if (target != null
                 && mc.player.isOnGround()
                 && !MapAreaCache.getCachedBlockState(target).isAir()
@@ -5616,8 +5681,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     "Movement",
                     "started auto-jump obstacle="
                         + target.toShortString()
-                        + " orderedGoal="
-                            + orderedMiningRoute
+                        + " sharedOrderedU="
+                            + hasActiveOrderedUMovement()
                         + " raisedUEntry="
                             + isRaisedCircularBuildEntry(target)
                         + " yaw=" + mc.player.getYaw()
@@ -5627,7 +5692,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         if (state == State.MiningUTraversal
             && isUTraversalCheckpoint(checkpoints.get(0))
-            && !isSafeUCheckpointSupport(goal)) {
+            && !isSafeUCheckpoint(checkpoints.get(0))) {
             miningRecoveryPending = true;
             Utils.setForwardPressed(false);
             Utils.setBackwardPressed(false);
@@ -5642,9 +5707,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 || preciseCircularBuildCheckpoint
                 || isLogisticsDetourCheckpoint(checkpoints.get(0));
         double checkpointDistance = usesThreeDimensionalCheckpoint
-            ? PlayerUtils.distanceTo(goal)
-            : PlayerUtils.distanceTo(goal.add(0, mc.player.getY() - goal.y, 0));
-        if (!followingCircularConnector && handleLogisticsNavigation(goal)) return;
+            ? PlayerUtils.distanceTo(checkpointGoal)
+            : PlayerUtils.distanceTo(
+                checkpointGoal.add(
+                    0,
+                    mc.player.getY() - checkpointGoal.y,
+                    0
+                )
+            );
+        if (!followingCircularConnector
+            && handleLogisticsNavigation(checkpointGoal)) return;
         boolean circularRouteCheckpoint =
             followingCircularConnector
                 || (state == State.MiningUTraversal && isUTraversalCheckpoint(checkpoints.get(0)))
@@ -5665,59 +5737,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 : checkpointBuffer.get();
         Pair<Vec3d, Pair<String, BlockPos>> currentCheckpoint =
             checkpoints.getFirst();
-        boolean uRouteStep =
-            state == State.MiningUTraversal
-                && isUTraversalRouteStep(currentCheckpoint);
         boolean uEndpoint =
             state == State.MiningUTraversal
                 && isUTraversalEndpoint(currentCheckpoint);
         if (uEndpoint
-            && isHorizontallyOverCheckpointSupport(goal)
-            && !isGroundedOnCheckpointSupport(goal)) {
+            && !activeContinuousTeardownMovement
+            && isHorizontallyOverCheckpointSupport(checkpointGoal)
+            && !isGroundedOnCheckpointSupport(checkpointGoal)) {
             stopCircularMiningMotion();
             return;
         }
         if (state == State.Walking
             && preciseCircularBuildCheckpoint
-            && isHorizontallyOverCheckpointSupport(goal)
-            && !isGroundedOnCheckpointSupport(goal)) {
+            && isHorizontallyOverCheckpointSupport(checkpointGoal)
+            && !isGroundedOnCheckpointSupport(checkpointGoal)) {
             stopMovement();
             return;
         }
-        CircularTraversalSafety.MiningCheckpointProgress uProgress =
-            CircularTraversalSafety.MiningCheckpointProgress.APPROACHING;
-        if (uRouteStep) {
-            uProgress = uTraversalCheckpointProgress(
-                currentCheckpoint,
-                goal,
-                checkpointDistance < requiredCheckpointBuffer
-            );
-            if (uProgress
-                == CircularTraversalSafety.MiningCheckpointProgress.HOLD_FOR_LANDING) {
-                stopCircularMiningMotion();
-                return;
-            }
-            boolean stalled = uTraversalProgressWatchdog.observe(
-                supportBelowCheckpoint(goal),
-                Math.hypot(
-                    goal.x - mc.player.getX(),
-                    goal.z - mc.player.getZ()
-                ),
-                true,
-                mc.player.isOnGround()
-            );
-            if (stalled) {
-                handleStalledUTraversal(goal);
-                return;
-            }
-        }
         boolean reachedCheckpoint;
-        if (uRouteStep) {
+        if (uEndpoint) {
             reachedCheckpoint =
-                uProgress
-                    == CircularTraversalSafety.MiningCheckpointProgress.REACHED;
-        } else if (uEndpoint) {
-            reachedCheckpoint = isGroundedOnCheckpointSupport(goal);
+                !activeContinuousTeardownMovement
+                    && isGroundedOnCheckpointSupport(checkpointGoal);
         } else {
             reachedCheckpoint =
                 checkpointDistance < requiredCheckpointBuffer;
@@ -5736,10 +5777,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 "Checkpoint",
                 "reached action=" + checkpointAction.getLeft()
                     + " target=" + checkpointAction.getRight()
-                    + " goal=" + goal
+                    + " goal=" + checkpointGoal
                     + " remainingQueue=" + checkpoints.size()
             );
-            if (snapToCheckpoints.get()) mc.player.setPosition(goal.x, mc.player.getY(), goal.z);
+            if (snapToCheckpoints.get()) {
+                mc.player.setPosition(
+                    checkpointGoal.x,
+                    mc.player.getY(),
+                    checkpointGoal.z
+                );
+            }
             checkpoints.remove(0);
             if (!checkpointAction.getLeft().equals("logisticsDetour")) {
                 clearLogisticsTracking();
@@ -5750,21 +5797,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         stopMovement();
                         return;
                     }
-                    break;
-                case "walkUBlock":
-                    if (isUTraversalTurnaround(
-                        goal,
-                        activeUTraversalPreviousSupport
-                    )) {
-                        activeUTraversalPreviousSupport =
-                            supportBelowCheckpoint(goal);
-                        uTraversalProgressWatchdog.reset();
-                        stopCircularMiningMotion();
-                        return;
-                    }
-                    activeUTraversalPreviousSupport =
-                        supportBelowCheckpoint(goal);
-                    uTraversalProgressWatchdog.reset();
                     break;
                 case "lineEnd":
                     activeCircularBuildPair = -1;
@@ -6204,59 +6236,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     Utils.setBackwardPressed(false);
                     checkpoints.add(new Pair(mc.player.getEntityPos(), new Pair<>("miningLineEnd", null)));
                     break;
-                case "removeUBlock":
-                    activeUTraversalPreviousSupport =
-                        supportBelowCheckpoint(goal);
-                    uTraversalProgressWatchdog.reset();
-                    miningPos = checkpointAction.getRight();
-                    if (miningPos != null && !MapAreaCache.getCachedBlockState(miningPos).isAir()) {
-                        if (!isBuildPlacementInReach(miningPos)) {
-                            error(
-                                "Planned U teardown target is outside the configured "
-                                    + "interaction range at "
-                                    + miningPos.toShortString() + "."
-                            );
-                            restartCurrentMiningAssignment();
-                            return;
-                        }
-                        Block expected = buildTargets.get(miningPos.subtract(mapCorner));
-                        BlockState targetState = MapAreaCache.getCachedBlockState(miningPos);
-                        if (expected == null || targetState.getBlock() != expected) {
-                            error("U mining target changed unexpectedly at " + miningPos.toShortString() + ".");
-                            toggle();
-                            return;
-                        }
-                        state = State.AwaitUBlockBreak;
-                        teardownMovementOverlapAllowed = true;
-                        TeardownBreakStatus breakStatus =
-                            driveOrderedTeardownBreak(
-                                miningPos,
-                                expected
-                            );
-                        if (breakStatus
-                            == TeardownBreakStatus.CLEARED) {
-                            miningPos = null;
-                            teardownMovementOverlapAllowed =
-                                false;
-                            state = State.MiningUTraversal;
-                        } else if (ownedTeardownMayOverlapMovement()) {
-                            state = State.MiningUTraversal;
-                        } else {
-                            teardownMovementOverlapAllowed =
-                                false;
-                            jumpTimeout = 0;
-                            stopCircularMiningMotion();
-                        }
-                        return;
-                    }
-                    miningPos = null;
-                    teardownMovementOverlapAllowed = false;
-                    stopMovement();
-                    return;
                 case "verifyUTools":
-                    activeUTraversalPreviousSupport =
-                        supportBelowCheckpoint(goal);
-                    uTraversalProgressWatchdog.reset();
                     int miningPairIndex = checkpointAction.getRight().getX();
                     CompactCircularNbtPlan.PairRoute miningRoute =
                         compactPlan.pairRoutes().get(miningPairIndex);
@@ -6270,6 +6250,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         toggle();
                         return;
                     }
+                    if (!hasCompleteTeardownScaffoldReserve()) {
+                        error(
+                            "The configured cobblestone scaffold reserve "
+                                + "was not complete at U entry for pair "
+                                + miningPairIndex + "."
+                        );
+                        toggle();
+                        return;
+                    }
                     HotbarPreparation uHotbarPreparation =
                         prepareTeardownHotbarLoadout();
                     if (uHotbarPreparation
@@ -6277,7 +6266,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         if (uHotbarPreparation
                             == HotbarPreparation.WAITING) {
                             checkpoints.add(0, new Pair<>(
-                                goal,
+                                checkpointGoal,
                                 new Pair<>(
                                     "verifyUTools",
                                     checkpointAction.getRight()
@@ -6291,6 +6280,105 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     }
                     strictMiningRestockActive = false;
                     strictMiningInventoryPlan = null;
+                    if (!activeContinuousTeardownStages.isEmpty()) {
+                        activeContinuousTeardownStageIndex = 0;
+                        activeCircularRouteSupportIndex = 0;
+                        activeContinuousTeardownArmed = true;
+                        debugLog(
+                            "Movement",
+                            "activated shared teardown U movement pair="
+                                + miningPairIndex
+                                + " currentSupport="
+                                + activeContinuousTeardownStages
+                                    .getFirst().support()
+                                    .toShortString()
+                                + (activeContinuousTeardownStages.size()
+                                        < 2
+                                    ? ""
+                                    : " nextSupport="
+                                        + activeContinuousTeardownStages
+                                            .get(1).support()
+                                            .toShortString())
+                                + " stages="
+                                + activeContinuousTeardownStages.size()
+                        );
+                    }
+                    stopMovement();
+                    return;
+                case "verifyTeardownScaffold":
+                    ActiveTeardownScaffoldRecovery scaffoldRecovery =
+                        activeTeardownScaffoldRecovery;
+                    int scaffoldPair =
+                        checkpointAction.getRight().getX();
+                    if (scaffoldRecovery == null
+                        || scaffoldRecovery.pairIndex()
+                            != scaffoldPair
+                        || (teardownScaffoldPhase
+                                != TeardownScaffoldPhase
+                                    .BUILDING_OUTBOUND
+                            && teardownScaffoldPhase
+                                != TeardownScaffoldPhase
+                                    .CLEANING_RETURN)) {
+                        failTeardownMining(
+                            "Sparse teardown scaffold lost its frozen "
+                                + "pair plan at entry."
+                        );
+                        return;
+                    }
+                    HashMap<Item, Integer> missingScaffoldTools =
+                        missingMiningTools(
+                            scaffoldRecovery.plannedToolStates()
+                                .keySet(),
+                            scaffoldRecovery.plannedToolStates()
+                        );
+                    if (missingScaffoldTools == null
+                        || !missingScaffoldTools.isEmpty()
+                        || !hasCompleteTeardownScaffoldReserve()) {
+                        error(
+                            "Sparse teardown scaffold inventory changed "
+                                + "before pair " + scaffoldPair
+                                + " entry."
+                        );
+                        toggle();
+                        return;
+                    }
+                    HotbarPreparation scaffoldTools =
+                        prepareTeardownHotbarLoadout();
+                    HotbarPreparation scaffoldMaterial =
+                        scaffoldTools == HotbarPreparation.READY
+                            ? prepareTeardownScaffoldHotbar()
+                            : scaffoldTools;
+                    if (scaffoldMaterial
+                        != HotbarPreparation.READY) {
+                        if (scaffoldMaterial
+                            == HotbarPreparation.WAITING) {
+                            checkpoints.add(0, new Pair<>(
+                                checkpointGoal,
+                                new Pair<>(
+                                    "verifyTeardownScaffold",
+                                    checkpointAction.getRight()
+                                )
+                            ));
+                        } else if (isActive()) {
+                            toggle();
+                        }
+                        stopMovement();
+                        return;
+                    }
+                    strictMiningRestockActive = false;
+                    strictMiningInventoryPlan = null;
+                    activeContinuousTeardownStageIndex = 0;
+                    activeCircularRouteSupportIndex = 0;
+                    activeContinuousTeardownArmed = true;
+                    debugLog(
+                        "TeardownScaffold",
+                        "activated scaffold route pair="
+                            + scaffoldPair + " phase="
+                            + teardownScaffoldPhase + " stages="
+                            + activeContinuousTeardownStages.size()
+                            + " cobblestoneSlot="
+                            + activeTeardownScaffoldHotbarSlot
+                    );
                     stopMovement();
                     return;
                 case "verifyIndependentTools":
@@ -6306,6 +6394,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         toggle();
                         return;
                     }
+                    if (!hasCompleteTeardownScaffoldReserve()) {
+                        error(
+                            "The configured cobblestone scaffold reserve "
+                                + "was not complete at independent line "
+                                + independentLine + "."
+                        );
+                        toggle();
+                        return;
+                    }
                     HotbarPreparation independentHotbarPreparation =
                         prepareTeardownHotbarLoadout();
                     if (independentHotbarPreparation
@@ -6313,7 +6410,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         if (independentHotbarPreparation
                             == HotbarPreparation.WAITING) {
                             checkpoints.add(0, new Pair<>(
-                                goal,
+                                checkpointGoal,
                                 new Pair<>(
                                     "verifyIndependentTools",
                                     checkpointAction.getRight()
@@ -6401,29 +6498,32 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             followingCircularConnector =
                 state == State.Walking
                     && circularBuildPhase == CircularBuildPhase.CONNECTOR;
-            goal = followingCircularConnector
+            checkpointGoal = followingCircularConnector
                 ? currentCircularConnectorGoal()
                 : checkpoints.get(0).getLeft();
-            BlockPos nextOrderedMiningJumpTarget =
-                currentOrderedMiningStepUpJumpTarget();
-            if (nextOrderedMiningJumpTarget != null) {
-                updateOrderedMiningJumpTransition(
-                    nextOrderedMiningJumpTarget
-                );
-                Utils.setJumpPressed(true);
-            }
+            activeOrderedUTraversal = activeOrderedUTraversal();
+            activeOrderedUMovement =
+                activeOrderedUTraversal != null;
+            movementGoal = activeOrderedUMovement
+                ? currentActiveOrderedUMovementGoal(
+                    activeOrderedUTraversal
+                )
+                : checkpointGoal;
         }
 
         //Set yaw rotation
-        steerTowardGoal(goal);
+        steerTowardGoal(movementGoal);
 
         // Set print mode
         String nextAction = checkpoints.get(0).getRight().getLeft();
-        if (state.equals(State.MiningUTraversal)) {
+        if (activeOrderedUMovement) {
             mc.player.setSprinting(
-                isUTraversalRouteStep(checkpoints.getFirst())
-                    && sprinting.get() != SprintMode.Off
+                shouldSprintActiveOrderedU(
+                    activeOrderedUTraversal
+                )
             );
+        } else if (state.equals(State.MiningUTraversal)) {
+            mc.player.setSprinting(false);
         } else if (circularBuildPhase == CircularBuildPhase.CONNECTOR
             || circularBuildPhase == CircularBuildPhase.RECOVERY
             || circularBuildPhase == CircularBuildPhase.RECOVERY_EXIT
@@ -6966,10 +7066,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     / 1_000_000_000.0;
             long submittedActions =
                 placementAttempts
+                    + teardownScaffoldPlacementAttempts
                     + repairBreakAttempts
                     + teardownBreakAttempts;
             long confirmedActions =
                 confirmedPlacements
+                    + confirmedTeardownScaffoldPlacements
                     + confirmedRepairBreaks
                     + confirmedTeardownBreaks;
             double submittedBps = elapsedSeconds <= 0.0
@@ -7011,6 +7113,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         + confirmedPlacements
                     + ",repair=" + repairBreakAttempts + "/"
                         + confirmedRepairBreaks
+                    + ",scaffold="
+                        + teardownScaffoldPlacementAttempts + "/"
+                        + confirmedTeardownScaffoldPlacements
                     + ",teardown=" + teardownBreakAttempts + "/"
                         + confirmedTeardownBreaks + "}"
             );
@@ -7173,6 +7278,272 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return false;
         }
         return true;
+    }
+
+    private boolean reconcileTeardownScaffoldPlacements() {
+        if (teardownScaffoldPlacementLedger == null
+            || teardownScaffoldPlacementLedger.isEmpty()) {
+            return true;
+        }
+        if (teardownScaffoldPhase
+                != TeardownScaffoldPhase.BUILDING_OUTBOUND
+            || activeTeardownScaffoldRecovery == null) {
+            teardownScaffoldPlacementLedger.reset();
+            teardownScaffoldSubmissionBlockSequences.clear();
+            return true;
+        }
+
+        for (PendingPlacementLedger.PendingAttempt<BlockPos, Block>
+            attempt : teardownScaffoldPlacementLedger
+                .pendingAttempts()) {
+            BlockPos world = attempt.key();
+            ServerBlockObservation observed =
+                serverBlockObservations.get(world);
+            long submittedAfter =
+                teardownScaffoldSubmissionBlockSequences.getOrDefault(
+                    world,
+                    Long.MAX_VALUE
+                );
+            if (observed == null
+                || observed.sequence() <= submittedAfter
+                || observed.block() == Blocks.AIR) {
+                teardownScaffoldPlacementLedger.observeUnresolved(world);
+                if (miningActionTick - attempt.firstSubmittedTick()
+                    >= PLACEMENT_MAX_PENDING_TICKS) {
+                    return failTeardownScaffoldPlacement(
+                        "Temporary cobblestone at "
+                            + world.toShortString()
+                            + " was not server-confirmed before the "
+                            + "bounded placement window."
+                    );
+                }
+                continue;
+            }
+            if (observed.block() != Blocks.COBBLESTONE) {
+                return failTeardownScaffoldPlacement(
+                    "Temporary scaffold target changed to "
+                        + observed.block().getName().getString()
+                        + " at " + world.toShortString() + "."
+                );
+            }
+            PendingPlacementLedger.Observation<BlockPos, Block>
+                confirmation =
+                    teardownScaffoldPlacementLedger.observePresent(
+                        world,
+                        observed.block()
+                    );
+            if (confirmation.status()
+                == PendingPlacementLedger.ObservationStatus.CONFIRMED) {
+                confirmedTeardownScaffoldPlacements++;
+                teardownScaffoldSubmissionBlockSequences.remove(world);
+                debugLog(
+                    "TeardownScaffold",
+                    "placement confirmed position="
+                        + world.toShortString()
+                        + " sequence=" + observed.sequence()
+                        + " confirmed="
+                            + confirmedTeardownScaffoldPlacements
+                );
+            }
+        }
+        for (PendingPlacementLedger.TimeoutDecision<BlockPos, Block>
+            timeout : teardownScaffoldPlacementLedger.advance(
+                miningActionTick,
+                0
+            )) {
+            if (timeout.action()
+                == PendingPlacementLedger.TimeoutAction.EXPIRED) {
+                return failTeardownScaffoldPlacement(
+                    "Temporary scaffold placement expired at "
+                        + timeout.attempt().key().toShortString() + "."
+                );
+            }
+        }
+        return true;
+    }
+
+    private boolean failTeardownScaffoldPlacement(String reason) {
+        error(reason);
+        debugLog(
+            "TeardownScaffold",
+            "placement failure reason=" + reason
+                + " phase=" + teardownScaffoldPhase
+                + " pending="
+                    + teardownScaffoldPlacementLedger
+                        .pendingAttempts()
+        );
+        resetTeardownMiningActionState();
+        stopMovement();
+        toggle();
+        return false;
+    }
+
+    private void runTeardownScaffoldPlacementScheduler() {
+        if (teardownScaffoldPhase
+                != TeardownScaffoldPhase.BUILDING_OUTBOUND
+            || activeTeardownScaffoldRecovery == null
+            || !activeContinuousTeardownArmed
+            || workActionBudget == null
+            || mc.player == null
+            || mc.world == null) {
+            return;
+        }
+        if (!dispatchDueTeardownScaffoldPlacementRetries()) return;
+        if (buildMovementBlockedThisTick) return;
+
+        int slot = -1;
+        for (BlockPos target :
+            activeTeardownScaffoldRecovery.scaffoldTargets()) {
+            Block current = latestKnownBuildBlock(target);
+            if (current == Blocks.COBBLESTONE
+                || teardownScaffoldPlacementLedger.isPending(target)) {
+                continue;
+            }
+            if (current != Blocks.AIR) {
+                failTeardownScaffoldPlacement(
+                    "Temporary scaffold target is occupied by "
+                        + current.getName().getString() + " at "
+                        + target.toShortString() + "."
+                );
+                return;
+            }
+            if (!isBuildPlacementInReach(target)) continue;
+            BuildPlacementPolicy.Mode mode =
+                teardownScaffoldPlacementMode(target);
+            if (mode == BuildPlacementPolicy.Mode.BLOCKED) continue;
+            if (slot < 0) {
+                slot = ensureTeardownScaffoldHotbarSlot();
+                if (slot == HOTBAR_SLOT_PENDING) {
+                    stopActiveOrderedUForAction(
+                        CircularBuildMovementPolicy.HoldReason
+                            .HOTBAR_SWAP_CONFIRMATION
+                    );
+                    return;
+                }
+                if (slot == HOTBAR_ITEM_UNAVAILABLE) return;
+            }
+            if (!workActionBudget.tryConsume()) return;
+            if (!submitPlacement(
+                target,
+                slot,
+                mode,
+                Blocks.COBBLESTONE
+            )) {
+                continue;
+            }
+            teardownScaffoldPlacementAttempts++;
+            boolean tracked = teardownScaffoldPlacementLedger.submit(
+                target,
+                Blocks.COBBLESTONE,
+                miningActionTick
+            );
+            if (tracked) {
+                teardownScaffoldSubmissionBlockSequences.put(
+                    new BlockPos(target),
+                    serverBlockUpdateSequence
+                );
+            }
+            debugLog(
+                "TeardownScaffold",
+                "placement submitted position="
+                    + target.toShortString()
+                    + " slot=" + slot + " mode=" + mode
+                    + " tracked=" + tracked
+                    + " attemptTotal="
+                        + teardownScaffoldPlacementAttempts
+            );
+        }
+    }
+
+    private boolean dispatchDueTeardownScaffoldPlacementRetries() {
+        for (PendingPlacementLedger.PendingAttempt<BlockPos, Block>
+            attempt : teardownScaffoldPlacementLedger
+                .pendingAttempts()) {
+            if (miningActionTick - attempt.lastAttemptTick()
+                < teardownScaffoldPlacementLedger.retryAfterTicks()) {
+                continue;
+            }
+            BlockPos target = attempt.key();
+            if (!isBuildPlacementInReach(target)) {
+                failTeardownScaffoldPlacement(
+                    "Temporary scaffold retry left live reach at "
+                        + target.toShortString() + "."
+                );
+                return false;
+            }
+            int slot = ensureTeardownScaffoldHotbarSlot();
+            if (slot == HOTBAR_SLOT_PENDING) {
+                stopActiveOrderedUForAction(
+                    CircularBuildMovementPolicy.HoldReason
+                        .HOTBAR_SWAP_CONFIRMATION
+                );
+                return false;
+            }
+            if (slot == HOTBAR_ITEM_UNAVAILABLE
+                || !workActionBudget.tryConsume()) {
+                return false;
+            }
+            BuildPlacementPolicy.Mode mode =
+                teardownScaffoldPlacementMode(target);
+            if (mode == BuildPlacementPolicy.Mode.BLOCKED
+                || !submitPlacement(
+                    target,
+                    slot,
+                    mode,
+                    Blocks.COBBLESTONE
+                )) {
+                continue;
+            }
+            teardownScaffoldPlacementAttempts++;
+            Optional<PendingPlacementLedger.TimeoutDecision<BlockPos, Block>>
+                reserved =
+                    teardownScaffoldPlacementLedger.reserveRetry(
+                        target,
+                        miningActionTick
+                    );
+            if (reserved.isPresent()
+                && reserved.orElseThrow().action()
+                    == PendingPlacementLedger.TimeoutAction.EXPIRED) {
+                failTeardownScaffoldPlacement(
+                    "Temporary scaffold retries were exhausted at "
+                        + target.toShortString() + "."
+                );
+                return false;
+            }
+            teardownScaffoldSubmissionBlockSequences.put(
+                new BlockPos(target),
+                serverBlockUpdateSequence
+            );
+            debugLog(
+                "TeardownScaffold",
+                "placement retry submitted position="
+                    + target.toShortString()
+                    + " totalAttempts="
+                        + (reserved.isEmpty()
+                            ? attempt.totalAttempts()
+                            : reserved.orElseThrow().attempt()
+                                .totalAttempts())
+            );
+        }
+        return true;
+    }
+
+    private BuildPlacementPolicy.Mode
+        teardownScaffoldPlacementMode(BlockPos world) {
+        Direction side = BlockUtils.getPlaceSide(world);
+        boolean adjacentPending = side != null
+            && teardownScaffoldPlacementLedger.isPending(
+                world.offset(side)
+            );
+        return BuildPlacementPolicy.select(
+            isBuildPlacementInReach(world),
+            latestKnownBuildBlock(world) == Blocks.AIR,
+            BlockUtils.canPlace(world),
+            side != null,
+            adjacentPending,
+            true,
+            false
+        );
     }
 
     private boolean handleConfirmedMiningHotbarSwap() {
@@ -7871,65 +8242,120 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return compactPlan.pairRoutes().get(activeCircularBuildPair);
     }
 
-    private boolean ensureActiveCircularNextSupport() {
-        CompactCircularNbtPlan.PairRoute route =
-            activeCircularBuildRoute();
-        if (route == null || mc.player == null) {
+    private boolean hasActiveOrderedUMovement() {
+        return activeOrderedUTraversal() != null;
+    }
+
+    private ActiveOrderedUTraversal activeOrderedUTraversal() {
+        boolean printing =
+            state == State.Walking
+                && activeCircularBuildPair >= 0
+                && (circularBuildPhase
+                        == CircularBuildPhase.OUTBOUND
+                    || circularBuildPhase
+                        == CircularBuildPhase.CONNECTOR
+                    || circularBuildPhase
+                        == CircularBuildPhase.RETURN);
+        if (printing) {
+            CompactCircularNbtPlan.PairRoute route =
+                activeCircularBuildRoute();
+            if (route == null) return null;
+            return new ActiveOrderedUTraversal(
+                OrderedUTraversalOwner.PRINTING,
+                route,
+                activeCircularBuildSupportPath(route)
+            );
+        }
+        if (state == State.MiningUTraversal
+            && activeContinuousTeardownArmed) {
+            if (compactPlan == null
+                || activeContinuousTeardownPair < 0
+                || activeContinuousTeardownPair
+                    >= compactPlan.pairRoutes().size()) {
+                return null;
+            }
+            return new ActiveOrderedUTraversal(
+                teardownScaffoldPhase == TeardownScaffoldPhase.NONE
+                    ? OrderedUTraversalOwner.TEARDOWN
+                    : OrderedUTraversalOwner.TEARDOWN_SCAFFOLD,
+                compactPlan.pairRoutes().get(
+                    activeContinuousTeardownPair
+                ),
+                activeContinuousTeardownStages.stream()
+                    .map(ContinuousTeardownRoutePlan.Stage::support)
+                    .toList()
+            );
+        }
+        return null;
+    }
+
+    private boolean ensureActiveOrderedUNextSupport(
+        ActiveOrderedUTraversal traversal
+    ) {
+        List<BlockPos> supportPath = traversal.supports();
+        if (supportPath.isEmpty() || mc.player == null) {
             return true;
         }
-
-        List<BlockPos> supportPath =
-            activeCircularBuildSupportPath(route);
         if (activeCircularRouteSupportIndex < 0
             || activeCircularRouteSupportIndex >= supportPath.size()) {
-            stopBuildForAction(
+            stopActiveOrderedUForAction(
                 CircularBuildMovementPolicy.HoldReason
                     .NEXT_ROUTE_SUPPORT_CONFIRMATION
             );
             error(
-                "Active circular build lost its horizontal route cursor; "
+                "Active ordered U traversal lost its horizontal route cursor; "
                     + "stopping before unsafe forward movement."
             );
             toggle();
             return false;
         }
-
-        OptionalInt resolvedIndex =
-            OrderedRouteProgressResolver.resolve(
+        OrderedUTraversalMovement.Progress progress =
+            OrderedUTraversalMovement.resolve(
                 supportPath,
                 activeCircularRouteSupportIndex,
                 mc.player.getX(),
-                mc.player.getZ()
+                mc.player.getZ(),
+                support -> isConfirmedActiveOrderedUSupport(
+                    traversal,
+                    support
+                )
             );
-        if (resolvedIndex.isEmpty()) {
+        if (progress.movement().status()
+            == OrderedUTraversalMovement.MovementStatus.OFF_PATH) {
             BlockPos cursorSupport = supportPath.get(
                 activeCircularRouteSupportIndex
             );
-            stopBuildForAction(
+            stopActiveOrderedUForAction(
                 CircularBuildMovementPolicy.HoldReason
                     .NEXT_ROUTE_SUPPORT_CONFIRMATION
             );
-            error(
-                "Active circular build left its horizontal ordered route "
+            warning(
+                "Active ordered U traversal could not reconcile its "
+                    + "horizontal route "
                     + "near " + mc.player.getBlockPos().toShortString()
                     + " from cursor="
                     + activeCircularRouteSupportIndex
                     + " support=" + cursorSupport.toShortString()
-                    + "; stopping before unsafe forward movement."
+                    + "; rebuilding from the authoritative support "
+                    + "under the player."
             );
-            toggle();
+            if (traversal.owner()
+                == OrderedUTraversalOwner.PRINTING) {
+                beginBuildRecovery(false);
+            } else {
+                beginMiningRecovery(false);
+            }
             return false;
         }
-
-        int nextResolvedIndex = resolvedIndex.getAsInt();
-        if (nextResolvedIndex > activeCircularRouteSupportIndex) {
+        int nextResolvedIndex = progress.currentIndex();
+        if (nextResolvedIndex != activeCircularRouteSupportIndex) {
             BlockPos enteredSupport =
                 supportPath.get(nextResolvedIndex);
-            if (!isConfirmedCircularBuildSupport(
-                route,
+            if (!isConfirmedActiveOrderedUSupport(
+                traversal,
                 enteredSupport
             )) {
-                stopBuildForAction(
+                stopActiveOrderedUForAction(
                     CircularBuildMovementPolicy.HoldReason
                         .NEXT_ROUTE_SUPPORT_CONFIRMATION
                 );
@@ -7937,24 +8363,40 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     new BlockPos(enteredSupport);
                 return false;
             }
+            int previousSupportIndex =
+                activeCircularRouteSupportIndex;
             activeCircularRouteSupportIndex = nextResolvedIndex;
+            if (nextResolvedIndex < previousSupportIndex) {
+                debugLog(
+                    "Movement",
+                    "reconciled server position correction owner="
+                        + traversal.owner() + " cursor="
+                        + previousSupportIndex + "->"
+                        + nextResolvedIndex + " support="
+                        + enteredSupport.toShortString()
+                );
+            }
         }
-
-        CircularBuildSupportPath.MovementDecision<BlockPos> decision =
-            CircularBuildSupportPath.decideMovement(
-                supportPath,
-                activeCircularRouteSupportIndex,
-                support ->
-                    isConfirmedCircularBuildSupport(route, support)
-            );
+        OrderedUTraversalMovement.MovementDecision<BlockPos> decision =
+            progress.movement();
+        if (decision.status()
+            == OrderedUTraversalMovement.MovementStatus.COMPLETE) {
+            // The final support is a hard movement boundary. Teardown may
+            // still be waiting for its last authoritative air update, but
+            // sprinting beyond this support would leave the ordered U.
+            stopMovement();
+            Utils.setJumpPressed(false);
+            Vec3d velocity = mc.player.getVelocity();
+            mc.player.setVelocity(0, velocity.y, 0);
+            return true;
+        }
         if (decision.mayMove()) return true;
-
-        stopBuildForAction(
+        stopActiveOrderedUForAction(
             CircularBuildMovementPolicy.HoldReason
                 .NEXT_ROUTE_SUPPORT_CONFIRMATION
         );
         if (decision.status()
-            == CircularBuildSupportPath.MovementStatus.OFF_PATH) {
+            == OrderedUTraversalMovement.MovementStatus.OFF_PATH) {
             throw new IllegalStateException(
                 "A validated horizontal route cursor became invalid."
             );
@@ -7962,6 +8404,56 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildMovementRequiredSupportThisTick =
             new BlockPos(decision.requiredSupport());
         return false;
+    }
+
+    private boolean isConfirmedActiveOrderedUSupport(
+        ActiveOrderedUTraversal traversal,
+        BlockPos support
+    ) {
+        if (traversal.owner()
+            == OrderedUTraversalOwner.TEARDOWN_SCAFFOLD) {
+            return isConfirmedTeardownScaffoldSupport(support);
+        }
+        if (traversal.owner() == OrderedUTraversalOwner.TEARDOWN) {
+            if (isSafeUCheckpointSupport(walkingPosition(support))) {
+                return true;
+            }
+            if (activeContinuousTeardownStages.isEmpty()
+                || !support.equals(
+                    activeContinuousTeardownStages.getFirst().support()
+                )
+                || mc.world == null) {
+                return false;
+            }
+            BlockState state = MapAreaCache.getCachedBlockState(support);
+            return !state.isAir()
+                && state.isSolidBlock(mc.world, support)
+                && MapAreaCache.getCachedBlockState(support.up()).isAir()
+                && MapAreaCache.getCachedBlockState(support.up(2)).isAir();
+        }
+        return isConfirmedCircularBuildSupport(
+            traversal.route(),
+            support
+        );
+    }
+
+    private void stopActiveOrderedUForAction(
+        CircularBuildMovementPolicy.HoldReason reason
+    ) {
+        if (reason == null
+            || reason
+                == CircularBuildMovementPolicy.HoldReason.NONE) {
+            throw new IllegalArgumentException(
+                "An ordered U hold requires a reason."
+            );
+        }
+        buildMovementHoldReasonThisTick = reason;
+        buildMovementBlockedThisTick = true;
+        stopMovement();
+        if (mc.player != null) {
+            Vec3d velocity = mc.player.getVelocity();
+            mc.player.setVelocity(0, velocity.y, 0);
+        }
     }
 
     private List<BlockPos> activeCircularBuildSupportPath(
@@ -9242,6 +9734,25 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Block targetBlock =
             buildTargets.get(world.subtract(mapCorner));
         if (targetBlock == null) return false;
+        return submitPlacement(
+            world,
+            hotbarSlot,
+            mode,
+            targetBlock
+        );
+    }
+
+    private boolean submitPlacement(
+        BlockPos world,
+        int hotbarSlot,
+        BuildPlacementPolicy.Mode mode,
+        Block targetBlock
+    ) {
+        Objects.requireNonNull(targetBlock, "targetBlock");
+        if (mode == null
+            || mode == BuildPlacementPolicy.Mode.BLOCKED) {
+            return false;
+        }
         boolean shouldRotate =
             rotatePlace.get()
                 && PlacementRotationPolicy
@@ -10043,7 +10554,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
-    private void debugActiveBuildMovementTransition(
+    private void debugActiveOrderedUMovementTransition(
         String stateKey,
         String message
     ) {
@@ -11100,35 +11611,57 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
-    private Vec3d circularBuildHandoffGoal(Vec3d currentGoal) {
-        if (state != State.Walking
-            || checkpoints.isEmpty()
-            || activeCircularBuildPair < 0
-            || activeCircularBuildPair >= compactPlan.pairRoutes().size()) {
-            return null;
+    private Vec3d currentActiveOrderedUMovementGoal(
+        ActiveOrderedUTraversal traversal
+    ) {
+        List<BlockPos> supports = traversal.supports();
+        if (supports.isEmpty()
+            || activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex >= supports.size()) {
+            throw new IllegalStateException(
+                "Active ordered U traversal has no movement goal."
+            );
         }
-        double horizontalDistance = PlayerUtils.distanceTo(
-            currentGoal.add(0, mc.player.getY() - currentGoal.y, 0)
+        int goalIndex = OrderedUTraversalMovement.steeringGoalIndex(
+            supports,
+            activeCircularRouteSupportIndex
         );
-        if (horizontalDistance >= circularBuildConnectorBuffer()) {
-            return null;
+        return walkingPosition(supports.get(goalIndex));
+    }
+
+    private boolean shouldSprintActiveOrderedU(
+        ActiveOrderedUTraversal traversal
+    ) {
+        if (sprinting.get() == SprintMode.Off
+            || sprinting.get() == SprintMode.NotPlacing) {
+            return false;
+        }
+        return !isActiveOrderedUConnectorSegment(traversal);
+    }
+
+    private boolean isActiveOrderedUConnectorSegment(
+        ActiveOrderedUTraversal traversal
+    ) {
+        if (activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex
+                >= traversal.supports().size()) {
+            return true;
         }
 
-        String action = checkpoints.getFirst().getRight().getLeft();
-        if (action.equals("uBuildOutboundEnd")
-            && circularBuildPhase == CircularBuildPhase.OUTBOUND) {
-            CompactCircularNbtPlan.PairRoute route =
-                compactPlan.pairRoutes().get(activeCircularBuildPair);
-            List<BlockPos> connectorSteps =
-                circularBuildCheckpointPlan(route).connectorTraversalSteps();
-            return walkingPosition(connectorSteps.getFirst());
-        }
-        if (action.equals("uBuildConnectorEnd")
-            && circularBuildPhase == CircularBuildPhase.RETURN
-            && checkpoints.size() > 1) {
-            return checkpoints.get(1).getLeft();
-        }
-        return null;
+        Set<BlockPos> connectorSupports =
+            traversal.route().relativePath().stream()
+            .map(this::connectorRuntimePosition)
+            .map(mapCorner::add)
+            .collect(Collectors.toSet());
+        BlockPos current = traversal.supports().get(
+            activeCircularRouteSupportIndex
+        );
+        if (!connectorSupports.contains(current)) return false;
+        int nextIndex = activeCircularRouteSupportIndex + 1;
+        return nextIndex < traversal.supports().size()
+            && connectorSupports.contains(
+                traversal.supports().get(nextIndex)
+            );
     }
 
     private void tickCircularBuildRecovery() {
@@ -11817,31 +12350,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void steerTowardGoal(Vec3d goal) {
         double lookX = goal.x;
         double lookZ = goal.z;
-        boolean orderedMiningRouteStep =
-            state == State.MiningUTraversal
-                && !checkpoints.isEmpty()
-                && isUTraversalRouteStep(checkpoints.getFirst())
-                && !isReachAssignedUCheckpoint(
-                    checkpoints.getFirst()
-                )
-                && activeUTraversalPreviousSupport != null;
-        if (orderedMiningRouteStep) {
-            CircularTraversalSafety.HorizontalPoint steering =
-                CircularTraversalSafety
-                    .orderedForwardSteeringPoint(
-                        mc.player.getX(),
-                        mc.player.getZ(),
-                        goal.x,
-                        goal.z,
-                        activeUTraversalPreviousSupport.getX()
-                            + 0.5,
-                        activeUTraversalPreviousSupport.getZ()
-                            + 0.5,
-                        U_TRAVERSAL_FORWARD_STEERING_EXTENSION
-                    );
-            lookX = steering.x();
-            lookZ = steering.z();
-        } else if (PlayerUtils.distanceTo(goal) > 2) {
+        if (PlayerUtils.distanceTo(goal) > 2) {
             lookZ = mc.player.getZ()
                 + Math.max(Math.min(goal.z - mc.player.getZ(), 1), -1);
         }
@@ -11852,75 +12361,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         } else {
             mc.player.setYaw((float) Rotations.getYaw(lookPos) + 180f);
         }
-    }
-
-    private BlockPos currentOrderedMiningStepUpJumpTarget() {
-        if (state != State.MiningUTraversal
-            || checkpoints == null
-            || checkpoints.isEmpty()
-            || !isUTraversalRouteStep(checkpoints.getFirst())) {
-            return null;
-        }
-        Vec3d goal = checkpoints.getFirst().getLeft();
-        BlockPos goalSupport = supportBelowCheckpoint(goal);
-        BlockPos previousSupport =
-            activeUTraversalPreviousSupport;
-        if (previousSupport == null) return null;
-        int orderedHorizontalStep =
-            Math.abs(goalSupport.getX() - mc.player.getBlockX())
-                + Math.abs(
-                    goalSupport.getZ() - mc.player.getBlockZ()
-                );
-        int orderedRouteStep =
-            Math.abs(goalSupport.getX() - previousSupport.getX())
-                + Math.abs(
-                    goalSupport.getZ() - previousSupport.getZ()
-                );
-        if (!CircularTraversalSafety.shouldHoldOrderedStepUpJump(
-            isSafeUCheckpointSupport(goal),
-            isGroundedOnCheckpointSupport(goal),
-            orderedRouteStep,
-            previousSupport.getY(),
-            goalSupport.getY(),
-            orderedHorizontalStep
-        )) {
-            return null;
-        }
-        return goalSupport;
-    }
-
-    private void updateOrderedMiningJumpTransition(
-        BlockPos target
-    ) {
-        if (Objects.equals(
-            activeOrderedMiningJumpTarget,
-            target
-        )) {
-            return;
-        }
-        if (target != null) {
-            debugLog(
-                "Movement",
-                "committed ordered U step-up target="
-                    + target.toShortString()
-                    + " previousSupport="
-                        + activeUTraversalPreviousSupport
-                    + "; holding jump until stable landing"
-            );
-            activeOrderedMiningJumpTarget =
-                new BlockPos(target);
-            return;
-        }
-        if (activeOrderedMiningJumpTarget != null) {
-            debugLog(
-                "Movement",
-                "released ordered U step-up target="
-                    + activeOrderedMiningJumpTarget
-                        .toShortString()
-                    + " player=" + mc.player.getEntityPos()
-            );
-        }
-        activeOrderedMiningJumpTarget = null;
     }
 
     private void stopMovement() {
@@ -11982,7 +12422,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         jumpTimeout = 0;
         miningRecoverySnapshotGate.reset();
         miningRecoverySnapshotWaitLogged = false;
-        activeOrderedMiningJumpTarget = null;
         if (mc.player == null) return;
         Vec3d velocity = mc.player.getVelocity();
         mc.player.setVelocity(0, velocity.y, 0);
@@ -12644,22 +13083,27 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     remaining.add(relative);
                 }
             }
-            boolean complete =
-                recovery.mode()
-                    == CircularMiningRecoveryPlan.Mode.COMPLETE;
-            boolean forward =
-                recovery.mode()
-                    == CircularMiningRecoveryPlan.Mode.FORWARD;
             boolean preferredLocalRoute =
                 route.pairIndex()
                     == preferredRecoveredMiningPair;
+            CircularTeardownRouteEligibility.Result eligibility =
+                CircularTeardownRouteEligibility.classify(
+                    recovery.mode(),
+                    preferredLocalRoute
+                );
+            List<BlockPos> safeRemoteOrder =
+                CircularRemoteTeardownOrder.create(
+                    remaining,
+                    recovery.mode()
+                );
             routes.add(
                 new ReachOptimizedTeardownPlan.Route<>(
                     route.pairIndex(),
-                    complete ? List.of() : remaining,
-                    !complete
-                        && (!forward || preferredLocalRoute),
-                    forward
+                    eligibility.complete()
+                        ? List.of()
+                        : safeRemoteOrder,
+                    eligibility.mustTraverse(),
+                    eligibility.canHostRemoteTeardown()
                 )
             );
         }
@@ -12725,8 +13169,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + plan.completedRouteIndices().size()
                 + " already clear routes, and assigning "
                 + optimizedDeferredMiningRouteAssignments.size()
-                + " fully reachable U routes (" + remoteTargets
-                + " blocks) to other traversals."
+                + " fully reachable U remainders (" + remoteTargets
+                + " blocks) to other traversals in endpoint-safe "
+                + "removal order."
         );
         debugLog(
             "TeardownPlan",
@@ -12917,16 +13362,509 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && MapAreaCache.getCachedBlockState(support.up(2)).isAir();
     }
 
+    private boolean isSafeUCheckpoint(
+        Pair<Vec3d, Pair<String, BlockPos>> checkpoint
+    ) {
+        if (isSafeUCheckpointSupport(checkpoint.getLeft())) {
+            return true;
+        }
+        Pair<String, BlockPos> action = checkpoint.getRight();
+        if ((!action.getLeft().equals("verifyUTools")
+                && !action.getLeft().equals(
+                    "verifyTeardownScaffold"
+                ))
+            || action.getRight() == null) {
+            return false;
+        }
+        int pairIndex = action.getRight().getX();
+        if (compactPlan == null
+            || pairIndex < 0
+            || pairIndex >= compactPlan.pairRoutes().size()) {
+            return false;
+        }
+        BlockPos requiredSupport = supportBelowCheckpoint(
+            checkpoint.getLeft()
+        );
+        if (activeContinuousTeardownStages.isEmpty()
+            || !requiredSupport.equals(
+                activeContinuousTeardownStages.getFirst().support()
+            )) {
+            return false;
+        }
+        BlockState state = MapAreaCache.getCachedBlockState(
+            requiredSupport
+        );
+        return mc.world != null
+            && !state.isAir()
+            && state.isSolidBlock(mc.world, requiredSupport)
+            && MapAreaCache.getCachedBlockState(
+                requiredSupport.up()
+            ).isAir()
+            && MapAreaCache.getCachedBlockState(
+                requiredSupport.up(2)
+            ).isAir();
+    }
+
     private boolean isUTraversalCheckpoint(
         Pair<Vec3d, Pair<String, BlockPos>> checkpoint
     ) {
         String action = checkpoint.getRight().getLeft();
         return action.isEmpty()
-            || action.equals("walkUBlock")
-            || action.equals("removeUBlock")
             || action.equals("verifyUTools")
+            || action.equals("verifyTeardownScaffold")
             || action.equals("uMiningRecoveryExit")
-            || action.equals("uMiningTaskEnd");
+            || action.equals("uMiningTaskEnd")
+            || action.equals("teardownScaffoldTaskEnd");
+    }
+
+    private boolean startTeardownScaffoldRecovery() {
+        if (!circularTraversalForCurrentMap
+            || compactPlan == null
+            || mapCorner == null
+            || mc.player == null
+            || mc.world == null) {
+            return false;
+        }
+
+        int maximumScaffoldBlocks = Math.multiplyExact(
+            teardownScaffoldStacks.get(),
+            64
+        );
+        BlockPos playerSupport = mc.player.isOnGround()
+            ? supportBelowCheckpoint(mc.player.getEntityPos())
+            : null;
+        TeardownScaffoldRecoveryCandidate firstCandidate = null;
+        TeardownScaffoldRecoveryCandidate localCandidate = null;
+        for (CompactCircularNbtPlan.PairRoute route
+            : compactPlan.pairRoutes()) {
+            if (route.outboundX() < workingInterval.getLeft()
+                || route.returnX() > workingInterval.getRight()) {
+                continue;
+            }
+            ArrayList<BlockPos> relativeTargets =
+                circularPairTargets(route);
+            ArrayList<TeardownScaffoldPlan.Cell> cells =
+                new ArrayList<>(relativeTargets.size());
+            HashMap<Integer, Block> ownedBlocks = new HashMap<>();
+            for (int index = 0;
+                 index < relativeTargets.size();
+                 index++) {
+                BlockPos relative = relativeTargets.get(index);
+                BlockPos world = mapCorner.add(relative);
+                BlockState state =
+                    MapAreaCache.getCachedBlockState(world);
+                boolean clearHeadroom =
+                    MapAreaCache.getCachedBlockState(world.up()).isAir()
+                        && MapAreaCache.getCachedBlockState(
+                            world.up(2)
+                        ).isAir();
+                if (!clearHeadroom) {
+                    cells.add(TeardownScaffoldPlan.Cell.BLOCKED);
+                    continue;
+                }
+                if (state.isAir()) {
+                    cells.add(TeardownScaffoldPlan.Cell.AIR);
+                    continue;
+                }
+                Block expected = buildTargets.get(relative);
+                boolean owned = expected != null
+                    && (state.getBlock() == expected
+                        || state.getBlock() == Blocks.COBBLESTONE)
+                    && state.isSolidBlock(mc.world, world);
+                if (!owned) {
+                    cells.add(TeardownScaffoldPlan.Cell.BLOCKED);
+                    continue;
+                }
+                cells.add(TeardownScaffoldPlan.Cell.OWNED);
+                ownedBlocks.put(index, state.getBlock());
+            }
+
+            Optional<TeardownScaffoldPlan.Plan> planned =
+                TeardownScaffoldPlan.create(
+                    cells,
+                    maximumScaffoldBlocks
+                );
+            if (planned.isEmpty()) continue;
+            TeardownScaffoldRecoveryCandidate candidate =
+                new TeardownScaffoldRecoveryCandidate(
+                    route,
+                    relativeTargets,
+                    cells,
+                    ownedBlocks,
+                    planned.orElseThrow()
+                );
+            if (firstCandidate == null) {
+                firstCandidate = candidate;
+            }
+            if (playerSupport != null
+                && teardownScaffoldCandidateContainsSupport(
+                    candidate,
+                    playerSupport
+                )) {
+                localCandidate = candidate;
+                break;
+            }
+        }
+        TeardownScaffoldRecoveryCandidate selected =
+            localCandidate != null ? localCandidate : firstCandidate;
+        if (selected == null) return false;
+        return beginTeardownScaffoldRecovery(
+            selected.route(),
+            selected.relativeTargets(),
+            selected.cells(),
+            selected.ownedBlocks(),
+            selected.plan()
+        );
+    }
+
+    private boolean teardownScaffoldCandidateContainsSupport(
+        TeardownScaffoldRecoveryCandidate candidate,
+        BlockPos support
+    ) {
+        for (int index
+            : candidate.plan().outwardSupportIndices()) {
+            if (mapCorner.add(
+                    candidate.relativeTargets().get(index)
+                ).equals(support)) {
+                return true;
+            }
+        }
+        return mapCorner.add(
+            candidate.relativeTargets().get(
+                candidate.plan().terminalCleanupIndex()
+            )
+        ).equals(support);
+    }
+
+    private boolean beginTeardownScaffoldRecovery(
+        CompactCircularNbtPlan.PairRoute route,
+        List<BlockPos> relativeTargets,
+        List<TeardownScaffoldPlan.Cell> cells,
+        Map<Integer, Block> ownedBlocks,
+        TeardownScaffoldPlan.Plan plan
+    ) {
+        resetTeardownMiningActionState();
+        plannedTeardownHotbarAssignments.clear();
+        checkpoints.clear();
+
+        ArrayList<BlockPos> outwardWorld = new ArrayList<>();
+        LinkedHashSet<BlockPos> scaffoldWorld =
+            new LinkedHashSet<>();
+        LinkedHashMap<BlockPos, Block> breakExpectations =
+            new LinkedHashMap<>();
+        HashMap<BlockPos, BlockState> plannedToolStates =
+            new HashMap<>();
+        for (int index : plan.outwardSupportIndices()) {
+            BlockPos relative = relativeTargets.get(index);
+            BlockPos world = mapCorner.add(relative);
+            outwardWorld.add(world);
+            Block expected;
+            if (cells.get(index) == TeardownScaffoldPlan.Cell.AIR) {
+                expected = Blocks.COBBLESTONE;
+                scaffoldWorld.add(world);
+            } else {
+                expected = ownedBlocks.get(index);
+            }
+            breakExpectations.put(world, expected);
+            plannedToolStates.put(
+                relative,
+                expected.getDefaultState()
+            );
+        }
+        int terminalIndex = plan.terminalCleanupIndex();
+        BlockPos terminalRelative = relativeTargets.get(terminalIndex);
+        BlockPos terminalWorld = mapCorner.add(terminalRelative);
+        Block terminalBlock = ownedBlocks.get(terminalIndex);
+        if (terminalBlock == null) {
+            error(
+                "Sparse teardown scaffold planner lost terminal block "
+                    + terminalWorld.toShortString() + "."
+            );
+            toggle();
+            return true;
+        }
+        breakExpectations.put(terminalWorld, terminalBlock);
+        plannedToolStates.put(
+            terminalRelative,
+            terminalBlock.getDefaultState()
+        );
+
+        int endpointX =
+            plan.endpoint() == TeardownScaffoldPlan.Endpoint.START
+                ? route.outboundX()
+                : route.returnX();
+        BlockPos endpoint = northWalkwaySupport(endpointX);
+        BlockPos firstRouteSupport = mapCorner.add(
+            relativeTargets.get(
+                plan.endpoint()
+                        == TeardownScaffoldPlan.Endpoint.START
+                    ? 0
+                    : relativeTargets.size() - 1
+            )
+        );
+        BlockPos approach =
+            OrderedUTraversalMovement.entryApproachSupport(
+                endpoint,
+                firstRouteSupport
+            );
+        activeTeardownScaffoldRecovery =
+            new ActiveTeardownScaffoldRecovery(
+                route.pairIndex(),
+                plan.endpoint(),
+                approach,
+                endpoint,
+                outwardWorld,
+                terminalWorld,
+                new ArrayList<>(scaffoldWorld),
+                breakExpectations,
+                plannedToolStates
+            );
+        BlockPos playerSupport = mc.player.isOnGround()
+            ? supportBelowCheckpoint(mc.player.getEntityPos())
+            : null;
+        int localOutwardIndex = playerSupport == null
+            ? -1
+            : outwardWorld.indexOf(playerSupport);
+        boolean standingOnTerminal = playerSupport != null
+            && playerSupport.equals(terminalWorld);
+        boolean locallyOnRecoveryPath =
+            localOutwardIndex >= 0 || standingOnTerminal;
+        if (locallyOnRecoveryPath) {
+            HashMap<Item, Integer> missingLocalTools =
+                missingMiningTools(
+                    plannedToolStates.keySet(),
+                    plannedToolStates
+                );
+            if (missingLocalTools == null) {
+                resetTeardownMiningActionState();
+                if (isActive()) toggle();
+                return true;
+            }
+            if (!missingLocalTools.isEmpty()
+                || !hasCompleteTeardownScaffoldReserve()) {
+                teardownScaffoldPhase =
+                    TeardownScaffoldPhase.EGRESS_TO_ENDPOINT;
+                activateTeardownScaffoldEgressStages(
+                    localOutwardIndex,
+                    standingOnTerminal
+                );
+                state = State.MiningUTraversal;
+                info(
+                    "Resumed on a sparse teardown scaffold without its "
+                        + "complete tool/material reserve; walking the "
+                        + "intact scaffold back to the safe north endpoint "
+                        + "before restocking."
+                );
+                debugLog(
+                    "TeardownScaffold",
+                    "activated safe egress pair=" + route.pairIndex()
+                        + " localOutwardIndex=" + localOutwardIndex
+                        + " standingOnTerminal=" + standingOnTerminal
+                        + " missingTools=" + missingLocalTools
+                        + " reserveComplete="
+                            + hasCompleteTeardownScaffoldReserve()
+                );
+                return true;
+            }
+        }
+
+        if (standingOnTerminal) {
+            teardownScaffoldPhase =
+                TeardownScaffoldPhase.CLEANING_RETURN;
+            activateTeardownScaffoldCleanupStages(true);
+        } else {
+            teardownScaffoldPhase =
+                TeardownScaffoldPhase.BUILDING_OUTBOUND;
+            activateTeardownScaffoldOutboundStages(
+                localOutwardIndex
+            );
+        }
+        activeContinuousTeardownArmed = false;
+
+        BlockPos verificationSupport = locallyOnRecoveryPath
+            ? playerSupport
+            : approach;
+        checkpoints.add(new Pair<>(
+            walkingPosition(verificationSupport),
+            new Pair<>(
+                "verifyTeardownScaffold",
+                new BlockPos(route.pairIndex(), 0, 0)
+            )
+        ));
+        checkpoints.add(new Pair<>(
+            walkingPosition(endpoint),
+            new Pair<>(
+                "teardownScaffoldTaskEnd",
+                new BlockPos(route.pairIndex(), 0, 0)
+            )
+        ));
+        if (!ensureMiningToolDurability(
+            plannedToolStates.keySet(),
+            plannedToolStates,
+            "sparse teardown scaffold for pair "
+                + route.pairIndex()
+        )) {
+            resetTeardownMiningActionState();
+            if (isActive()) toggle();
+            return true;
+        }
+        state = State.MiningUTraversal;
+        info(
+            "Sparse teardown recovery found "
+                + plan.ownedCleanupCount()
+                + " server-missed block(s) in pair "
+                + route.pairIndex()
+                + (locallyOnRecoveryPath
+                    ? "; resuming from the current scaffold support"
+                    : "; entering from the closest "
+                        + plan.endpoint().name()
+                            .toLowerCase(Locale.ROOT)
+                        + " endpoint")
+                + " with " + scaffoldWorld.size()
+                + " temporary cobblestone supports."
+        );
+        debugLog(
+            "TeardownScaffold",
+            "planned pair=" + route.pairIndex()
+                + " endpoint=" + plan.endpoint()
+                + " outwardSupports=" + outwardWorld.size()
+                + " scaffoldBlocks=" + scaffoldWorld.size()
+                + " cleanupTargets=" + breakExpectations.size()
+                + " terminal=" + terminalWorld.toShortString()
+        );
+        return true;
+    }
+
+    private void activateTeardownScaffoldOutboundStages(
+        int localOutwardIndex
+    ) {
+        ActiveTeardownScaffoldRecovery recovery =
+            Objects.requireNonNull(
+                activeTeardownScaffoldRecovery,
+                "activeTeardownScaffoldRecovery"
+            );
+        ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
+            new ArrayList<>(recovery.outwardSupports().size() + 2);
+        if (localOutwardIndex < 0) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.entryApproach(),
+                List.of()
+            ));
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.entryEndpoint(),
+                List.of()
+            ));
+        }
+        for (int index = Math.max(0, localOutwardIndex);
+             index < recovery.outwardSupports().size();
+             index++) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.outwardSupports().get(index),
+                List.of()
+            ));
+        }
+        activeContinuousTeardownStages = List.copyOf(stages);
+        activeContinuousTeardownPair = recovery.pairIndex();
+        activeContinuousTeardownStageIndex = 0;
+        activeCircularRouteSupportIndex = -1;
+        activeContinuousTeardownRecoveryExit = false;
+    }
+
+    private void activateTeardownScaffoldEgressStages(
+        int localOutwardIndex,
+        boolean standingOnTerminal
+    ) {
+        ActiveTeardownScaffoldRecovery recovery =
+            Objects.requireNonNull(
+                activeTeardownScaffoldRecovery,
+                "activeTeardownScaffoldRecovery"
+            );
+        if (localOutwardIndex < 0 && !standingOnTerminal) {
+            throw new IllegalArgumentException(
+                "Scaffold egress requires a local route support."
+            );
+        }
+        ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
+            new ArrayList<>(recovery.outwardSupports().size() + 2);
+        if (standingOnTerminal) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.terminalCleanupTarget(),
+                List.of()
+            ));
+            localOutwardIndex =
+                recovery.outwardSupports().size() - 1;
+        }
+        for (int index = localOutwardIndex; index >= 0; index--) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.outwardSupports().get(index),
+                List.of()
+            ));
+        }
+        stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+            recovery.entryEndpoint(),
+            List.of()
+        ));
+        activeContinuousTeardownStages = List.copyOf(stages);
+        activeContinuousTeardownPair = recovery.pairIndex();
+        activeContinuousTeardownStageIndex = 0;
+        activeCircularRouteSupportIndex = 0;
+        activeContinuousTeardownArmed = true;
+        activeContinuousTeardownRecoveryExit = true;
+        checkpoints.add(new Pair<>(
+            walkingPosition(recovery.entryEndpoint()),
+            new Pair<>(
+                "uMiningRecoveryExit",
+                new BlockPos(recovery.pairIndex(), 0, 0)
+            )
+        ));
+    }
+
+    private boolean isConfirmedTeardownScaffoldSupport(
+        BlockPos support
+    ) {
+        ActiveTeardownScaffoldRecovery recovery =
+            activeTeardownScaffoldRecovery;
+        if (recovery == null || mc.world == null) return false;
+        if (support.equals(recovery.entryEndpoint())) {
+            int endpointX =
+                recovery.endpoint()
+                    == TeardownScaffoldPlan.Endpoint.START
+                    ? compactPlan.pairRoutes()
+                        .get(recovery.pairIndex()).outboundX()
+                    : compactPlan.pairRoutes()
+                        .get(recovery.pairIndex()).returnX();
+            return isSafeNorthWalkway(endpointX);
+        }
+        if (support.equals(recovery.entryApproach())) {
+            BlockState state =
+                MapAreaCache.getCachedBlockState(support);
+            return !state.isAir()
+                && state.isSolidBlock(mc.world, support)
+                && MapAreaCache.getCachedBlockState(
+                    support.up()
+                ).isAir()
+                && MapAreaCache.getCachedBlockState(
+                    support.up(2)
+                ).isAir();
+        }
+        Block expected = recovery.breakExpectations().get(support);
+        if (expected == null) return false;
+        BlockState state = MapAreaCache.getCachedBlockState(support);
+        return state.getBlock() == expected
+            && state.isSolidBlock(mc.world, support)
+            && MapAreaCache.getCachedBlockState(support.up()).isAir()
+            && MapAreaCache.getCachedBlockState(support.up(2)).isAir();
+    }
+
+    private Block activeTeardownExpectedBlock(BlockPos target) {
+        if (teardownScaffoldPhase
+                == TeardownScaffoldPhase.CLEANING_RETURN
+            && activeTeardownScaffoldRecovery != null) {
+            return activeTeardownScaffoldRecovery
+                .breakExpectations().get(target);
+        }
+        if (mapCorner == null) return null;
+        return buildTargets.get(target.subtract(mapCorner));
     }
 
     private boolean calculateCircularMiningPath(
@@ -12943,8 +13881,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         ArrayList<BlockPos> targets = circularPairTargets(route);
         checkpoints.clear();
-        activeUTraversalPreviousSupport = null;
-        uTraversalProgressWatchdog.reset();
+        activeContinuousTeardownStages = List.of();
+        activeContinuousTeardownPair = -1;
+        activeContinuousTeardownStageIndex = -1;
+        activeCircularRouteSupportIndex = -1;
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownRecoveryExit = false;
         activeMiningLine = -1;
 
         Optional<CircularMiningLocalSupport> localSupport =
@@ -13013,11 +13955,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 ).add(scheduled);
             }
         }
-        BlockPos previousRelativeTarget;
         String entryDescription;
+        List<BlockPos> entrySupports;
         if (localPlan.isPresent()) {
             CircularMiningLocalSupport local =
                 localSupport.orElseThrow();
+            entrySupports = List.of(local.support());
             checkpoints.add(new Pair<>(
                 walkingPosition(local.support()),
                 new Pair<>(
@@ -13025,8 +13968,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     new BlockPos(route.pairIndex(), 0, 0)
                 )
             ));
-            previousRelativeTarget =
-                targets.get(local.targetIndex());
             entryDescription =
                 "verified local support index "
                     + local.targetIndex();
@@ -13036,60 +13977,60 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     == CircularMiningTraversalPlan.Endpoint.START
                     ? route.outboundX()
                     : route.returnX();
-            addCircularEntry(entryX, route.pairIndex());
-            previousRelativeTarget =
-                northWalkwaySupport(entryX).subtract(mapCorner);
+            BlockPos entryEndpoint = northWalkwaySupport(entryX);
+            BlockPos firstRouteSupport = mapCorner.add(
+                targets.get(traversalSteps.getFirst().standIndex())
+            );
+            BlockPos entryApproach =
+                OrderedUTraversalMovement.entryApproachSupport(
+                    entryEndpoint,
+                    firstRouteSupport
+                );
+            entrySupports = List.of(entryApproach, entryEndpoint);
+            addCircularEntry(entryApproach, route.pairIndex());
             entryDescription =
                 endpointPlan.entry().name()
                     .toLowerCase(Locale.ROOT)
                     + " endpoint";
         }
-        boolean remoteScheduleEnabled = localPlan.isEmpty();
-        for (CircularMiningTraversalPlan.Step step
-            : traversalSteps) {
-            BlockPos standTarget = targets.get(step.standIndex());
-            if (!remoteScheduleEnabled
-                && step.standIndex()
-                    == remoteResumeSupportIndex) {
-                remoteScheduleEnabled = true;
-            }
-            if (remoteScheduleEnabled) {
-                for (ReachOptimizedTeardownPlan.ScheduledTarget<BlockPos>
-                    scheduled : remoteTargetsBySupport.getOrDefault(
-                        step.standIndex(),
-                        new ArrayList<>()
-                    )) {
-                    addWalkTarget(
-                        standTarget,
-                        "removeUBlock",
-                        scheduled.target()
-                    );
-                }
-            }
-            if (step.removesBlock()) {
-                addWalkTarget(
-                    standTarget,
-                    "removeUBlock",
-                    targets.get(step.removeIndex())
-                );
-            } else {
-                addWalkTarget(
-                    standTarget,
-                    "walkUBlock",
-                    previousRelativeTarget
-                );
-            }
-            previousRelativeTarget = standTarget;
-        }
-        addCircularExit(
+        HashMap<Integer, List<BlockPos>> remoteWorldTargetsBySupport =
+            new HashMap<>();
+        remoteTargetsBySupport.forEach(
+            (supportIndex, scheduledTargets) ->
+                remoteWorldTargetsBySupport.put(
+                    supportIndex,
+                    scheduledTargets.stream()
+                        .map(ReachOptimizedTeardownPlan.ScheduledTarget::target)
+                        .map(mapCorner::add)
+                        .toList()
+                )
+        );
+        int exitX =
             exit == CircularMiningTraversalPlan.Endpoint.START
                 ? route.outboundX()
-                : route.returnX(),
-            targets.get(finalRemoveIndex)
-        );
-
-        Pair<Vec3d, Pair<String, BlockPos>> end = checkpoints.getLast();
-        checkpoints.add(new Pair<>(end.getLeft(), new Pair<>("uMiningTaskEnd", null)));
+                : route.returnX();
+        BlockPos exitSupport = northWalkwaySupport(exitX);
+        List<BlockPos> worldTargets = targets.stream()
+            .map(mapCorner::add)
+            .toList();
+        activeContinuousTeardownStages =
+            ContinuousTeardownRoutePlan.create(
+                worldTargets,
+                traversalSteps,
+                remoteWorldTargetsBySupport,
+                remoteResumeSupportIndex,
+                entrySupports,
+                exitSupport,
+                mapCorner.add(targets.get(finalRemoveIndex))
+            ).stages();
+        activeContinuousTeardownPair = route.pairIndex();
+        activeContinuousTeardownStageIndex = 0;
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownRecoveryExit = false;
+        checkpoints.add(new Pair<>(
+            walkingPosition(exitSupport),
+            new Pair<>("uMiningTaskEnd", null)
+        ));
         state = State.MiningUTraversal;
         info(
             "Mining pair " + route.pairIndex() + " with "
@@ -13112,34 +14053,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                             .distinct()
                             .count()
                         + " skippable U routes")
+                + " using entry/exit checkpoints and "
+                + activeContinuousTeardownStages.size()
+                + " internal support stages"
         );
         return true;
     }
 
-    private void addCircularEntry(int x, int pairIndex) {
-        BlockPos walkway = northWalkwaySupport(x);
+    private void addCircularEntry(
+        BlockPos entryApproach,
+        int pairIndex
+    ) {
         checkpoints.add(new Pair<>(
-            walkingPosition(walkway),
+            walkingPosition(entryApproach),
             new Pair<>("verifyUTools", new BlockPos(pairIndex, 0, 0))
-        ));
-    }
-
-    private void addCircularExit(int x, BlockPos finalRelativeTarget) {
-        BlockPos walkway = northWalkwaySupport(x);
-        checkpoints.add(new Pair<>(
-            walkingPosition(walkway),
-            new Pair<>("removeUBlock", mapCorner.add(finalRelativeTarget))
-        ));
-    }
-
-    private void addWalkTarget(BlockPos relative, String action) {
-        addWalkTarget(relative, action, null);
-    }
-
-    private void addWalkTarget(BlockPos relative, String action, BlockPos removeRelative) {
-        checkpoints.add(new Pair<>(
-            walkingPosition(mapCorner.add(relative)),
-            new Pair<>(action, removeRelative == null ? null : mapCorner.add(removeRelative))
         ));
     }
 
@@ -13160,37 +14087,47 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (egressPlan.isEmpty()) return false;
 
         checkpoints.clear();
-        activeUTraversalPreviousSupport = null;
-        uTraversalProgressWatchdog.reset();
+        activeContinuousTeardownStages = List.of();
+        activeContinuousTeardownPair = -1;
+        activeContinuousTeardownStageIndex = -1;
+        activeCircularRouteSupportIndex = -1;
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownRecoveryExit = false;
         activeMiningLine = -1;
         List<Integer> supportIndices =
             egressPlan.orElseThrow().supportIndices();
-        BlockPos previousRelative =
-            targets.get(supportIndices.getFirst());
-        addWalkTarget(
-            previousRelative,
-            "walkUBlock",
-            previousRelative
-        );
-        for (int offset = 1;
-             offset < supportIndices.size();
-             offset++) {
-            BlockPos next =
-                targets.get(supportIndices.get(offset));
-            addWalkTarget(
-                next,
-                "walkUBlock",
-                previousRelative
-            );
-            previousRelative = next;
-        }
-
         int endpointX =
             egressPlan.orElseThrow().exit()
                 == CircularMiningTraversalPlan.Endpoint.START
                 ? route.outboundX()
                 : route.returnX();
         BlockPos walkway = northWalkwaySupport(endpointX);
+        ArrayList<
+            ContinuousTeardownRoutePlan.Stage<BlockPos>
+        > egressStages = new ArrayList<>(
+            supportIndices.size() + 1
+        );
+        for (int supportIndex : supportIndices) {
+            egressStages.add(
+                new ContinuousTeardownRoutePlan.Stage<>(
+                    mapCorner.add(targets.get(supportIndex)),
+                    List.of()
+                )
+            );
+        }
+        egressStages.add(
+            new ContinuousTeardownRoutePlan.Stage<>(
+                walkway,
+                List.of()
+            )
+        );
+        activeContinuousTeardownStages =
+            List.copyOf(egressStages);
+        activeContinuousTeardownPair = route.pairIndex();
+        activeContinuousTeardownStageIndex = 0;
+        activeCircularRouteSupportIndex = 0;
+        activeContinuousTeardownArmed = true;
+        activeContinuousTeardownRecoveryExit = true;
         checkpoints.add(new Pair<>(
             walkingPosition(walkway),
             new Pair<>(
@@ -13210,17 +14147,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + route.pairIndex()
                 + " supportIndex=" + local.targetIndex()
                 + " endpointX=" + endpointX
-                + " checkpoints=" + checkpoints.size()
+                + " structuralCheckpoints="
+                    + checkpoints.size()
+                + " internalStages="
+                    + activeContinuousTeardownStages.size()
         );
         return true;
-    }
-
-    private boolean isUTraversalRouteStep(
-        Pair<Vec3d, Pair<String, BlockPos>> checkpoint
-    ) {
-        String action = checkpoint.getRight().getLeft();
-        return action.equals("walkUBlock")
-            || action.equals("removeUBlock");
     }
 
     private boolean isUTraversalEndpoint(
@@ -13228,140 +14160,352 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ) {
         String action = checkpoint.getRight().getLeft();
         return action.equals("verifyUTools")
+            || action.equals("verifyTeardownScaffold")
             || action.equals("uMiningRecoveryExit")
-            || action.equals("uMiningTaskEnd");
+            || action.equals("uMiningTaskEnd")
+            || action.equals("teardownScaffoldTaskEnd");
     }
 
-    private CircularTraversalSafety.MiningCheckpointProgress uTraversalCheckpointProgress(
-        Pair<Vec3d, Pair<String, BlockPos>> checkpoint,
-        Vec3d goal,
-        boolean nearCheckpointCenter
-    ) {
-        BlockPos previousSupport =
-            activeUTraversalPreviousSupport;
-        boolean crossedCheckpointCenter =
-            previousSupport != null
-                && CircularTraversalSafety.hasCrossedCheckpointCenter(
-                    mc.player.getX(),
-                    mc.player.getZ(),
-                    goal.x,
-                    goal.z,
-                    previousSupport.getX() + 0.5,
-                    previousSupport.getZ() + 0.5
-                );
-        BlockPos standSupport = supportBelowCheckpoint(goal);
-        boolean horizontallyOver =
-            isHorizontallyOverCheckpointSupport(standSupport);
-        boolean orderedStepUp =
-            previousSupport != null
-                && CircularTraversalSafety.isOrderedStepUpTarget(
-                    Math.abs(
-                        standSupport.getX()
-                            - previousSupport.getX()
-                    ) + Math.abs(
-                        standSupport.getZ()
-                            - previousSupport.getZ()
-                    ),
-                    previousSupport.getY(),
-                    standSupport.getY(),
-                    Math.abs(
-                        standSupport.getX()
-                            - mc.player.getBlockX()
-                    ) + Math.abs(
-                        standSupport.getZ()
-                            - mc.player.getBlockZ()
-                    )
-                );
-        boolean stablyStanding =
-            isGroundedOnCheckpointSupport(goal);
-        if (isReachAssignedUCheckpoint(checkpoint)) {
-            if (nearCheckpointCenter && stablyStanding) {
-                return CircularTraversalSafety
-                    .MiningCheckpointProgress.REACHED;
-            }
-            return nearCheckpointCenter && horizontallyOver
-                ? CircularTraversalSafety
-                    .MiningCheckpointProgress.HOLD_FOR_LANDING
-                : CircularTraversalSafety
-                    .MiningCheckpointProgress.APPROACHING;
-        }
-        return CircularTraversalSafety.miningCheckpointProgress(
-            horizontallyOver,
-            stablyStanding,
-            nearCheckpointCenter,
-            crossedCheckpointCenter,
-            orderedStepUp
-        );
-    }
-
-    private boolean isReachAssignedUCheckpoint(
-        Pair<Vec3d, Pair<String, BlockPos>> checkpoint
-    ) {
-        if (checkpoint == null
-            || activeUTraversalPreviousSupport == null
-            || !checkpoint.getRight().getLeft()
-                .equals("removeUBlock")) {
+    /**
+     * Consumes support-entry events from the shared printing route cursor.
+     * This method submits teardown work only; it never sets movement keys,
+     * steering, sprint, jump, velocity, or route progress.
+     */
+    private boolean serviceContinuousTeardownWork() {
+        if (activeContinuousTeardownStageIndex < 0
+            || activeContinuousTeardownStageIndex
+                > activeContinuousTeardownStages.size()
+            || activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex
+                >= activeContinuousTeardownStages.size()) {
+            failTeardownMining(
+                "Continuous U teardown lost its shared route cursor."
+            );
             return false;
         }
-        BlockPos breakTarget =
-            checkpoint.getRight().getRight();
-        return breakTarget != null
-            && !breakTarget.equals(
-                activeUTraversalPreviousSupport
-            );
-    }
 
-    private void handleStalledUTraversal(Vec3d goal) {
-        BlockPos goalSupport = supportBelowCheckpoint(goal);
-        Optional<CircularMiningLocalSupport> localSupport =
-            circularMiningLocalSupport();
-        if (localSupport.isPresent()) {
-            CircularMiningLocalSupport local =
-                localSupport.orElseThrow();
-            warning(
-                "Ordered U traversal made no progress toward "
-                    + goalSupport.toShortString()
-                    + "; rebuilding the remaining teardown route from "
-                    + "verified pair " + local.pairIndex()
-                    + " support " + local.targetIndex() + "."
-            );
-            debugLog(
-                "Recovery",
-                "stalled U route player="
-                    + mc.player.getEntityPos()
-                    + " goal=" + goal
-                    + " previousSupport="
-                        + activeUTraversalPreviousSupport
-                    + " localSupport=" + local.support()
-                    + " queuedCheckpoints=" + checkpoints.size()
-            );
-            restartCurrentMiningAssignment();
-            return;
+        boolean pendingOwnedBreak =
+            miningPos != null
+                && teardownMineController.hasOwnedTarget();
+        if (pendingOwnedBreak) {
+            if (!ownedTeardownMayOverlapMovement()) {
+                stopActiveOrderedUForAction(
+                    CircularBuildMovementPolicy.HoldReason
+                        .OTHER_BUILD_ACTION
+                );
+                return false;
+            }
+            return true;
         }
 
-        error(
-            "Ordered U traversal stopped progressing near "
-                + mc.player.getBlockPos().toShortString()
-                + " and the player is not standing on a verified "
-                + "remaining U support."
+        while (activeContinuousTeardownStageIndex
+            <= activeCircularRouteSupportIndex) {
+            ContinuousTeardownRoutePlan.Stage<BlockPos> stage =
+                activeContinuousTeardownStages.get(
+                    activeContinuousTeardownStageIndex
+                );
+            ArrayList<BlockPos> unresolvedTargets = new ArrayList<>();
+            for (BlockPos target : stage.breakTargets()) {
+                if (!MapAreaCache.getCachedBlockState(target).isAir()) {
+                    unresolvedTargets.add(target);
+                }
+            }
+            if (unresolvedTargets.isEmpty()) {
+                activeContinuousTeardownStageIndex++;
+                continue;
+            }
+
+            BlockPos nextTarget = unresolvedTargets.getFirst();
+            OptionalInt requiredSupport =
+                ContinuousTeardownRoutePlan
+                    .requiredSupportIndexAtOrAfter(
+                        activeContinuousTeardownStages,
+                        activeCircularRouteSupportIndex,
+                        nextTarget
+                    );
+            if (requiredSupport.isPresent()) {
+                if (requiredSupport.getAsInt()
+                    == activeCircularRouteSupportIndex) {
+                    // The work cursor can lag behind the movement cursor while
+                    // an earlier server acknowledgement is pending. Keep
+                    // walking; this target becomes eligible only after it is
+                    // physically behind the player.
+                    return true;
+                }
+                failTeardownMining(
+                    "Teardown work attempted to remove future route support "
+                        + nextTarget.toShortString() + "."
+                );
+                return false;
+            }
+            if (isPlayerStandingOnTeardownTarget(nextTarget)) {
+                // Authoritative underfoot safety is checked again at dispatch
+                // time instead of trusting the earlier planning snapshot.
+                return true;
+            }
+            if (!isBuildPlacementInReach(nextTarget)) {
+                warning(
+                    "Continuous U teardown work fell outside live reach at "
+                        + nextTarget.toShortString()
+                        + "; recovering from the next stable local U support."
+                );
+                beginMiningRecovery(false);
+                return false;
+            }
+
+            TeardownBreakStatus breakStatus =
+                beginContinuousTeardownBreak(
+                    nextTarget
+                );
+            if (breakStatus == TeardownBreakStatus.FAILED) {
+                return false;
+            }
+            if (breakStatus == TeardownBreakStatus.DEFERRED) {
+                return true;
+            }
+            if (breakStatus == TeardownBreakStatus.CLEARED) {
+                continue;
+            }
+            if (ownedTeardownMayOverlapMovement()) {
+                if (unresolvedTargets.size() == 1) {
+                    activeContinuousTeardownStageIndex++;
+                }
+                return true;
+            }
+            stopActiveOrderedUForAction(
+                CircularBuildMovementPolicy.HoldReason
+                    .OTHER_BUILD_ACTION
+            );
+            return false;
+        }
+
+        boolean routeComplete =
+            activeCircularRouteSupportIndex
+                == activeContinuousTeardownStages.size() - 1
+                && activeContinuousTeardownStageIndex
+                    == activeContinuousTeardownStages.size();
+        if (!routeComplete) return true;
+        if (miningPos != null
+            || teardownMineController.hasOwnedTarget()) {
+            stopActiveOrderedUForAction(
+                CircularBuildMovementPolicy.HoldReason
+                    .OTHER_BUILD_ACTION
+            );
+            return false;
+        }
+
+        if (teardownScaffoldPhase
+            == TeardownScaffoldPhase.BUILDING_OUTBOUND) {
+            if (!teardownScaffoldPlacementLedger.isEmpty()) {
+                stopActiveOrderedUForAction(
+                    CircularBuildMovementPolicy.HoldReason
+                        .OTHER_BUILD_ACTION
+                );
+                return false;
+            }
+            beginTeardownScaffoldCleanupReturn();
+            return false;
+        }
+        if (teardownScaffoldPhase
+            == TeardownScaffoldPhase.CLEANING_RETURN) {
+            completeTeardownScaffoldRecovery();
+            return false;
+        }
+
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownPair = -1;
+        activeCircularRouteSupportIndex = -1;
+        stopCircularMiningMotion();
+        if (activeContinuousTeardownRecoveryExit) {
+            activeContinuousTeardownRecoveryExit = false;
+            info(
+                "Reached the safe U endpoint; replanning "
+                    + "teardown and tool restock."
+            );
+            restartCurrentMiningAssignment();
+            return false;
+        }
+        timeoutTicks = mineLineEndTimeout.get();
+        completeCurrentMiningAssignment();
+        return false;
+    }
+
+    private TeardownBreakStatus beginContinuousTeardownBreak(
+        BlockPos target
+    ) {
+        if (isPlayerStandingOnTeardownTarget(target)) {
+            return TeardownBreakStatus.DEFERRED;
+        }
+        if (!isBuildPlacementInReach(target)) {
+            return TeardownBreakStatus.DEFERRED;
+        }
+        miningPos = new BlockPos(target);
+        Block expected = activeTeardownExpectedBlock(miningPos);
+        BlockState targetState =
+            MapAreaCache.getCachedBlockState(miningPos);
+        if (expected == null
+            || (!targetState.isAir()
+                && targetState.getBlock() != expected)) {
+            error(
+                "Continuous U teardown target changed unexpectedly at "
+                    + miningPos.toShortString() + "."
+            );
+            toggle();
+            return TeardownBreakStatus.FAILED;
+        }
+        if (targetState.isAir()) {
+            miningPos = null;
+            return TeardownBreakStatus.CLEARED;
+        }
+
+        state = State.AwaitUBlockBreak;
+        teardownMovementOverlapAllowed = true;
+        TeardownBreakStatus breakStatus =
+            driveOrderedTeardownBreak(miningPos, expected);
+        if (breakStatus == TeardownBreakStatus.CLEARED) {
+            miningPos = null;
+            teardownMovementOverlapAllowed = false;
+            state = State.MiningUTraversal;
+        } else if (breakStatus != TeardownBreakStatus.FAILED
+            && ownedTeardownMayOverlapMovement()) {
+            state = State.MiningUTraversal;
+        } else if (breakStatus != TeardownBreakStatus.FAILED) {
+            teardownMovementOverlapAllowed = false;
+            jumpTimeout = 0;
+            stopCircularMiningMotion();
+        }
+        return breakStatus;
+    }
+
+    private void beginTeardownScaffoldCleanupReturn() {
+        ActiveTeardownScaffoldRecovery recovery =
+            Objects.requireNonNull(
+                activeTeardownScaffoldRecovery,
+                "activeTeardownScaffoldRecovery"
+            );
+        teardownScaffoldPhase =
+            TeardownScaffoldPhase.CLEANING_RETURN;
+        teardownScaffoldPlacementLedger.reset();
+        teardownScaffoldSubmissionBlockSequences.clear();
+        activateTeardownScaffoldCleanupStages(false);
+        activeContinuousTeardownArmed = true;
+        state = State.MiningUTraversal;
+        stopCircularMiningMotion();
+        info(
+            "Reached the sparse teardown target; returning to the "
+                + "safe walkway while THM-clearing the missed blocks "
+                + "and every temporary scaffold support."
         );
         debugLog(
-            "Recovery",
-            "unrecoverable stalled U route player="
-                + mc.player.getEntityPos()
-                + " goal=" + goal
-                + " previousSupport="
-                    + activeUTraversalPreviousSupport
-                + " queuedCheckpoints=" + checkpoints.size()
+            "TeardownScaffold",
+            "activated cleanup return pair=" + recovery.pairIndex()
+                + " stages="
+                    + activeContinuousTeardownStages.size()
+                + " targets="
+                    + recovery.breakExpectations().size()
         );
+    }
+
+    private void activateTeardownScaffoldCleanupStages(
+        boolean includeTerminalEntry
+    ) {
+        ActiveTeardownScaffoldRecovery recovery =
+            Objects.requireNonNull(
+                activeTeardownScaffoldRecovery,
+                "activeTeardownScaffoldRecovery"
+            );
+        ArrayList<BlockPos> outward = new ArrayList<>(
+            recovery.outwardSupports()
+        );
+        ArrayList<ContinuousTeardownRoutePlan.Stage<BlockPos>> stages =
+            new ArrayList<>(
+                outward.size() + (includeTerminalEntry ? 2 : 1)
+            );
+        if (includeTerminalEntry) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.terminalCleanupTarget(),
+                List.of()
+            ));
+        }
+        if (outward.isEmpty()) {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.entryEndpoint(),
+                List.of(recovery.terminalCleanupTarget())
+            ));
+        } else {
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                outward.getLast(),
+                List.of(recovery.terminalCleanupTarget())
+            ));
+            for (int index = outward.size() - 2;
+                 index >= 0;
+                 index--) {
+                stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                    outward.get(index),
+                    List.of(outward.get(index + 1))
+                ));
+            }
+            stages.add(new ContinuousTeardownRoutePlan.Stage<>(
+                recovery.entryEndpoint(),
+                List.of(outward.getFirst())
+            ));
+        }
+        activeContinuousTeardownStages = List.copyOf(stages);
+        activeContinuousTeardownPair = recovery.pairIndex();
+        activeContinuousTeardownStageIndex = 0;
+        activeCircularRouteSupportIndex = 0;
+        activeContinuousTeardownRecoveryExit = false;
+    }
+
+    private void completeTeardownScaffoldRecovery() {
+        ActiveTeardownScaffoldRecovery recovery =
+            activeTeardownScaffoldRecovery;
+        if (recovery == null) {
+            failTeardownMining(
+                "Sparse teardown cleanup lost its active plan."
+            );
+            return;
+        }
+        for (BlockPos target : recovery.breakExpectations().keySet()) {
+            if (!MapAreaCache.getCachedBlockState(target).isAir()) {
+                failTeardownMining(
+                    "Sparse teardown cleanup finished with a remaining "
+                        + "owned block at " + target.toShortString() + "."
+                );
+                return;
+            }
+        }
+        int pairIndex = recovery.pairIndex();
+        int cleaned = recovery.breakExpectations().size();
+        activeContinuousTeardownArmed = false;
         stopCircularMiningMotion();
-        toggle();
+        resetTeardownMiningActionState();
+        checkpoints.clear();
+        info(
+            "Sparse teardown scaffold recovery cleared " + cleaned
+                + " blocks from pair " + pairIndex
+                + " and removed its complete temporary path."
+        );
+        finishMiningIfComplete();
     }
 
     private boolean isHorizontallyOverCheckpointSupport(Vec3d goal) {
         return isHorizontallyOverCheckpointSupport(
             supportBelowCheckpoint(goal)
         );
+    }
+
+    private boolean isPlayerStandingOnTeardownTarget(
+        BlockPos target
+    ) {
+        if (mc.player == null || !mc.player.isOnGround()) {
+            return false;
+        }
+        BlockPos support = supportBelowCheckpoint(
+            mc.player.getEntityPos()
+        );
+        return target.equals(support)
+            && isPlayerStandingOnSupport(support);
     }
 
     private boolean isHorizontallyOverCheckpointSupport(BlockPos support) {
@@ -13374,41 +14518,90 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && isPlayerStandingOnSupport(supportBelowCheckpoint(goal));
     }
 
-    private boolean isUTraversalTurnaround(
-        Vec3d reachedGoal,
-        BlockPos previousSupport
-    ) {
-        if (previousSupport == null || checkpoints.isEmpty()) return false;
-        Vec3d nextGoal = checkpoints.getFirst().getLeft();
-        return CircularTraversalSafety.isRouteReversal(
-            previousSupport.getX() + 0.5,
-            previousSupport.getZ() + 0.5,
-            reachedGoal.x,
-            reachedGoal.z,
-            nextGoal.x,
-            nextGoal.z
-        );
-    }
-
     private void stopCircularMiningMotion() {
         stopMovement();
         mc.player.setVelocity(0, mc.player.getVelocity().y, 0);
     }
 
     private boolean ownedTeardownMayOverlapMovement() {
-        if (!teardownMovementOverlapAllowed
-            || teardownMineController == null
+        if (teardownMineController == null
             || workActionBudget == null
-            || workActionBudget.paused()
-            || miningPos == null
-            || !isBuildPlacementInReach(miningPos)) {
+            || miningPos == null) {
             return false;
         }
         return teardownMineController.snapshot()
             .map(snapshot ->
-                snapshot.classification()
-                    .allowsBatchDispatch())
+                TeardownMovementOverlapPolicy.mayContinue(
+                    teardownMovementOverlapAllowed,
+                    workActionBudget.paused(),
+                    isBuildPlacementInReach(miningPos),
+                    activeTeardownRouteAdvanceRetainsReach(
+                        miningPos
+                    ),
+                    snapshot.classification(),
+                    activeTeardownSpeedMineAllowsMovement(
+                        snapshot.target().expectedBlock()
+                    )
+                ))
             .orElse(false);
+    }
+
+    private boolean activeTeardownRouteAdvanceRetainsReach(
+        BlockPos target
+    ) {
+        if (mc.player == null
+            || activeContinuousTeardownStages.isEmpty()
+            || activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex
+                >= activeContinuousTeardownStages.size()) {
+            return false;
+        }
+        int nextSupportIndex = activeCircularRouteSupportIndex + 1;
+        if (nextSupportIndex
+            >= activeContinuousTeardownStages.size()) {
+            return true;
+        }
+
+        BlockPos nextSupport = activeContinuousTeardownStages.get(
+            nextSupportIndex
+        ).support();
+        double standingEyeHeight =
+            mc.player.getEyePos().y - mc.player.getY();
+        return BlockReachWindow.find(
+            new BlockReachWindow.Cell(
+                target.getX(),
+                target.getY(),
+                target.getZ()
+            ),
+            List.of(
+                new BlockReachWindow.Cell(
+                    nextSupport.getX(),
+                    nextSupport.getY(),
+                    nextSupport.getZ()
+                )
+            ),
+            standingEyeHeight,
+            Math.max(
+                0.1,
+                effectiveBuildInteractionRange()
+                    - TEARDOWN_REACH_POSITION_TOLERANCE
+            )
+        ).isPresent();
+    }
+
+    private boolean activeTeardownSpeedMineAllowsMovement(
+        Block expectedBlock
+    ) {
+        if (!thmInstantTeardown.get()
+            || speedMineOwner != SpeedMineOwner.TEARDOWN
+            || ownedSpeedMineSnapshot == null) {
+            return false;
+        }
+        SpeedMine speedMine = Modules.get().get(SpeedMine.class);
+        return speedMine != null
+            && speedMine.isActive()
+            && speedMine.instamine()
+            && speedMine.filter(expectedBlock);
     }
 
     private TeardownBreakStatus driveOrderedTeardownBreak(
@@ -13773,12 +14966,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             teardownMineController.reset();
         }
         teardownMovementOverlapAllowed = false;
-        activeUTraversalPreviousSupport = null;
-        uTraversalProgressWatchdog.reset();
+        activeContinuousTeardownStages = List.of();
+        activeContinuousTeardownPair = -1;
+        activeContinuousTeardownStageIndex = -1;
+        activeCircularRouteSupportIndex = -1;
+        activeContinuousTeardownArmed = false;
+        activeContinuousTeardownRecoveryExit = false;
+        clearTeardownScaffoldRecoveryState();
         teardownMineFirstDispatchTick = -1L;
         teardownMineLastDispatchTick = -1L;
         lastMiningPauseReason =
             TpsScaledActionBudget.PauseReason.NONE;
+    }
+
+    private void clearTeardownScaffoldRecoveryState() {
+        teardownScaffoldPhase = TeardownScaffoldPhase.NONE;
+        activeTeardownScaffoldRecovery = null;
+        activeTeardownScaffoldHotbarSlot = -1;
+        if (teardownScaffoldPlacementLedger != null) {
+            teardownScaffoldPlacementLedger.reset();
+        }
+        if (teardownScaffoldSubmissionBlockSequences != null) {
+            teardownScaffoldSubmissionBlockSequences.clear();
+        }
     }
 
     private HotbarPreparation prepareTeardownHotbarLoadout() {
@@ -13891,6 +15101,109 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + plannedTeardownHotbarAssignments
         );
         return HotbarPreparation.READY;
+    }
+
+    private HotbarPreparation prepareTeardownScaffoldHotbar() {
+        int slot = ensureTeardownScaffoldHotbarSlot();
+        if (slot >= 0) return HotbarPreparation.READY;
+        if (slot == HOTBAR_SLOT_PENDING) {
+            return HotbarPreparation.WAITING;
+        }
+        return HotbarPreparation.FAILED;
+    }
+
+    private int ensureTeardownScaffoldHotbarSlot() {
+        if (mc.player == null) return HOTBAR_ITEM_UNAVAILABLE;
+        Set<Integer> toolSlots =
+            plannedTeardownHotbarAssignments.keySet();
+        if (activeTeardownScaffoldHotbarSlot >= 0
+            && !toolSlots.contains(activeTeardownScaffoldHotbarSlot)) {
+            ItemStack active = mc.player.getInventory().getStack(
+                activeTeardownScaffoldHotbarSlot
+            );
+            if (!active.isEmpty()
+                && active.getItem() == Items.COBBLESTONE) {
+                return InvUtils.swap(
+                    activeTeardownScaffoldHotbarSlot,
+                    false
+                )
+                    ? activeTeardownScaffoldHotbarSlot
+                    : HOTBAR_ITEM_UNAVAILABLE;
+            }
+        }
+        for (int slot : availableHotBarSlots) {
+            if (toolSlots.contains(slot)) continue;
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty()
+                && stack.getItem() == Items.COBBLESTONE) {
+                activeTeardownScaffoldHotbarSlot = slot;
+                return InvUtils.swap(slot, false)
+                    ? slot
+                    : HOTBAR_ITEM_UNAVAILABLE;
+            }
+        }
+        if (confirmedMiningHotbarSwap.isPending()) {
+            return HOTBAR_SLOT_PENDING;
+        }
+
+        int sourceSlot = findBestMainInventorySlot(
+            Items.COBBLESTONE,
+            -1
+        );
+        if (sourceSlot < 0) {
+            error(
+                "The teardown scaffold reserve contains no available "
+                    + "cobblestone stack."
+            );
+            stopMovement();
+            toggle();
+            return HOTBAR_ITEM_UNAVAILABLE;
+        }
+        int targetSlot = availableHotBarSlots.stream()
+            .filter(slot -> !toolSlots.contains(slot))
+            .min(Comparator
+                .comparingInt((Integer slot) ->
+                    mc.player.getInventory().getStack(slot).isEmpty()
+                        ? 0
+                        : 1)
+                .thenComparingInt(Integer::intValue))
+            .orElse(-1);
+        if (targetSlot < 0) {
+            error(
+                "The teardown hotbar has no non-tool slot for its "
+                    + "cobblestone scaffold."
+            );
+            stopMovement();
+            toggle();
+            return HOTBAR_ITEM_UNAVAILABLE;
+        }
+
+        ItemStack source = mc.player.getInventory().getStack(sourceSlot);
+        MiningToolIdentity expected = miningToolIdentity(source);
+        confirmedMiningHotbarSwap.begin(
+            targetSlot,
+            expected,
+            serverHotbarSwapAckSequences[targetSlot],
+            clientActionTick
+        );
+        miningHotbarSwapContext = MiningHotbarSwapContext.TEARDOWN;
+        if (!dispatchConfirmedInventorySwap(
+            sourceSlot,
+            targetSlot,
+            "teardown-scaffold cobblestone",
+            false
+        )) {
+            failMiningHotbarSwap(expected);
+            return HOTBAR_ITEM_UNAVAILABLE;
+        }
+        activeTeardownScaffoldHotbarSlot = targetSlot;
+        debugLog(
+            "HotbarPlan",
+            "submitted silent scaffold preload sourceSlot="
+                + sourceSlot + " targetHotbarSlot=" + targetSlot
+        );
+        stopMovement();
+        return HOTBAR_SLOT_PENDING;
     }
 
     private boolean isUsableTeardownLoadoutTool(
@@ -14442,11 +15755,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private HashMap<Item, Integer> missingMiningTools(
         Collection<BlockPos> relativeTargets
     ) {
+        return missingMiningTools(relativeTargets, Map.of());
+    }
+
+    private HashMap<Item, Integer> missingMiningTools(
+        Collection<BlockPos> relativeTargets,
+        Map<BlockPos, BlockState> plannedTargetStates
+    ) {
         MiningToolInventoryPlan<
             Item,
             ItemStack,
             MiningToolRequirement
-        > plan = createMiningToolInventoryPlan(relativeTargets);
+        > plan = createMiningToolInventoryPlan(
+            relativeTargets,
+            plannedTargetStates
+        );
         if (plan == null) return null;
 
         HashMap<Item, Integer> missingTools = new HashMap<>();
@@ -14465,6 +15788,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     > createMiningToolInventoryPlan(
         Collection<BlockPos> relativeTargets
     ) {
+        return createMiningToolInventoryPlan(
+            relativeTargets,
+            Map.of()
+        );
+    }
+
+    private MiningToolInventoryPlan<
+        Item,
+        ItemStack,
+        MiningToolRequirement
+    > createMiningToolInventoryPlan(
+        Collection<BlockPos> relativeTargets,
+        Map<BlockPos, BlockState> plannedTargetStates
+    ) {
+        Objects.requireNonNull(
+            plannedTargetStates,
+            "plannedTargetStates"
+        );
         HashMap<Item, Integer> rawUses = new HashMap<>();
         HashMap<Item, Integer> maximumDamage = new HashMap<>();
         HashMap<Item, ArrayList<MiningToolRequirement>>
@@ -14473,7 +15814,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             teardownMinimumToolCounts();
         if (minimumHotbarCounts == null) return null;
         for (BlockPos relative : relativeTargets) {
-            BlockState state = MapAreaCache.getCachedBlockState(mapCorner.add(relative));
+            BlockState state = plannedTargetStates.getOrDefault(
+                relative,
+                MapAreaCache.getCachedBlockState(
+                    mapCorner.add(relative)
+                )
+            );
             if (state.isAir()) continue;
             ItemStack bestTool = getBestRegisteredTool(state);
             if (bestTool == null || bestTool.getMaxDamage() <= 1) {
@@ -14603,6 +15949,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private TeardownScaffoldMaterialPlan.Plan
+        teardownScaffoldMaterialPlan() {
+        ArrayList<Integer> stackCounts = new ArrayList<>();
+        for (int slot : availableSlots) {
+            if (slot < 0 || slot >= 36) continue;
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (!stack.isEmpty()
+                && stack.getItem() == Items.COBBLESTONE) {
+                stackCounts.add(stack.getCount());
+            }
+        }
+        return TeardownScaffoldMaterialPlan.create(
+            teardownScaffoldStacks.get(),
+            64,
+            stackCounts
+        );
+    }
+
+    private boolean hasCompleteTeardownScaffoldReserve() {
+        return teardownScaffoldMaterialPlan().missingAmount() == 0;
+    }
+
     private LinkedHashMap<Item, Integer>
         teardownMinimumToolCounts() {
         ItemStack pickaxe =
@@ -14701,6 +16069,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Collection<BlockPos> targets,
         String traversalName
     ) {
+        return ensureMiningToolDurability(
+            targets,
+            Map.of(),
+            traversalName
+        );
+    }
+
+    private boolean ensureMiningToolDurability(
+        Collection<BlockPos> targets,
+        Map<BlockPos, BlockState> plannedTargetStates,
+        String traversalName
+    ) {
         abandonRestockSession(true);
         debugRestock(
             "mining-tool restock planning traversal=" + traversalName
@@ -14708,8 +16088,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
         strictMiningRestockActive = false;
         strictMiningInventoryPlan =
-            createMiningToolInventoryPlan(targets);
+            createMiningToolInventoryPlan(
+                targets,
+                plannedTargetStates
+            );
         if (strictMiningInventoryPlan == null) return false;
+
+        TeardownScaffoldMaterialPlan.Plan scaffoldReserve =
+            teardownScaffoldMaterialPlan();
 
         int freeSlots = 0;
         for (int slot : availableSlots) {
@@ -14721,10 +16107,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 .values()
                 .stream()
                 .mapToInt(RestockDemand::remainingAmount)
-                .sum();
+                .sum()
+                + scaffoldReserve.additionalSlotsRequired();
         debugRestock(
             "mining-tool capacity freeSlots=" + freeSlots
                 + " requiredFreshToolSlots=" + requiredSlots
+                + " scaffoldReserve="
+                    + scaffoldReserve.onHandAmount() + "/"
+                    + scaffoldReserve.targetAmount()
+                + " scaffoldNewSlots="
+                    + scaffoldReserve.additionalSlotsRequired()
                 + " demandTypes="
                     + strictMiningInventoryPlan.restockDemands().size()
         );
@@ -14761,6 +16153,38 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + " target="
                         + demand.targetCompatiblePlayerCount()
                     + " remaining=" + demand.remainingAmount()
+                    + " registeredChests=" + chests.size()
+            );
+        }
+        if (scaffoldReserve.missingAmount() > 0) {
+            ArrayList<Pair<BlockPos, Vec3d>> chests =
+                materialDict.get(Items.COBBLESTONE);
+            if (chests == null || chests.isEmpty()) {
+                error(
+                    "No registered cobblestone chest can supply the "
+                        + teardownScaffoldStacks.get()
+                        + "-stack teardown scaffold reserve."
+                );
+                return false;
+            }
+            RestockDemand<Item> scaffoldDemand =
+                RestockDemand.fromOnHandAndMissing(
+                    Items.COBBLESTONE,
+                    scaffoldReserve.onHandAmount(),
+                    scaffoldReserve.missingAmount()
+                );
+            restockList.add(scaffoldDemand);
+            info(
+                "Preloading Â§a"
+                    + scaffoldDemand.remainingStacks(64)
+                    + " cobblestone stacks for sparse teardown "
+                    + "scaffold recovery"
+            );
+            debugRestock(
+                "planned teardown scaffold reserve onHand="
+                    + scaffoldReserve.onHandAmount()
+                    + " target=" + scaffoldReserve.targetAmount()
+                    + " missing=" + scaffoldReserve.missingAmount()
                     + " registeredChests=" + chests.size()
             );
         }
@@ -14807,6 +16231,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         clearCircularBuildInventoryPlan();
         placementAttempts = 0L;
         confirmedPlacements = 0L;
+        teardownScaffoldPlacementAttempts = 0L;
+        confirmedTeardownScaffoldPlacements = 0L;
         repairBreakAttempts = 0L;
         confirmedRepairBreaks = 0L;
         teardownBreakAttempts = 0L;
@@ -14830,10 +16256,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
         return isMined;
-    }
-
-    private boolean isMiningLineComplete(int line) {
-        return reportedMinedLines.contains(line) || isLineMined(line);
     }
 
     private void startBuilding() {
@@ -16055,13 +17477,23 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private BlockPos circularBuildAlignmentSupport(
         CompactCircularNbtPlan.PairRoute route
     ) {
-        return northWalkwaySupport(route.outboundX()).north();
+        BlockPos endpoint = northWalkwaySupport(route.outboundX());
+        BlockPos firstRouteSupport = mapCorner.add(
+            surfaceRuntimePosition(route.outboundX(), 1)
+        );
+        return OrderedUTraversalMovement.entryApproachSupport(
+            endpoint,
+            firstRouteSupport
+        );
     }
 
     private boolean isSafeCircularBuildAlignment(
         CompactCircularNbtPlan.PairRoute route
     ) {
-        if (mc.world == null) return false;
+        if (mc.world == null
+            || !isSafeNorthWalkway(route.outboundX())) {
+            return false;
+        }
         BlockPos alignment = circularBuildAlignmentSupport(route);
         BlockState state =
             MapAreaCache.getCachedBlockState(alignment);
@@ -16567,7 +17999,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (preferred != null) return preferred;
 
         for (int line = 0; line < map.length; line++) {
-            if (reservedMiningLines.contains(line) || isMiningLineComplete(line)) continue;
+            if (reservedMiningLines.contains(line)
+                || isLineMined(line)) {
+                continue;
+            }
 
             CompactCircularNbtPlan.PairRoute route = compactPlan.pairRoutes().get(line / 2);
             if (circularTraversalForCurrentMap
@@ -16582,11 +18017,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (!circularTraversalForCurrentMap || !pairAvailable) {
                 return new MiningAssignment(line, false, Set.of(line));
             }
+            CircularMiningRecoveryPlan.Result recovery =
+                analyzeCircularMiningRoute(route);
+            if (recovery.mode()
+                == CircularMiningRecoveryPlan.Mode.FALLBACK) {
+                // Disconnected sparse leftovers cannot safely use the old
+                // independent-line walker. The master clears them only after
+                // normal continuous U work through scaffold recovery.
+                continue;
+            }
             CircularMiningAssignmentPolicy.Kind policy =
                 CircularMiningAssignmentPolicy.decide(
                     true,
                     true,
-                    analyzeCircularMiningRoute(route).mode()
+                    recovery.mode()
                 );
             if (policy == CircularMiningAssignmentPolicy.Kind.CIRCULAR_PAIR) {
                 return new MiningAssignment(
@@ -16915,8 +18359,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         // Re-read every U after the authoritative final break. A remotely
-        // cleared route disappears from assignment; an interrupted remote
-        // prefix becomes an opposite-end recovery route.
+        // cleared route disappears from assignment. A continuous remainder
+        // left by interrupted remote work stays attached to its protected
+        // endpoint and remains eligible for another proven safe-order remote
+        // schedule; an unassignable remainder uses that same safe endpoint.
         refreshCircularMiningTraversalOptimization();
         if (!startNextMasterMiningAssignment()) {
             if (SlaveSystem.allSlavesFinished()) {
@@ -16947,8 +18393,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void finishMiningIfComplete() {
         for (int line = 0; line < map.length; line++) {
-            if (!isMiningLineComplete(line)) {
+            // Final clearance never trusts the earlier assignment report: a
+            // late authoritative server update may reveal a missed block.
+            if (!isLineMined(line)) {
                 if (!startNextMasterMiningAssignment()) {
+                    if (startTeardownScaffoldRecovery()) {
+                        return;
+                    }
                     error("No safe mining assignment could be generated for line " + line + ".");
                     toggle();
                 }
@@ -16957,8 +18408,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         for (BlockPos relative : connectorTargets) {
-            if (reportedClearedConnectorPairs.contains(relative.getX() / 2)) continue;
             if (!MapAreaCache.getCachedBlockState(mapCorner.add(relative)).isAir()) {
+                if (startTeardownScaffoldRecovery()) {
+                    return;
+                }
                 error(
                     "Map columns are mined, but a disconnected connector remains at "
                         + mapCorner.add(relative).toShortString() + "."
@@ -20218,6 +21671,108 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         RECOVERY_EXIT
     }
 
+    private enum OrderedUTraversalOwner {
+        PRINTING,
+        TEARDOWN,
+        TEARDOWN_SCAFFOLD
+    }
+
+    private enum TeardownScaffoldPhase {
+        NONE,
+        BUILDING_OUTBOUND,
+        CLEANING_RETURN,
+        EGRESS_TO_ENDPOINT
+    }
+
+    private record TeardownScaffoldRecoveryCandidate(
+        CompactCircularNbtPlan.PairRoute route,
+        List<BlockPos> relativeTargets,
+        List<TeardownScaffoldPlan.Cell> cells,
+        Map<Integer, Block> ownedBlocks,
+        TeardownScaffoldPlan.Plan plan
+    ) {
+        private TeardownScaffoldRecoveryCandidate {
+            Objects.requireNonNull(route, "route");
+            relativeTargets = List.copyOf(relativeTargets);
+            cells = List.copyOf(cells);
+            ownedBlocks = Map.copyOf(ownedBlocks);
+            Objects.requireNonNull(plan, "plan");
+        }
+    }
+
+    private record ActiveTeardownScaffoldRecovery(
+        int pairIndex,
+        TeardownScaffoldPlan.Endpoint endpoint,
+        BlockPos entryApproach,
+        BlockPos entryEndpoint,
+        List<BlockPos> outwardSupports,
+        BlockPos terminalCleanupTarget,
+        List<BlockPos> scaffoldTargets,
+        Map<BlockPos, Block> breakExpectations,
+        Map<BlockPos, BlockState> plannedToolStates
+    ) {
+        private ActiveTeardownScaffoldRecovery {
+            if (pairIndex < 0) {
+                throw new IllegalArgumentException(
+                    "Scaffold recovery pair cannot be negative."
+                );
+            }
+            Objects.requireNonNull(endpoint, "endpoint");
+            entryApproach = new BlockPos(
+                Objects.requireNonNull(
+                    entryApproach,
+                    "entryApproach"
+                )
+            );
+            entryEndpoint = new BlockPos(
+                Objects.requireNonNull(
+                    entryEndpoint,
+                    "entryEndpoint"
+                )
+            );
+            outwardSupports = List.copyOf(outwardSupports);
+            terminalCleanupTarget = new BlockPos(
+                Objects.requireNonNull(
+                    terminalCleanupTarget,
+                    "terminalCleanupTarget"
+                )
+            );
+            scaffoldTargets = List.copyOf(scaffoldTargets);
+            breakExpectations = Collections.unmodifiableMap(
+                new LinkedHashMap<>(breakExpectations)
+            );
+            plannedToolStates = Collections.unmodifiableMap(
+                new HashMap<>(plannedToolStates)
+            );
+            if (!breakExpectations.containsKey(
+                terminalCleanupTarget
+            )) {
+                throw new IllegalArgumentException(
+                    "Scaffold terminal cleanup target is not owned."
+                );
+            }
+        }
+    }
+
+    private record ActiveOrderedUTraversal(
+        OrderedUTraversalOwner owner,
+        CompactCircularNbtPlan.PairRoute route,
+        List<BlockPos> supports
+    ) {
+        private ActiveOrderedUTraversal {
+            Objects.requireNonNull(owner, "owner");
+            Objects.requireNonNull(route, "route");
+            supports = List.copyOf(
+                Objects.requireNonNull(supports, "supports")
+            );
+            if (supports.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "An active ordered U traversal requires supports."
+                );
+            }
+        }
+    }
+
     private enum InventoryLogisticsRecovery {
         NONE,
         MAP_HANDOFF,
@@ -20290,6 +21845,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private enum TeardownBreakStatus {
         CLEARED,
+        DEFERRED,
         WAITING,
         FAILED
     }

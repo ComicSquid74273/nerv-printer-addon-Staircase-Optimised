@@ -2,6 +2,7 @@ package com.julflips.nerv_printer.utils;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -9,6 +10,75 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BlockReachWindowTest {
+    @Test
+    void adjacentFlatUCanRemoveItsNeighborFromEndToStartMonotonically() {
+        List<BlockReachWindow.Cell> hostSupports = List.of(
+            new BlockReachWindow.Cell(0, 64, 0),
+            new BlockReachWindow.Cell(0, 64, 1),
+            new BlockReachWindow.Cell(0, 64, 2),
+            new BlockReachWindow.Cell(0, 64, 3),
+            new BlockReachWindow.Cell(1, 64, 3),
+            new BlockReachWindow.Cell(1, 64, 2),
+            new BlockReachWindow.Cell(1, 64, 1),
+            new BlockReachWindow.Cell(1, 64, 0)
+        );
+        List<BlockReachWindow.Cell> neighborEndToStart = List.of(
+            new BlockReachWindow.Cell(3, 64, 0),
+            new BlockReachWindow.Cell(3, 64, 1),
+            new BlockReachWindow.Cell(3, 64, 2),
+            new BlockReachWindow.Cell(3, 64, 3),
+            new BlockReachWindow.Cell(2, 64, 3),
+            new BlockReachWindow.Cell(2, 64, 2),
+            new BlockReachWindow.Cell(2, 64, 1),
+            new BlockReachWindow.Cell(2, 64, 0)
+        );
+
+        int previousSupport = 0;
+        ArrayList<Integer> schedule = new ArrayList<>();
+        for (BlockReachWindow.Cell target : neighborEndToStart) {
+            int minimum = previousSupport;
+            int support = BlockReachWindow.find(
+                target,
+                hostSupports,
+                1.62,
+                4.8
+            ).orElseThrow().reachableSupportIndices().stream()
+                .filter(index -> index >= minimum)
+                .findFirst()
+                .orElseThrow();
+            schedule.add(support);
+            previousSupport = support;
+        }
+
+        assertEquals(8, schedule.size());
+        for (int index = 1; index < schedule.size(); index++) {
+            assertTrue(schedule.get(index) >= schedule.get(index - 1));
+        }
+    }
+
+    @Test
+    void risingRouteSupportCanCloseAFormerlyValidTrailingWindow() {
+        BlockReachWindow.Cell target =
+            new BlockReachWindow.Cell(0, 102, 0);
+
+        assertTrue(
+            BlockReachWindow.find(
+                target,
+                List.of(new BlockReachWindow.Cell(0, 102, 4)),
+                1.62,
+                4.8
+            ).isPresent()
+        );
+        assertTrue(
+            BlockReachWindow.find(
+                target,
+                List.of(new BlockReachWindow.Cell(0, 104, 4)),
+                1.62,
+                4.8
+            ).isEmpty()
+        );
+    }
+
     @Test
     void fiveBlockReachMarginStillCoversASecondFollowingPair() {
         assertTrue(

@@ -38,6 +38,22 @@ class RepairMiningClassificationTest {
     }
 
     @Test
+    void acceleratedProgressCanOverlapRouteMovementWithoutAllowingAnotherTarget() {
+        RepairMiningClassification vanilla =
+            RepairMiningClassification.VANILLA_BATCH_INSTANT;
+        RepairMiningClassification accelerated =
+            RepairMiningClassification.SPEED_MINE_ACCELERATED_PROGRESSIVE;
+        RepairMiningClassification slow =
+            RepairMiningClassification.SLOW_PROGRESSIVE;
+
+        assertTrue(vanilla.allowsOwnedRouteMovementOverlap());
+        assertTrue(accelerated.allowsOwnedRouteMovementOverlap());
+        assertFalse(accelerated.allowsBatchDispatch());
+        assertTrue(accelerated.requiresProgressiveContinuation());
+        assertFalse(slow.allowsOwnedRouteMovementOverlap());
+    }
+
+    @Test
     void speedMineThresholdIsStrictAndRequiresAnAdmittedLease() {
         assertEquals(
             RepairMiningClassification.SLOW_PROGRESSIVE,

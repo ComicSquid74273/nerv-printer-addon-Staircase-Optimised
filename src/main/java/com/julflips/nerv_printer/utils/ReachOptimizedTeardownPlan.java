@@ -10,14 +10,14 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Selects circular U routes to traverse and assigns fully reachable routes to
- * them for remote teardown.
+ * Selects circular U routes to traverse and assigns fully reachable route
+ * remainders to them for remote teardown.
  *
- * <p>An assigned route is accepted only when the caller supplies one
- * nondecreasing destination-support index for every target in the source
- * route's endpoint-to-endpoint order. Consequently an interrupted remote
- * teardown has removed only a prefix and leaves one continuous suffix attached
- * to the opposite endpoint.</p>
+ * <p>An assigned route is accepted only when the caller supplies its targets
+ * in an endpoint-preserving removal order and one nondecreasing destination
+ * support index for every target. Consequently an interrupted remote teardown
+ * has removed only a prefix of that safe order and leaves one continuous
+ * remainder attached to the endpoint selected by the caller.</p>
  */
 public final class ReachOptimizedTeardownPlan {
     private ReachOptimizedTeardownPlan() {
@@ -107,8 +107,9 @@ public final class ReachOptimizedTeardownPlan {
     @FunctionalInterface
     public interface ScheduleFinder<K> {
         /**
-         * Returns one destination-support index per ordered source target.
-         * Indices must be nondecreasing.
+         * Returns one destination-support index per source target in the
+         * caller's endpoint-preserving removal order. Indices must be
+         * nondecreasing.
          */
         Optional<List<Integer>> find(
             List<K> orderedSourceTargets,

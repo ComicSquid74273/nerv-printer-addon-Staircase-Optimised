@@ -86,26 +86,26 @@ class CircularBuildSupportPathTest {
             "exit"
         );
 
-        CircularBuildSupportPath.MovementDecision<String> fromAlignment =
-            CircularBuildSupportPath.decideMovement(
+        OrderedUTraversalMovement.MovementDecision<String> fromAlignment =
+            OrderedUTraversalMovement.decideMovement(
                 path,
                 "alignment",
                 confirmed::contains
             );
         assertEquals(
-            CircularBuildSupportPath.MovementStatus.READY,
+            OrderedUTraversalMovement.MovementStatus.READY,
             fromAlignment.status()
         );
         assertEquals("walkway", fromAlignment.requiredSupport());
 
-        CircularBuildSupportPath.MovementDecision<String> fromFirst =
-            CircularBuildSupportPath.decideMovement(
+        OrderedUTraversalMovement.MovementDecision<String> fromFirst =
+            OrderedUTraversalMovement.decideMovement(
                 path,
                 "first",
                 confirmed::contains
             );
         assertEquals(
-            CircularBuildSupportPath.MovementStatus
+            OrderedUTraversalMovement.MovementStatus
                 .WAITING_FOR_NEXT_SUPPORT,
             fromFirst.status()
         );
@@ -118,24 +118,24 @@ class CircularBuildSupportPathTest {
             List.of("alignment", "walkway", "target", "exit");
 
         assertEquals(
-            CircularBuildSupportPath.MovementStatus.COMPLETE,
-            CircularBuildSupportPath.decideMovement(
+            OrderedUTraversalMovement.MovementStatus.COMPLETE,
+            OrderedUTraversalMovement.decideMovement(
                 path,
                 "exit",
                 ignored -> false
             ).status()
         );
         assertEquals(
-            CircularBuildSupportPath.MovementStatus.OFF_PATH,
-            CircularBuildSupportPath.decideMovement(
+            OrderedUTraversalMovement.MovementStatus.OFF_PATH,
+            OrderedUTraversalMovement.decideMovement(
                 path,
                 "unknown",
                 ignored -> true
             ).status()
         );
         assertEquals(
-            CircularBuildSupportPath.MovementStatus.OFF_PATH,
-            CircularBuildSupportPath.decideMovement(
+            OrderedUTraversalMovement.MovementStatus.OFF_PATH,
+            OrderedUTraversalMovement.decideMovement(
                 path,
                 -1,
                 ignored -> true
