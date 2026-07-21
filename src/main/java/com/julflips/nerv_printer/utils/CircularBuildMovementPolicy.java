@@ -18,14 +18,12 @@ public final class CircularBuildMovementPolicy {
         NONE,
         ACTIVE_U_REPAIR,
         HOTBAR_SWAP_CONFIRMATION,
-        DEFERRED_U_PLACEMENT_CONFIRMATION,
         NEXT_ROUTE_SUPPORT_CONFIRMATION,
         OTHER_BUILD_ACTION
     }
 
     public enum ReachDeadlineAction {
         CONTINUE,
-        HOLD_FOR_PLACEMENT,
         BACKTRACK_ON_ROUTE
     }
 
@@ -48,36 +46,11 @@ public final class CircularBuildMovementPolicy {
     }
 
     /**
-     * Returns whether an unconfirmed deferred target has reached the last
-     * support from which the route can still guarantee its placement.
-     *
-     * <p>A pending placement by itself must never stop walking. The route can
-     * continue through every earlier reachable support and waits only on entry
-     * to the final conservative reach cell. This leaves one support of margin
-     * for the server acknowledgement without consuming movement or an active
-     * auto-jump while the target is still safely reachable far ahead.</p>
-     */
-    public static boolean requiresDeferredPlacementHold(
-        int currentSupportIndex,
-        int lastReachSupportIndex
-    ) {
-        if (lastReachSupportIndex < 0) {
-            throw new IllegalArgumentException(
-                "The last reachable support index cannot be negative."
-            );
-        }
-        int deadlineEntryIndex = Math.max(
-            0,
-            lastReachSupportIndex - 1
-        );
-        return currentSupportIndex >= deadlineEntryIndex;
-    }
-
-    /**
      * Selects bounded route behavior for one still-missing frozen neighbor.
-     * A stale live-range sample cannot let forward movement consume a proven
-     * deadline. If lag has already moved beyond it, only the same ordered
-     * support path may be reversed.
+     * Missing placement work never owns a stationary movement hold. While the
+     * target remains live-reachable, normal movement and placement continue in
+     * parallel. At the final guaranteed support, a target that is still not
+     * live-reachable starts a recovery sweep over the same verified route.
      */
     public static ReachDeadlineAction reachDeadlineAction(
         int currentSupportIndex,
@@ -90,19 +63,46 @@ public final class CircularBuildMovementPolicy {
                 "The last guaranteed support index cannot be negative."
             );
         }
-        if (alreadyBacktracking
-            && currentSupportIndex > lastGuaranteedSupportIndex) {
+        if (alreadyBacktracking) {
             return ReachDeadlineAction.CONTINUE;
         }
-        if (currentSupportIndex > lastGuaranteedSupportIndex
+        if (currentSupportIndex >= lastGuaranteedSupportIndex
             && !currentlyReachable) {
             return ReachDeadlineAction.BACKTRACK_ON_ROUTE;
         }
-        return requiresDeferredPlacementHold(
-            currentSupportIndex,
-            lastGuaranteedSupportIndex
-        )
-            ? ReachDeadlineAction.HOLD_FOR_PLACEMENT
-            : ReachDeadlineAction.CONTINUE;
+        return ReachDeadlineAction.CONTINUE;
+    }
+
+    /**
+     * Reverses a recovery sweep only at its route-derived boundaries. Keeping
+     * the direction as explicit state prevents a one-support backtrack from
+     * changing direction again as soon as the cursor enters the next cell.
+     */
+    public static int reachSweepDirection(
+        int currentSupportIndex,
+        int firstSweepSupportIndex,
+        int lastSweepSupportIndex,
+        int currentDirection
+    ) {
+        if (firstSweepSupportIndex < 0
+            || lastSweepSupportIndex < firstSweepSupportIndex) {
+            throw new IllegalArgumentException(
+                "The reach-sweep boundaries are invalid."
+            );
+        }
+        if (currentDirection != -1 && currentDirection != 1) {
+            throw new IllegalArgumentException(
+                "The reach-sweep direction must be -1 or 1."
+            );
+        }
+        if (currentDirection < 0
+            && currentSupportIndex <= firstSweepSupportIndex) {
+            return 1;
+        }
+        if (currentDirection > 0
+            && currentSupportIndex >= lastSweepSupportIndex) {
+            return -1;
+        }
+        return currentDirection;
     }
 }

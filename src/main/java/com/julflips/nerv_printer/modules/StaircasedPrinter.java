@@ -147,6 +147,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         0.10;
     private static final int BUILD_MATERIAL_HOTBAR_SLOT_COUNT = 8;
     private static final int BUILD_REQUIRED_MANAGED_HOTBAR_SLOTS = 9;
+    private static final int CIRCULAR_BUILD_REJOIN_REPLAY_SUPPORTS = 3;
     private static final int TEARDOWN_PICKAXE_HOTBAR_COUNT = 2;
     private static final int TEARDOWN_AXE_HOTBAR_COUNT = 1;
     private static final int HOTBAR_SLOT_PENDING = -1;
@@ -943,6 +944,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     BlockPos buildMovementRequiredSupportThisTick;
     int activeCircularRouteSupportIndex;
     int circularBuildPlacementBacktrackSupportIndex;
+    int circularBuildPlacementBacktrackLastSupportIndex;
+    int circularBuildPlacementBacktrackDirection;
     BlockPos circularBuildPlacementBacktrackTarget;
     String lastActiveBuildMovementDebugState;
     SpeedMineSettingsSnapshot ownedSpeedMineSnapshot;
@@ -999,6 +1002,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int activeCircularBuildPair;
     int activeCircularConnectorIndex;
     int circularBuildRecoveryDirection;
+    int circularBuildRejoinSupportIndex;
+    CircularBuildPhase circularBuildRejoinResumePhase;
+    BlockPos circularBuildRejectedRejoinStart;
+    long circularBuildRejectedRejoinBlockSequence;
     CircularBuildPhase circularBuildPhase;
     List<BlockPos> activeCircularConnectorSteps;
     List<BlockPos> activeCircularRecoveryTargets;
@@ -1239,6 +1246,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildMovementRequiredSupportThisTick = null;
         activeCircularRouteSupportIndex = -1;
         circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackLastSupportIndex = -1;
+        circularBuildPlacementBacktrackDirection = 1;
         circularBuildPlacementBacktrackTarget = null;
         lastActiveBuildMovementDebugState = null;
         ownedSpeedMineSnapshot = null;
@@ -1296,6 +1305,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularBuildPair = -1;
         activeCircularConnectorIndex = -1;
         circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
+        circularBuildRejectedRejoinStart = null;
+        circularBuildRejectedRejoinBlockSequence = -1L;
         circularBuildPhase = CircularBuildPhase.NONE;
         activeCircularConnectorSteps = List.of();
         activeCircularRecoveryTargets = List.of();
@@ -5530,6 +5543,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         // Main Loop for Building & Mining
 
         if (state == State.Walking
+            && circularBuildPhase == CircularBuildPhase.REJOIN) {
+            tickCircularBuildRouteRejoin();
+            return;
+        }
+        if (state == State.Walking
             && circularBuildPhase == CircularBuildPhase.CONNECTOR) {
             if (!updateCircularConnectorTraversal()) return;
         }
@@ -5903,6 +5921,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         currentCheckpointAction.equals("finishPair"),
                         activeOrderedRouteComplete
                     );
+        boolean connectorHandoffReachesCheckpoint =
+            activeCircularBuildMovement
+                && CircularBuildCheckpointPlan
+                    .connectorHandoffReachesCheckpoint(
+                        currentCheckpointAction.equals(
+                            "uBuildConnectorEnd"
+                        ),
+                        circularBuildPhase
+                            == CircularBuildPhase.RETURN
+                    );
         boolean connectorHandoffCheckpoint =
             activeCircularBuildPair >= 0
                 && (currentCheckpointAction.equals("uBuildOutboundEnd")
@@ -5949,6 +5977,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     && isGroundedOnCheckpointSupport(checkpointGoal);
         } else if (printingEndpointProgress
             == OrderedUTraversalMovement.EndpointProgress.REACHED) {
+            reachedCheckpoint = true;
+        } else if (connectorHandoffReachesCheckpoint) {
             reachedCheckpoint = true;
         } else {
             reachedCheckpoint =
@@ -6031,6 +6061,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     activeCircularConnectorIndex = -1;
                     activeCircularPlacementCursor = -1;
                     circularBuildRecoveryDirection = 0;
+                    circularBuildRejoinSupportIndex = -1;
+                    circularBuildRejoinResumePhase =
+                        CircularBuildPhase.NONE;
                     circularBuildPhase = CircularBuildPhase.NONE;
                     releaseBuildRepairSpeedMine();
                     buildRepairController.reset();
@@ -6236,7 +6269,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         activeCircularConnectorIndex = 0;
                         activeCircularPlacementCursor = 0;
                         activeCircularRouteSupportIndex = 0;
+                        circularBuildRecoveryDirection = 0;
+                        circularBuildRejoinSupportIndex = -1;
+                        circularBuildRejoinResumePhase =
+                            CircularBuildPhase.NONE;
                         circularBuildPlacementBacktrackSupportIndex = -1;
+                        circularBuildPlacementBacktrackLastSupportIndex = -1;
+                        circularBuildPlacementBacktrackDirection = 1;
                         circularBuildPlacementBacktrackTarget = null;
                         releaseBuildRepairSpeedMine();
                         buildRepairController.reset();
@@ -6366,6 +6405,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     activeCircularConnectorIndex = -1;
                     activeCircularPlacementCursor = -1;
                     circularBuildRecoveryDirection = 0;
+                    circularBuildRejoinSupportIndex = -1;
+                    circularBuildRejoinResumePhase =
+                        CircularBuildPhase.NONE;
                     circularBuildPhase = CircularBuildPhase.NONE;
                     releaseBuildRepairSpeedMine();
                     buildRepairController.reset();
@@ -6737,6 +6779,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         } else if (circularBuildPhase == CircularBuildPhase.CONNECTOR
             || circularBuildPhase == CircularBuildPhase.RECOVERY
             || circularBuildPhase == CircularBuildPhase.RECOVERY_EXIT
+            || circularBuildPhase == CircularBuildPhase.REJOIN
             || nextAction.equals("logisticsDetour")) {
             mc.player.setSprinting(false);
         } else if ((nextAction.isEmpty()
@@ -8542,20 +8585,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 CircularBuildMovementPolicy.HoldReason
                     .NEXT_ROUTE_SUPPORT_CONFIRMATION
             );
-            warning(
-                "Active ordered U traversal could not reconcile its "
-                    + "horizontal route "
-                    + "near " + mc.player.getBlockPos().toShortString()
-                    + " from cursor="
-                    + activeCircularRouteSupportIndex
-                    + " support=" + cursorSupport.toShortString()
-                    + "; rebuilding from the authoritative support "
-                    + "under the player."
-            );
             if (traversal.owner()
                 == OrderedUTraversalOwner.PRINTING) {
-                beginBuildRecovery(false);
+                warning(
+                    "Active circular printing left its ordered route near "
+                        + mc.player.getBlockPos().toShortString()
+                        + " from cursor="
+                        + activeCircularRouteSupportIndex
+                        + " support=" + cursorSupport.toShortString()
+                        + "; automatically rejoining through confirmed "
+                        + "grounded supports."
+                );
+                beginCircularBuildRouteRejoin();
             } else {
+                warning(
+                    "Active ordered U traversal could not reconcile its "
+                        + "horizontal route near "
+                        + mc.player.getBlockPos().toShortString()
+                        + " from cursor="
+                        + activeCircularRouteSupportIndex
+                        + " support=" + cursorSupport.toShortString()
+                        + "; rebuilding from the authoritative support "
+                        + "under the player."
+                );
                 beginMiningRecovery(false);
             }
             return false;
@@ -8643,11 +8695,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private int activeCircularBuildMovementDirection() {
-        return circularBuildPlacementBacktrackSupportIndex >= 0
-            && activeCircularRouteSupportIndex
-                > circularBuildPlacementBacktrackSupportIndex
-            ? -1
-            : 1;
+        return circularBuildPlacementBacktrackTarget == null
+            ? 1
+            : circularBuildPlacementBacktrackDirection;
     }
 
     private boolean isConfirmedActiveOrderedUSupport(
@@ -9602,34 +9652,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ) {
         ArrayList<PrioritizedPlacementPlanner.Target<BlockPos, Item>>
             targets = new ArrayList<>();
-        if (!activeRelativeTargets.isEmpty()) {
-            for (BlockPos relative : activeRelativeTargets) {
-                Block expected = buildTargets.get(relative);
-                if (expected == null) continue;
-                BlockPos world = mapCorner.add(relative);
-                if (latestKnownBuildBlock(world) == Blocks.AIR) {
-                    targets.add(
-                        new PrioritizedPlacementPlanner.Target<>(
-                            world,
-                            expected.asItem()
-                        )
-                    );
-                }
-            }
+        LinkedHashSet<BlockPos> orderedRelativeTargets =
+            new LinkedHashSet<>();
+        if (circularBuildPlacementBacktrackTarget != null) {
+            orderedRelativeTargets.add(
+                circularBuildPlacementBacktrackTarget
+            );
         }
-        if (!deferredMandatoryTargets.isEmpty()) {
-            for (BlockPos relative : deferredMandatoryTargets) {
-                Block expected = buildTargets.get(relative);
-                if (expected == null) continue;
-                BlockPos world = mapCorner.add(relative);
-                if (latestKnownBuildBlock(world) == Blocks.AIR) {
-                    targets.add(
-                        new PrioritizedPlacementPlanner.Target<>(
-                            world,
-                            expected.asItem()
-                        )
-                    );
-                }
+        orderedRelativeTargets.addAll(activeRelativeTargets);
+        orderedRelativeTargets.addAll(deferredMandatoryTargets);
+        for (BlockPos relative : orderedRelativeTargets) {
+            Block expected = buildTargets.get(relative);
+            if (expected == null) continue;
+            BlockPos world = mapCorner.add(relative);
+            if (latestKnownBuildBlock(world) == Blocks.AIR) {
+                targets.add(
+                    new PrioritizedPlacementPlanner.Target<>(
+                        world,
+                        expected.asItem()
+                    )
+                );
             }
         }
         if (!activeRelativeTargets.isEmpty()
@@ -9736,8 +9778,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (deadlineAction
                 == CircularBuildMovementPolicy.ReachDeadlineAction
                     .BACKTRACK_ON_ROUTE) {
+                int supportCount = activeCircularBuildSupportPath(
+                    activeRoute
+                ).size();
                 circularBuildPlacementBacktrackSupportIndex =
-                    window.lastSupportIndex();
+                    Math.max(0, window.firstSupportIndex() - 1);
+                circularBuildPlacementBacktrackLastSupportIndex =
+                    Math.min(
+                        supportCount - 1,
+                        window.lastSupportIndex() + 1
+                    );
+                circularBuildPlacementBacktrackDirection = -1;
                 circularBuildPlacementBacktrackTarget =
                     new BlockPos(relative);
                 debugLog(
@@ -9747,39 +9798,56 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         + " target=" + world.toShortString()
                         + " currentSupport="
                             + activeCircularRouteSupportIndex
-                        + " backtrackSupport="
+                        + " sweepSupports="
                             + circularBuildPlacementBacktrackSupportIndex
+                        + ".."
+                            + circularBuildPlacementBacktrackLastSupportIndex
                 );
                 return false;
             }
-            if (deadlineAction
-                == CircularBuildMovementPolicy.ReachDeadlineAction
-                    .HOLD_FOR_PLACEMENT) {
-                stopBuildForAction(
-                    CircularBuildMovementPolicy.HoldReason
-                        .DEFERRED_U_PLACEMENT_CONFIRMATION
-                );
+            if (activeBacktrack) {
+                int previousDirection =
+                    circularBuildPlacementBacktrackDirection;
+                circularBuildPlacementBacktrackDirection =
+                    CircularBuildMovementPolicy.reachSweepDirection(
+                        activeCircularRouteSupportIndex,
+                        circularBuildPlacementBacktrackSupportIndex,
+                        circularBuildPlacementBacktrackLastSupportIndex,
+                        circularBuildPlacementBacktrackDirection
+                    );
+                if (circularBuildPlacementBacktrackDirection
+                    != previousDirection) {
+                    debugLog(
+                        "TraversalPlan",
+                        "reversed neighboring-target recovery sweep pair="
+                            + activeRoute.pairIndex()
+                            + " target=" + world.toShortString()
+                            + " supportCursor="
+                                + activeCircularRouteSupportIndex
+                            + " direction="
+                                + circularBuildPlacementBacktrackDirection
+                    );
+                }
                 debugLog(
                     "TraversalPlan",
-                    "holding pair=" + activeRoute.pairIndex()
-                        + " for neighboringTarget="
+                    "recovering pair=" + activeRoute.pairIndex()
+                        + " neighboringTarget="
                             + world.toShortString()
                         + " tier="
                             + (mandatory ? "MANDATORY" : "OPTIONAL")
                         + " pending=" + pending
+                        + " liveReach=" + inReach
                         + " supportCursor="
                             + activeCircularRouteSupportIndex
-                        + " lastReachSupport="
-                            + window.lastSupportIndex()
-                        + " deadlineEntry="
-                            + Math.max(
-                                0,
-                                window.lastSupportIndex() - 1
-                            )
+                        + " sweep="
+                            + circularBuildPlacementBacktrackSupportIndex
+                        + ".."
+                            + circularBuildPlacementBacktrackLastSupportIndex
+                        + " direction="
+                            + circularBuildPlacementBacktrackDirection
                 );
-                return true;
+                return false;
             }
-            if (activeBacktrack) return false;
         }
         return false;
     }
@@ -9801,6 +9869,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + activeCircularRouteSupportIndex
         );
         circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackLastSupportIndex = -1;
+        circularBuildPlacementBacktrackDirection = 1;
         circularBuildPlacementBacktrackTarget = null;
     }
 
@@ -11271,8 +11341,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularConnectorIndex = -1;
         activeCircularPlacementCursor = -1;
         circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackLastSupportIndex = -1;
+        circularBuildPlacementBacktrackDirection = 1;
         circularBuildPlacementBacktrackTarget = null;
         circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
         circularBuildPhase = CircularBuildPhase.NONE;
         releaseBuildRepairSpeedMine();
         buildRepairController.reset();
@@ -11967,6 +12041,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         Vec3d goal = walkingPosition(world);
+        boolean finalConnectorStep =
+            activeCircularConnectorIndex == connectorSteps.size() - 1;
+        boolean enteredConnectorCell =
+            isHorizontallyOverCheckpointSupport(world)
+                && CircularTraversalSafety
+                    .isConnectorStepHeightReachable(
+                        mc.player.getY(),
+                        goal.y
+                    );
+        if (finalConnectorStep && enteredConnectorCell) {
+            activeCircularConnectorIndex++;
+            activeCircularConnectorSteps = List.of();
+            circularBuildPhase = CircularBuildPhase.RETURN;
+            debugLog(
+                "Movement",
+                "entered final connector support pair="
+                    + activeCircularBuildPair
+                    + " support=" + world.toShortString()
+                    + "; handing steering directly to the return leg"
+            );
+            return true;
+        }
+
         double horizontalDistance = PlayerUtils.distanceTo(
             goal.add(0, mc.player.getY() - goal.y, 0)
         );
@@ -12102,6 +12199,353 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && connectorSupports.contains(
                 traversal.supports().get(nextIndex)
             );
+    }
+
+    private void beginCircularBuildRouteRejoin() {
+        if (circularBuildPhase == CircularBuildPhase.REJOIN) return;
+        circularBuildRejoinResumePhase = circularBuildPhase;
+        circularBuildRecoveryDirection =
+            activeCircularBuildMovementDirection();
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejectedRejoinStart = null;
+        circularBuildRejectedRejoinBlockSequence = -1L;
+        activeCircularRecoveryTargets = List.of();
+        activeCircularConnectorSteps = List.of();
+        activeCircularConnectorIndex = 0;
+        circularBuildPhase = CircularBuildPhase.REJOIN;
+        freezeForRecoveryClassification();
+    }
+
+    /**
+     * Re-enters the retained U cursor through a shortest path of confirmed
+     * NBT supports. The printer stays active and preserves its pair inventory
+     * plan; only horizontal correction movement owns this phase.
+     */
+    private void tickCircularBuildRouteRejoin() {
+        if (activeCircularBuildPair < 0
+            || activeCircularBuildPair
+                >= compactPlan.pairRoutes().size()
+            || circularBuildRejoinResumePhase
+                == CircularBuildPhase.NONE) {
+            error("Circular build route rejoin lost its retained pair.");
+            toggle();
+            return;
+        }
+
+        CompactCircularNbtPlan.PairRoute route =
+            compactPlan.pairRoutes().get(activeCircularBuildPair);
+        if (activeCircularRecoveryTargets.isEmpty()) {
+            stopMovement();
+            if (!mc.player.isOnGround()) return;
+            if (!planCircularBuildRouteRejoin(route)) {
+                debugLog(
+                    "Recovery",
+                    "waiting for a confirmed grounded path back to pair="
+                        + activeCircularBuildPair
+                        + " from="
+                        + supportBelowCheckpoint(
+                            mc.player.getEntityPos()
+                        ).toShortString()
+                );
+            }
+            return;
+        }
+
+        OptionalInt resolvedIndex =
+            CircularBuildRecoveryCursor.resolveHorizontalSupport(
+                activeCircularRecoveryTargets,
+                activeCircularConnectorIndex,
+                mc.player.getX(),
+                mc.player.getZ()
+            );
+        if (resolvedIndex.isEmpty()) {
+            debugLog(
+                "Recovery",
+                "server position left the local rejoin path; replanning "
+                    + "pair=" + activeCircularBuildPair
+                    + " near="
+                        + mc.player.getBlockPos().toShortString()
+            );
+            activeCircularRecoveryTargets = List.of();
+            activeCircularConnectorIndex = 0;
+            freezeForRecoveryClassification();
+            return;
+        }
+
+        activeCircularConnectorIndex = resolvedIndex.getAsInt();
+        BlockPos currentSupport = activeCircularRecoveryTargets.get(
+            activeCircularConnectorIndex
+        );
+        if (!isWalkableCircularBuildRejoinSupport(currentSupport)) {
+            activeCircularRecoveryTargets = List.of();
+            activeCircularConnectorIndex = 0;
+            freezeForRecoveryClassification();
+            return;
+        }
+
+        if (activeCircularConnectorIndex
+            == activeCircularRecoveryTargets.size() - 1) {
+            List<BlockPos> orderedSupports =
+                activeCircularBuildSupportPath(route);
+            if (!mc.player.isOnGround()
+                || !isPlayerStandingOnSupport(currentSupport)
+                || circularBuildRejoinSupportIndex < 0
+                || circularBuildRejoinSupportIndex
+                    >= orderedSupports.size()
+                || !orderedSupports.get(
+                    circularBuildRejoinSupportIndex
+                ).equals(currentSupport)
+                || !isConfirmedCircularBuildSupport(
+                    route,
+                    currentSupport
+                )) {
+                stopMovement();
+                return;
+            }
+            completeCircularBuildRouteRejoin(route);
+            return;
+        }
+
+        BlockPos nextSupport = activeCircularRecoveryTargets.get(
+            activeCircularConnectorIndex + 1
+        );
+        if (!isWalkableCircularBuildRejoinSupport(nextSupport)) {
+            activeCircularRecoveryTargets = List.of();
+            activeCircularConnectorIndex = 0;
+            freezeForRecoveryClassification();
+            return;
+        }
+        moveAlongCircularSupport(walkingPosition(nextSupport));
+    }
+
+    private boolean planCircularBuildRouteRejoin(
+        CompactCircularNbtPlan.PairRoute route
+    ) {
+        if (mc.player == null
+            || mc.world == null
+            || mapCorner == null
+            || workingInterval == null) {
+            return false;
+        }
+        BlockPos startWorld = supportBelowCheckpoint(
+            mc.player.getEntityPos()
+        );
+        if (!isPlayerStandingOnSupport(startWorld)
+            || !isWalkableCircularBuildRejoinSupport(startWorld)) {
+            return false;
+        }
+        if (startWorld.equals(circularBuildRejectedRejoinStart)
+            && serverBlockUpdateSequence
+                == circularBuildRejectedRejoinBlockSequence) {
+            return false;
+        }
+
+        List<BlockPos> orderedSupports =
+            activeCircularBuildSupportPath(route);
+        int firstTargetSupportIndex = 2;
+        int outboundEndSupportIndex =
+            firstTargetSupportIndex
+                + CompactCircularNbtPlan.VISIBLE_ROWS - 1;
+        int returnStartSupportIndex =
+            firstTargetSupportIndex
+                + CompactCircularNbtPlan.VISIBLE_ROWS
+                + route.relativeInterior().size();
+        int lastTargetSupportIndex = orderedSupports.size() - 3;
+        int firstEligibleSupportIndex;
+        int lastEligibleSupportIndex;
+        switch (circularBuildRejoinResumePhase) {
+            case OUTBOUND -> {
+                firstEligibleSupportIndex = firstTargetSupportIndex;
+                lastEligibleSupportIndex = outboundEndSupportIndex;
+            }
+            case CONNECTOR -> {
+                firstEligibleSupportIndex = outboundEndSupportIndex;
+                lastEligibleSupportIndex = returnStartSupportIndex;
+            }
+            case RETURN -> {
+                firstEligibleSupportIndex = returnStartSupportIndex;
+                lastEligibleSupportIndex = lastTargetSupportIndex;
+            }
+            default -> {
+                return false;
+            }
+        }
+        if (lastEligibleSupportIndex < firstEligibleSupportIndex) {
+            return false;
+        }
+        int retainedSupportIndex = Math.max(
+            firstEligibleSupportIndex,
+            Math.min(
+                lastEligibleSupportIndex,
+                activeCircularRouteSupportIndex
+            )
+        );
+        List<GroundedSupportPathPlanner.Cell> routeCells =
+            orderedSupports.stream()
+                .map(support -> support.subtract(mapCorner))
+                .map(this::groundedSupportCell)
+                .toList();
+        BlockPos startRelative = startWorld.subtract(mapCorner);
+        GroundedSupportPathPlanner.Cell start =
+            groundedSupportCell(startRelative);
+        CircularBuildRouteRejoinPlan.Domain recoveryDomain =
+            CircularBuildRouteRejoinPlan.routeDomain(
+                start,
+                routeCells.subList(
+                    firstEligibleSupportIndex,
+                    lastEligibleSupportIndex + 1
+                )
+            );
+        int nodeCap = Math.max(
+            64,
+            Math.min(16_384, buildTargets.size())
+        );
+
+        Optional<CircularBuildRouteRejoinPlan.Plan> planned =
+            CircularBuildRouteRejoinPlan.find(
+                start,
+                routeCells,
+                retainedSupportIndex,
+                firstEligibleSupportIndex,
+                lastEligibleSupportIndex,
+                circularBuildRecoveryDirection,
+                CIRCULAR_BUILD_REJOIN_REPLAY_SUPPORTS,
+                candidate ->
+                    recoveryDomain.contains(candidate)
+                        && candidate.y() >= minimumRelativeSupportY
+                        && candidate.y() <= maximumRelativeSupportY,
+                candidate ->
+                    isWalkableCircularBuildRejoinSupport(
+                        mapCorner.add(
+                            candidate.x(),
+                            candidate.y(),
+                            candidate.z()
+                        )
+                    ),
+                nodeCap
+            );
+        if (planned.isEmpty()) {
+            circularBuildRejectedRejoinStart =
+                new BlockPos(startWorld);
+            circularBuildRejectedRejoinBlockSequence =
+                serverBlockUpdateSequence;
+            return false;
+        }
+
+        CircularBuildRouteRejoinPlan.Plan plan =
+            planned.orElseThrow();
+        circularBuildRejectedRejoinStart = null;
+        circularBuildRejectedRejoinBlockSequence = -1L;
+        circularBuildRejoinSupportIndex =
+            plan.routeSupportIndex();
+        activeCircularRecoveryTargets = plan.path().stream()
+            .map(cell -> mapCorner.add(
+                cell.x(),
+                cell.y(),
+                cell.z()
+            ))
+            .toList();
+        activeCircularConnectorIndex = 0;
+        debugLog(
+            "Recovery",
+            "planned automatic circular route rejoin pair="
+                + route.pairIndex()
+                + " from=" + startWorld.toShortString()
+                + " to="
+                    + orderedSupports.get(
+                        circularBuildRejoinSupportIndex
+                    ).toShortString()
+                + " retainedCursor="
+                    + activeCircularRouteSupportIndex
+                + " destinationCursor="
+                    + circularBuildRejoinSupportIndex
+                + " replayedSupports="
+                    + Math.abs(
+                        retainedSupportIndex
+                            - circularBuildRejoinSupportIndex
+                    )
+                + " supports="
+                    + activeCircularRecoveryTargets.size()
+        );
+        return true;
+    }
+
+    private GroundedSupportPathPlanner.Cell groundedSupportCell(
+        BlockPos position
+    ) {
+        return new GroundedSupportPathPlanner.Cell(
+            position.getX(),
+            position.getY(),
+            position.getZ()
+        );
+    }
+
+    private boolean isWalkableCircularBuildRejoinSupport(
+        BlockPos world
+    ) {
+        if (mc.world == null || mapCorner == null) return false;
+        BlockPos relative = world.subtract(mapCorner);
+        Block expected = buildTargets.get(relative);
+        BlockState state = MapAreaCache.getCachedBlockState(world);
+        return expected != null
+            && state.getBlock() == expected
+            && state.isSolidBlock(mc.world, world)
+            && MapAreaCache.getCachedBlockState(world.up()).isAir()
+            && MapAreaCache.getCachedBlockState(world.up(2)).isAir();
+    }
+
+    private void completeCircularBuildRouteRejoin(
+        CompactCircularNbtPlan.PairRoute route
+    ) {
+        int supportIndex = circularBuildRejoinSupportIndex;
+        int targetIndex = supportIndex - 2;
+        CircularBuildPhase retainedPhase =
+            circularBuildRejoinResumePhase;
+        CircularBuildPhase targetPhase =
+            circularBuildPhaseForTargetIndex(route, targetIndex);
+
+        activeCircularRouteSupportIndex = supportIndex;
+        activeCircularPlacementCursor = targetIndex;
+        if (retainedPhase == CircularBuildPhase.CONNECTOR
+            && targetPhase != CircularBuildPhase.RETURN) {
+            CircularBuildCheckpointPlan.Plan<BlockPos> connectorPlan =
+                circularBuildCheckpointPlan(route);
+            activeCircularConnectorSteps =
+                connectorPlan.connectorTraversalSteps();
+            int connectorStart = CompactCircularNbtPlan.VISIBLE_ROWS;
+            activeCircularConnectorIndex = Math.max(
+                0,
+                targetIndex - connectorStart
+            );
+            circularBuildPhase = CircularBuildPhase.CONNECTOR;
+        } else {
+            activeCircularConnectorSteps = List.of();
+            activeCircularConnectorIndex = -1;
+            circularBuildPhase = retainedPhase == CircularBuildPhase.CONNECTOR
+                ? CircularBuildPhase.RETURN
+                : retainedPhase;
+        }
+
+        activeCircularRecoveryTargets = List.of();
+        circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
+        circularBuildRejectedRejoinStart = null;
+        circularBuildRejectedRejoinBlockSequence = -1L;
+        stopMovement();
+        info(
+            "Automatically rejoined circular pair "
+                + route.pairIndex()
+                + " at its retained U route; continuing printing."
+        );
+        debugLog(
+            "Recovery",
+            "completed automatic circular route rejoin pair="
+                + route.pairIndex()
+                + " supportCursor=" + supportIndex
+                + " targetIndex=" + targetIndex
+                + " phase=" + circularBuildPhase
+        );
     }
 
     private void tickCircularBuildRecovery() {
@@ -12413,6 +12857,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 info(
                     "Safely backing out of interrupted circular pair "
                         + interruptedPair + " before replanning"
+                );
+                return true;
+            }
+
+            if (!inventoryLost
+                && activeCircularRouteSupportIndex >= 0
+                && activeCircularRouteSupportIndex
+                    < supportPath.size()
+                && isPlayerStandingOnSupport(supportUnderPlayer)
+                && isWalkableCircularBuildRejoinSupport(
+                    supportUnderPlayer
+                )) {
+                beginCircularBuildRouteRejoin();
+                state = State.Walking;
+                info(
+                    "Interrupted printing is on a confirmed neighboring "
+                        + "NBT support; automatically rejoining circular "
+                        + "pair " + interruptedPair + "."
                 );
                 return true;
             }
@@ -12897,6 +13359,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularConnectorIndex = -1;
         activeCircularPlacementCursor = -1;
         circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
         circularBuildPhase = CircularBuildPhase.NONE;
         releaseBuildRepairSpeedMine();
         buildRepairController.reset();
@@ -17340,7 +17804,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         plannedForeignBuildReachTargets.clear();
         plannedForeignBuildReachWindows.clear();
         circularBuildPlacementBacktrackSupportIndex = -1;
+        circularBuildPlacementBacktrackLastSupportIndex = -1;
+        circularBuildPlacementBacktrackDirection = 1;
         circularBuildPlacementBacktrackTarget = null;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
+        activeCircularRecoveryTargets = List.of();
         optimizedCircularTraversalPairs.clear();
         optimizedDeferredBuildTargets.clear();
         optimizedDeferredRouteAssignments.clear();
@@ -17456,6 +17925,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularBuildPair = -1;
         activeCircularConnectorIndex = -1;
         circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
         circularBuildPhase = CircularBuildPhase.NONE;
         resetMapAreaCache();
         if (circularTraversalForCurrentMap
@@ -19135,6 +19606,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularBuildPair = -1;
         activeCircularConnectorIndex = -1;
         circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
         circularBuildPhase = CircularBuildPhase.NONE;
         resetTeardownMiningActionState();
         plannedTeardownHotbarAssignments.clear();
@@ -23536,6 +24009,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         OUTBOUND,
         CONNECTOR,
         RETURN,
+        REJOIN,
         RECOVERY,
         RECOVERY_EXIT
     }

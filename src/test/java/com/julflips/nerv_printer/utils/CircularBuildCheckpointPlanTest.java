@@ -133,4 +133,26 @@ class CircularBuildCheckpointPlanTest {
             )
         );
     }
+
+    @Test
+    void returnLegEntryConsumesOnlyTheConnectorExit() {
+        assertFalse(
+            CircularBuildCheckpointPlan.connectorHandoffReachesCheckpoint(
+                false,
+                true
+            )
+        );
+        assertFalse(
+            CircularBuildCheckpointPlan.connectorHandoffReachesCheckpoint(
+                true,
+                false
+            )
+        );
+        assertTrue(
+            CircularBuildCheckpointPlan.connectorHandoffReachesCheckpoint(
+                true,
+                true
+            )
+        );
+    }
 }

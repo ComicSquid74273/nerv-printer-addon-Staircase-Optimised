@@ -4,9 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import static com.julflips.nerv_printer.utils.CircularBuildMovementPolicy.HoldReason;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CircularBuildMovementPolicyTest {
     @Test
@@ -50,63 +48,12 @@ class CircularBuildMovementPolicyTest {
     }
 
     @Test
-    void pendingDeferredPlacementDoesNotHoldBeforeReachDeadline() {
-        assertFalse(
-            CircularBuildMovementPolicy.requiresDeferredPlacementHold(
-                55,
-                208
-            )
-        );
-    }
-
-    @Test
-    void deferredPlacementHoldsOnEntryToFinalReachSupport() {
-        assertFalse(
-            CircularBuildMovementPolicy.requiresDeferredPlacementHold(
-                206,
-                208
-            )
-        );
-        assertTrue(
-            CircularBuildMovementPolicy.requiresDeferredPlacementHold(
-                207,
-                208
-            )
-        );
-        assertTrue(
-            CircularBuildMovementPolicy.requiresDeferredPlacementHold(
-                208,
-                208
-            )
-        );
-    }
-
-    @Test
-    void deadlineHoldDoesNotDependOnOneStaleLiveReachSample() {
-        assertTrue(
-            CircularBuildMovementPolicy.requiresDeferredPlacementHold(
-                208,
-                208
-            )
-        );
-    }
-
-    @Test
-    void invalidDeferredReachDeadlineIsRejected() {
-        assertThrows(
-            IllegalArgumentException.class,
-            () -> CircularBuildMovementPolicy
-                .requiresDeferredPlacementHold(0, -1)
-        );
-    }
-
-    @Test
     void passedDeadlineBacktracksOnlyAlongTheOrderedRoute() {
         assertEquals(
             CircularBuildMovementPolicy.ReachDeadlineAction
                 .BACKTRACK_ON_ROUTE,
             CircularBuildMovementPolicy.reachDeadlineAction(
-                84,
+                82,
                 82,
                 false,
                 false
@@ -122,13 +69,100 @@ class CircularBuildMovementPolicyTest {
             )
         );
         assertEquals(
-            CircularBuildMovementPolicy.ReachDeadlineAction
-                .HOLD_FOR_PLACEMENT,
+            CircularBuildMovementPolicy.ReachDeadlineAction.CONTINUE,
             CircularBuildMovementPolicy.reachDeadlineAction(
                 82,
                 82,
                 false,
                 true
+            )
+        );
+    }
+
+    @Test
+    void reachableMissingTargetNeverStopsRouteMovement() {
+        assertEquals(
+            CircularBuildMovementPolicy.ReachDeadlineAction.CONTINUE,
+            CircularBuildMovementPolicy.reachDeadlineAction(
+                129,
+                129,
+                true,
+                false
+            )
+        );
+    }
+
+    @Test
+    void unsubmittedTargetBeforeFinalReachSupportDoesNotDeadlock() {
+        assertEquals(
+            CircularBuildMovementPolicy.ReachDeadlineAction.CONTINUE,
+            CircularBuildMovementPolicy.reachDeadlineAction(
+                128,
+                129,
+                false,
+                false
+            )
+        );
+    }
+
+    @Test
+    void reachRecoverySweepsBetweenRouteDerivedBoundaries() {
+        assertEquals(
+            -1,
+            CircularBuildMovementPolicy.reachSweepDirection(
+                130,
+                127,
+                130,
+                -1
+            )
+        );
+        assertEquals(
+            1,
+            CircularBuildMovementPolicy.reachSweepDirection(
+                127,
+                127,
+                130,
+                -1
+            )
+        );
+        assertEquals(
+            1,
+            CircularBuildMovementPolicy.reachSweepDirection(
+                129,
+                127,
+                130,
+                1
+            )
+        );
+        assertEquals(
+            -1,
+            CircularBuildMovementPolicy.reachSweepDirection(
+                130,
+                127,
+                130,
+                1
+            )
+        );
+    }
+
+    @Test
+    void invalidReachSweepIsRejected() {
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> CircularBuildMovementPolicy.reachSweepDirection(
+                5,
+                6,
+                5,
+                -1
+            )
+        );
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> CircularBuildMovementPolicy.reachSweepDirection(
+                5,
+                4,
+                6,
+                0
             )
         );
     }

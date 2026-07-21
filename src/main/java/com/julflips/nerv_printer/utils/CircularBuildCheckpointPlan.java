@@ -103,4 +103,16 @@ public final class CircularBuildCheckpointPlan {
     ) {
         return finalExitCheckpoint && completeOrderedRoute;
     }
+
+    /**
+     * Entering the ordered return leg authoritatively completes the connector
+     * handoff. Requiring another point-center sample after that cell entry can
+     * leave the connector checkpoint behind a moving player.
+     */
+    public static boolean connectorHandoffReachesCheckpoint(
+        boolean connectorExitCheckpoint,
+        boolean returnLegEntered
+    ) {
+        return connectorExitCheckpoint && returnLegEntered;
+    }
 }
