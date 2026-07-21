@@ -22,7 +22,8 @@ class CircularBuildSupportPathTest {
                 "connector",
                 "return-1",
                 "return-0",
-                "return-walkway-z-minus-1"
+                "return-walkway-z-minus-1",
+                "exit-alignment-z-minus-2"
             ),
             CircularBuildSupportPath.create(
                 "alignment-z-minus-2",
@@ -34,7 +35,8 @@ class CircularBuildSupportPathTest {
                     "return-1",
                     "return-0"
                 ),
-                "return-walkway-z-minus-1"
+                "return-walkway-z-minus-1",
+                "exit-alignment-z-minus-2"
             )
         );
     }
@@ -47,7 +49,8 @@ class CircularBuildSupportPathTest {
                 "alignment",
                 "walkway",
                 List.of(),
-                "return"
+                "return",
+                "exit"
             )
         );
         assertThrows(
@@ -56,7 +59,8 @@ class CircularBuildSupportPathTest {
                 "walkway",
                 "walkway",
                 List.of("target"),
-                "return"
+                "return",
+                "exit"
             )
         );
         assertThrows(
@@ -65,6 +69,17 @@ class CircularBuildSupportPathTest {
                 "alignment",
                 "walkway",
                 List.of("target", "target"),
+                "return",
+                "exit"
+            )
+        );
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> CircularBuildSupportPath.create(
+                "alignment",
+                "walkway",
+                List.of("target"),
+                "return",
                 "return"
             )
         );
@@ -144,14 +159,15 @@ class CircularBuildSupportPathTest {
     }
 
     @Test
-    void restartCanReplanFromAlignmentOrEitherNorthWalkway() {
+    void restartCanReplanFromEitherAlignmentOrNorthWalkway() {
         List<String> path = List.of(
             "alignment",
             "outbound-walkway",
             "outbound-target",
             "connector",
             "return-target",
-            "return-walkway"
+            "return-walkway",
+            "exit-alignment"
         );
 
         assertTrue(
@@ -170,6 +186,12 @@ class CircularBuildSupportPathTest {
             CircularBuildSupportPath.isDirectReplanSupport(
                 path,
                 "return-walkway"
+            )
+        );
+        assertTrue(
+            CircularBuildSupportPath.isDirectReplanSupport(
+                path,
+                "exit-alignment"
             )
         );
         assertFalse(

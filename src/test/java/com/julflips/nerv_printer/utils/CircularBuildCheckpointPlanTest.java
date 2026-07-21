@@ -11,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class CircularBuildCheckpointPlanTest {
     @Test
-    void exposesOnlyTheFourUniqueUStructuralEndpoints() {
+    void exposesThreeUStructuralEndpointsAndTheExteriorExit() {
         var plan = CircularBuildCheckpointPlan.create(
             "outbound-north",
             List.of(
@@ -20,7 +20,7 @@ class CircularBuildCheckpointPlanTest {
                 "turn-2",
                 "return-far"
             ),
-            "return-north"
+            "return-exterior"
         );
 
         assertEquals(
@@ -28,7 +28,7 @@ class CircularBuildCheckpointPlanTest {
                 "outbound-north",
                 "outbound-far",
                 "return-far",
-                "return-north"
+                "return-exterior"
             ),
             plan.structuralCheckpoints()
         );

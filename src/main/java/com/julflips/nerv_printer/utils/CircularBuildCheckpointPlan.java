@@ -4,8 +4,8 @@ import java.util.List;
 import java.util.Objects;
 
 /**
- * Separates the four user-visible U endpoints from the exact connector
- * steering steps required between the two far endpoints.
+ * Separates the three structural U endpoints and exterior departure from the
+ * exact connector steering steps required between the two far endpoints.
  */
 public final class CircularBuildCheckpointPlan {
     private CircularBuildCheckpointPlan() {
@@ -39,11 +39,11 @@ public final class CircularBuildCheckpointPlan {
     public static <T> Plan<T> create(
         T outboundNorth,
         List<T> connectorPath,
-        T returnNorth
+        T returnExit
     ) {
         Objects.requireNonNull(outboundNorth, "outboundNorth");
         Objects.requireNonNull(connectorPath, "connectorPath");
-        Objects.requireNonNull(returnNorth, "returnNorth");
+        Objects.requireNonNull(returnExit, "returnExit");
         if (connectorPath.size() < 2) {
             throw new IllegalArgumentException(
                 "A connector path must contain both far endpoints."
@@ -60,7 +60,7 @@ public final class CircularBuildCheckpointPlan {
                 outboundNorth,
                 connectorStart,
                 connectorEnd,
-                returnNorth
+                returnExit
             ),
             connectorPath.subList(1, connectorPath.size())
         );

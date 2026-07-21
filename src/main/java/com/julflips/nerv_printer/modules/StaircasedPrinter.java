@@ -139,7 +139,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final double
         TEARDOWN_STANDING_EYE_HEIGHT = 1.62;
     private static final int MINING_RECOVERY_STABLE_SNAPSHOT_TICKS = 2;
-    private static final int DEBUG_ACTION_BUDGET_INTERVAL_TICKS = 20;
+    private static final int DEFAULT_DEBUG_PRINT_INTERVAL_TICKS = 200;
     private static final int LOCAL_CYCLE_HEARTBEAT_TICKS = 20;
     private static final double MINIMUM_TOOL_DURABILITY_FRACTION =
         0.10;
@@ -149,6 +149,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final int TEARDOWN_AXE_HOTBAR_COUNT = 1;
     private static final int HOTBAR_SLOT_PENDING = -1;
     private static final int HOTBAR_ITEM_UNAVAILABLE = -2;
+
+    private final CategorizedDebugLogLimiter debugLogLimiter =
+        new CategorizedDebugLogLimiter();
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgAdvanced = settings.createGroup("Advanced", false);
@@ -517,6 +520,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("debug-prints")
         .description("Print structured state, movement, inventory, restock, transfer-confirmation, refill-wait, placement, and checkpoint diagnostics.")
         .defaultValue(false)
+        .onChanged(enabled -> {
+            if (!enabled) debugLogLimiter.clear();
+        })
+        .build()
+    );
+
+    private final Setting<Integer> debugPrintInterval = sgAdvanced.add(new IntSetting.Builder()
+        .name("debug-print-interval")
+        .description("Minimum ticks between debug messages in the same category. Repeated messages are coalesced and the latest state is printed.")
+        .defaultValue(DEFAULT_DEBUG_PRINT_INTERVAL_TICKS)
+        .min(20)
+        .max(500)
+        .sliderRange(20, 500)
+        .visible(debugPrints::get)
+        .onChanged(interval -> debugLogLimiter.clear())
         .build()
     );
 
@@ -1084,6 +1102,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     @Override
     public void onActivate() {
+        debugLogLimiter.clear();
         boolean preserveForStartContinue =
             startContinueActivationRequested;
         startContinueActivationRequested = false;
@@ -1235,7 +1254,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         teardownBreakAttempts = 0L;
         confirmedTeardownBreaks = 0L;
         lastActionBudgetDebugTick =
-            -DEBUG_ACTION_BUDGET_INTERVAL_TICKS;
+            -DEFAULT_DEBUG_PRINT_INTERVAL_TICKS;
         lastActionBudgetDebugNanos = 0L;
         lastActionBudgetPlacementAttempts = 0L;
         lastActionBudgetConfirmedPlacements = 0L;
@@ -2651,10 +2670,30 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private void debugLog(String category, String message) {
-        if (!debugPrints.get()) return;
+        if (!debugPrints.get()) {
+            debugLogLimiter.clear();
+            return;
+        }
+        Optional<CategorizedDebugLogLimiter.Emission> emission =
+            debugLogLimiter.submit(
+                clientActionTick,
+                debugPrintInterval.get(),
+                category,
+                message
+            );
+        if (emission.isEmpty()) return;
+
+        CategorizedDebugLogLimiter.Emission emitted =
+            emission.orElseThrow();
+        String coalesced = emitted.suppressedMessages() == 0
+            ? ""
+            : " | coalesced=" + emitted.suppressedMessages()
+                + " intermediate " + category + " messages";
         info(
+            "%s",
             "[Debug][" + category + "] tick=" + clientActionTick
-                + " state=" + state + " | " + message
+                + " state=" + state + " | " + emitted.message()
+                + coalesced
         );
     }
 
@@ -5487,9 +5526,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 checkpoints.getFirst().getRight().getLeft();
             boolean alignmentCheckpoint =
                 circularBuildAction.equals("preparePair");
+            boolean exitAlignmentCheckpoint =
+                circularBuildAction.equals("finishPair");
             boolean walkwayCheckpoint =
-                circularBuildAction.equals("finishPair")
-                    || circularBuildAction.equals("uBuildRecoveryExit");
+                circularBuildAction.equals("uBuildRecoveryExit");
             boolean continuousLegCheckpoint =
                 circularBuildAction.equals("uBuildOutboundEnd");
             BlockPos requiredSupport =
@@ -5516,6 +5556,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     error(
                         "Circular build alignment changed unexpectedly at "
                             + expectedAlignment.toShortString() + "."
+                    );
+                    toggle();
+                    return;
+                }
+            } else if (exitAlignmentCheckpoint) {
+                int pairIndex = activeCircularBuildPair;
+                if (pairIndex < 0
+                    || pairIndex >= compactPlan.pairRoutes().size()) {
+                    error(
+                        "Circular build exit lost its active pair index."
+                    );
+                    toggle();
+                    return;
+                }
+                CompactCircularNbtPlan.PairRoute route =
+                    compactPlan.pairRoutes().get(pairIndex);
+                BlockPos expectedExit =
+                    circularBuildExitAlignmentSupport(route);
+                if (!requiredSupport.equals(expectedExit)
+                    || !isSafeCircularBuildExitAlignment(route)) {
+                    error(
+                        "Circular build exit alignment changed unexpectedly at "
+                            + expectedExit.toShortString() + "."
                     );
                     toggle();
                     return;
@@ -5820,6 +5883,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean uEndpoint =
             state == State.MiningUTraversal
                 && isUTraversalEndpoint(currentCheckpoint);
+        OrderedUTraversalMovement.EndpointProgress
+            printingEndpointProgress = activeCircularBuildMovement
+                ? OrderedUTraversalMovement.endpointProgress(
+                    activeOrderedRouteComplete
+                )
+                : OrderedUTraversalMovement.EndpointProgress.APPROACHING;
         if (uEndpoint
             && !activeContinuousTeardownMovement
             && isHorizontallyOverCheckpointSupport(checkpointGoal)
@@ -5830,6 +5899,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (state == State.Walking
             && (preciseCircularBuildCheckpoint
                 || persistedMiningRecoveryCheckpoint)
+            && printingEndpointProgress
+                != OrderedUTraversalMovement.EndpointProgress.REACHED
             && isHorizontallyOverCheckpointSupport(checkpointGoal)
             && !isGroundedOnCheckpointSupport(checkpointGoal)) {
             stopMovement();
@@ -5840,6 +5911,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             reachedCheckpoint =
                 !activeContinuousTeardownMovement
                     && isGroundedOnCheckpointSupport(checkpointGoal);
+        } else if (printingEndpointProgress
+            == OrderedUTraversalMovement.EndpointProgress.REACHED) {
+            reachedCheckpoint = true;
         } else {
             reachedCheckpoint =
                 checkpointDistance < requiredCheckpointBuffer;
@@ -6144,6 +6218,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                                     + pairEntry.toShortString()
                                 + " firstTarget="
                                     + firstTarget.toShortString()
+                                + " exitSupport="
+                                    + circularBuildExitAlignmentSupport(
+                                        pairRoute
+                                    ).toShortString()
                                 + " raisedEntry="
                                     + (firstTarget.getY()
                                         == pairEntry.getY() + 1)
@@ -6232,12 +6310,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     if (finishedPairIndex >= 0) {
                         CompactCircularNbtPlan.PairRoute exitingRoute =
                             compactPlan.pairRoutes().get(finishedPairIndex);
-                        BlockPos returnWalkway =
-                            northWalkwaySupport(exitingRoute.returnX());
-                        if (!isPlayerStandingOnSupport(returnWalkway)) {
+                        BlockPos exitAlignment =
+                            circularBuildExitAlignmentSupport(exitingRoute);
+                        if (!isSafeCircularBuildExitAlignment(exitingRoute)
+                            || !isHorizontallyOverCheckpointSupport(
+                                exitAlignment
+                            )) {
                             error(
                                 "Circular pair " + finishedPairIndex
-                                    + " did not reach its exact north return endpoint."
+                                    + " did not enter its exact one-block-back exit alignment."
                             );
                             toggle();
                             return;
@@ -7149,7 +7230,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean periodicSummaryDue =
             workActionBudget.grantedThisTick() > 0
                 && clientActionTick - lastActionBudgetDebugTick
-                    >= DEBUG_ACTION_BUDGET_INTERVAL_TICKS;
+                    >= debugPrintInterval.get();
         if (pauseChanged || periodicSummaryDue) {
             lastActionBudgetDebugTick = clientActionTick;
             double elapsedSeconds = lastActionBudgetDebugNanos <= 0L
@@ -8572,7 +8653,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             circularBuildAlignmentSupport(route),
             northWalkwaySupport(route.outboundX()),
             worldTargets,
-            northWalkwaySupport(route.returnX())
+            northWalkwaySupport(route.returnX()),
+            circularBuildExitAlignmentSupport(route)
         );
     }
 
@@ -8582,6 +8664,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ) {
         if (support.equals(circularBuildAlignmentSupport(route))) {
             return isSafeCircularBuildAlignment(route);
+        }
+        if (support.equals(circularBuildExitAlignmentSupport(route))) {
+            return isSafeCircularBuildExitAlignment(route);
         }
         if (support.equals(northWalkwaySupport(route.outboundX()))) {
             return isSafeNorthWalkway(route.outboundX());
@@ -11922,7 +12007,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return CircularBuildCheckpointPlan.create(
             northWalkwaySupport(route.outboundX()),
             connectorPath,
-            northWalkwaySupport(route.returnX())
+            circularBuildExitAlignmentSupport(route)
         );
     }
 
@@ -12350,6 +12435,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 if (support.equals(alignment)
                     && isSafeCircularBuildAlignment(route)
                     && isPlayerStandingOnSupport(alignment)) {
+                    return true;
+                }
+                BlockPos exitAlignment =
+                    circularBuildExitAlignmentSupport(route);
+                if (support.equals(exitAlignment)
+                    && isSafeCircularBuildExitAlignment(route)
+                    && isPlayerStandingOnSupport(exitAlignment)) {
                     return true;
                 }
             }
@@ -16925,6 +17017,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return false;
             }
             info(
+                "%s",
                 "Restocking §a" + demand.remainingAmount() + " usable "
                     + demand.item().getName().getString()
                     + " below the configured "
@@ -17030,7 +17123,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         teardownBreakAttempts = 0L;
         confirmedTeardownBreaks = 0L;
         lastActionBudgetDebugTick =
-            clientActionTick - DEBUG_ACTION_BUDGET_INTERVAL_TICKS;
+            clientActionTick - debugPrintInterval.get();
         lastActionBudgetDebugNanos = 0L;
         lastActionBudgetPlacementAttempts = 0L;
         lastActionBudgetConfirmedPlacements = 0L;
@@ -17406,14 +17499,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
             return false;
         }
-        if (debugPrints.get()
-            || !plannedOptionalBuildOrder.isEmpty()
-            || !plannedDeferredMandatoryBuildOrder.isEmpty()) {
+        if (debugPrints.get()) {
             long plannedConnectorTargets =
                 plannedOptionalBuildOrder.stream()
                     .filter(connectorTargets::contains)
                     .count();
-            info(
+            debugLog(
+                "InventoryPlan",
                 "Pair " + route.pairIndex() + " inventory plan: "
                     + result.plan().primarySlotsRequired() + " guaranteed U slots, "
                     + result.plan().totalSlotsRequired() + "/"
@@ -18287,20 +18379,50 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private BlockPos circularBuildExitAlignmentSupport(
+        CompactCircularNbtPlan.PairRoute route
+    ) {
+        BlockPos endpoint = northWalkwaySupport(route.returnX());
+        BlockPos finalRouteSupport = mapCorner.add(
+            surfaceRuntimePosition(route.returnX(), 1)
+        );
+        return OrderedUTraversalMovement.exitDepartureSupport(
+            endpoint,
+            finalRouteSupport
+        );
+    }
+
     private boolean isSafeCircularBuildAlignment(
         CompactCircularNbtPlan.PairRoute route
     ) {
-        if (mc.world == null
-            || !isSafeNorthWalkway(route.outboundX())) {
+        return isSafeCircularExteriorSupport(
+            route.outboundX(),
+            circularBuildAlignmentSupport(route)
+        );
+    }
+
+    private boolean isSafeCircularBuildExitAlignment(
+        CompactCircularNbtPlan.PairRoute route
+    ) {
+        return isSafeCircularExteriorSupport(
+            route.returnX(),
+            circularBuildExitAlignmentSupport(route)
+        );
+    }
+
+    private boolean isSafeCircularExteriorSupport(
+        int walkwayX,
+        BlockPos exteriorSupport
+    ) {
+        if (mc.world == null || !isSafeNorthWalkway(walkwayX)) {
             return false;
         }
-        BlockPos alignment = circularBuildAlignmentSupport(route);
         BlockState state =
-            MapAreaCache.getCachedBlockState(alignment);
+            MapAreaCache.getCachedBlockState(exteriorSupport);
         return !state.isAir()
-            && state.isSolidBlock(mc.world, alignment)
-            && MapAreaCache.getCachedBlockState(alignment.up()).isAir()
-            && MapAreaCache.getCachedBlockState(alignment.up(2)).isAir();
+            && state.isSolidBlock(mc.world, exteriorSupport)
+            && MapAreaCache.getCachedBlockState(exteriorSupport.up()).isAir()
+            && MapAreaCache.getCachedBlockState(exteriorSupport.up(2)).isAir();
     }
 
     private boolean validateCompactWorkspace() {
@@ -18354,6 +18476,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 error(
                     "Circular pair one-block-back alignment is not safe at "
                         + circularBuildAlignmentSupport(route)
+                            .toShortString() + "."
+                );
+            }
+            return false;
+        }
+        if (!isSafeCircularBuildExitAlignment(route)) {
+            if (reportError) {
+                error(
+                    "Circular pair one-block-back exit is not safe at "
+                        + circularBuildExitAlignmentSupport(route)
                             .toShortString() + "."
                 );
             }
@@ -19508,6 +19640,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         checkpoints.addAll(0, depositCheckpoints);
         info(
+            "%s",
             "Routing " + depositSlots.size()
                 + " below-"
                 + String.format(

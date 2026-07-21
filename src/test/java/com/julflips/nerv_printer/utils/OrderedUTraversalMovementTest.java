@@ -79,6 +79,18 @@ class OrderedUTraversalMovementTest {
     }
 
     @Test
+    void finalCellCompletesWithoutASeparateGroundedHandoff() {
+        assertEquals(
+            OrderedUTraversalMovement.EndpointProgress.APPROACHING,
+            OrderedUTraversalMovement.endpointProgress(false)
+        );
+        assertEquals(
+            OrderedUTraversalMovement.EndpointProgress.REACHED,
+            OrderedUTraversalMovement.endpointProgress(true)
+        );
+    }
+
+    @Test
     void steeringUsesStraightSegmentsInsteadOfPerBlockCenters() {
         List<BlockPos> route = List.of(
             new BlockPos(0, 10, -1),
@@ -129,6 +141,38 @@ class OrderedUTraversalMovementTest {
         assertEquals(
             new BlockPos(11, 30, 10),
             OrderedUTraversalMovement.entryApproachSupport(
+                new BlockPos(10, 30, 10),
+                new BlockPos(9, 30, 10)
+            )
+        );
+    }
+
+    @Test
+    void departureSupportIsDerivedFromEitherExitDirection() {
+        assertEquals(
+            new BlockPos(4, 20, -2),
+            OrderedUTraversalMovement.exitDepartureSupport(
+                new BlockPos(4, 20, -1),
+                new BlockPos(4, 21, 0)
+            )
+        );
+        assertEquals(
+            new BlockPos(9, 20, 12),
+            OrderedUTraversalMovement.exitDepartureSupport(
+                new BlockPos(9, 20, 11),
+                new BlockPos(9, 19, 10)
+            )
+        );
+        assertEquals(
+            new BlockPos(9, 30, 10),
+            OrderedUTraversalMovement.exitDepartureSupport(
+                new BlockPos(10, 30, 10),
+                new BlockPos(11, 30, 10)
+            )
+        );
+        assertEquals(
+            new BlockPos(11, 30, 10),
+            OrderedUTraversalMovement.exitDepartureSupport(
                 new BlockPos(10, 30, 10),
                 new BlockPos(9, 30, 10)
             )

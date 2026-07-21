@@ -52,6 +52,17 @@ public final class OrderedUTraversalMovement {
         WAITING_FOR_NEXT_SUPPORT
     }
 
+    /**
+     * Reports whether the final horizontal route cell has been entered.
+     * Ordered U movement deliberately leaves vertical landing to vanilla
+     * gravity and auto-jump; requiring a separate grounded tick here can
+     * deadlock the route after its movement cursor has already stopped.
+     */
+    public enum EndpointProgress {
+        APPROACHING,
+        REACHED
+    }
+
     public record MovementDecision<T>(
         MovementStatus status,
         T requiredSupport
@@ -72,6 +83,14 @@ public final class OrderedUTraversalMovement {
         public boolean mayMove() {
             return status == MovementStatus.READY;
         }
+    }
+
+    public static EndpointProgress endpointProgress(
+        boolean finalSupportCellEntered
+    ) {
+        return finalSupportCellEntered
+            ? EndpointProgress.REACHED
+            : EndpointProgress.APPROACHING;
     }
 
     public static Progress resolve(
@@ -233,19 +252,51 @@ public final class OrderedUTraversalMovement {
         BlockPos entryEndpoint,
         BlockPos firstRouteSupport
     ) {
-        Objects.requireNonNull(entryEndpoint, "entryEndpoint");
-        Objects.requireNonNull(firstRouteSupport, "firstRouteSupport");
-        int directionX = firstRouteSupport.getX() - entryEndpoint.getX();
-        int directionZ = firstRouteSupport.getZ() - entryEndpoint.getZ();
+        return exteriorEndpointSupport(
+            entryEndpoint,
+            firstRouteSupport,
+            "first"
+        );
+    }
+
+    /**
+     * Extends the return endpoint one route step away from the final U
+     * support. Entry and exit therefore use the same route-derived geometry
+     * even when a map is rotated or a leg changes elevation.
+     */
+    public static BlockPos exitDepartureSupport(
+        BlockPos exitEndpoint,
+        BlockPos finalRouteSupport
+    ) {
+        return exteriorEndpointSupport(
+            exitEndpoint,
+            finalRouteSupport,
+            "final"
+        );
+    }
+
+    private static BlockPos exteriorEndpointSupport(
+        BlockPos endpoint,
+        BlockPos adjacentRouteSupport,
+        String routeSupportName
+    ) {
+        Objects.requireNonNull(endpoint, "endpoint");
+        Objects.requireNonNull(
+            adjacentRouteSupport,
+            "adjacentRouteSupport"
+        );
+        int directionX = adjacentRouteSupport.getX() - endpoint.getX();
+        int directionZ = adjacentRouteSupport.getZ() - endpoint.getZ();
         requireHorizontalStep(directionX, directionZ);
         if (Math.abs(
-            firstRouteSupport.getY() - entryEndpoint.getY()
+            adjacentRouteSupport.getY() - endpoint.getY()
         ) > 1) {
             throw new IllegalArgumentException(
-                "The first ordered U support is not walkable from its endpoint."
+                "The " + routeSupportName
+                    + " ordered U support is not walkable from its endpoint."
             );
         }
-        return entryEndpoint.add(-directionX, 0, -directionZ);
+        return endpoint.add(-directionX, 0, -directionZ);
     }
 
     private static void requireHorizontalStep(int deltaX, int deltaZ) {
