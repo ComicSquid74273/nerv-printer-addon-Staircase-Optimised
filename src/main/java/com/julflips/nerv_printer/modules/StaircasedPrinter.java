@@ -22196,19 +22196,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 && liveCursor.pairIndex() != assignmentPair) {
                 liveCursor = null;
             }
-            Integer checkpointPair = assignmentPair != null
-                ? assignmentPair
-                : liveCursor != null
-                    ? liveCursor.pairIndex()
-                    : orderedCursor != null
-                        ? orderedCursor.pairIndex()
-                        : retainedCursor != null
-                            ? retainedCursor.pairIndex()
-                            : preferredRecoveredMiningPair >= 0
-                                ? preferredRecoveredMiningPair
-                                : recoveredActiveMiningPair >= 0
-                                    ? recoveredActiveMiningPair
-                                    : null;
+            Integer checkpointPair =
+                DurableTeardownRecoveryCursor.selectCheckpointPair(
+                    assignmentPair,
+                    liveCursor,
+                    orderedCursor,
+                    retainedCursor,
+                    preferredRecoveredMiningPair,
+                    recoveredActiveMiningPair
+                );
             Optional<DurableTeardownRecoveryCursor.Cursor>
                 selectedCursor =
                     DurableTeardownRecoveryCursor.select(

@@ -6,10 +6,99 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DurableTeardownRecoveryCursorTest {
+    @Test
+    void miningStartCheckpointMayPrecedeTheFirstPairAssignment() {
+        assertNull(
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                null,
+                null,
+                null,
+                -1,
+                -1
+            )
+        );
+    }
+
+    @Test
+    void checkpointPairSelectionPreservesRecoveryOwnershipPriority() {
+        var live = cursor(6, 10);
+        var ordered = cursor(7, 11);
+        var confirmed = cursor(8, 12);
+
+        assertEquals(
+            5,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                5,
+                live,
+                ordered,
+                confirmed,
+                9,
+                10
+            )
+        );
+        assertEquals(
+            6,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                live,
+                ordered,
+                confirmed,
+                9,
+                10
+            )
+        );
+        assertEquals(
+            7,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                null,
+                ordered,
+                confirmed,
+                9,
+                10
+            )
+        );
+        assertEquals(
+            8,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                null,
+                null,
+                confirmed,
+                9,
+                10
+            )
+        );
+        assertEquals(
+            9,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                null,
+                null,
+                null,
+                9,
+                10
+            )
+        );
+        assertEquals(
+            10,
+            DurableTeardownRecoveryCursor.selectCheckpointPair(
+                null,
+                null,
+                null,
+                null,
+                -1,
+                10
+            )
+        );
+    }
+
     @Test
     void liveAuthoritativeCursorWinsOverRuntimeAndPersistedState() {
         var live = cursor(24, 18);

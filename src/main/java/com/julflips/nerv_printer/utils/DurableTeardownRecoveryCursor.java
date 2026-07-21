@@ -34,6 +34,42 @@ public final class DurableTeardownRecoveryCursor {
     }
 
     /**
+     * Selects the pair identity written at a teardown checkpoint.
+     *
+     * <p>The priority matches runtime recovery ownership. A mining-start
+     * checkpoint may legitimately precede the first assignment, in which
+     * case this method returns {@code null} without unboxing it.</p>
+     */
+    public static Integer selectCheckpointPair(
+        Integer currentAssignmentPair,
+        Cursor liveAuthoritativeCursor,
+        Cursor activeOrderedRouteCursor,
+        Cursor lastConfirmedCursor,
+        int preferredRecoveredPair,
+        int recoveredActivePair
+    ) {
+        if (currentAssignmentPair != null) {
+            return currentAssignmentPair;
+        }
+        if (liveAuthoritativeCursor != null) {
+            return liveAuthoritativeCursor.pairIndex();
+        }
+        if (activeOrderedRouteCursor != null) {
+            return activeOrderedRouteCursor.pairIndex();
+        }
+        if (lastConfirmedCursor != null) {
+            return lastConfirmedCursor.pairIndex();
+        }
+        if (preferredRecoveredPair >= 0) {
+            return preferredRecoveredPair;
+        }
+        if (recoveredActivePair >= 0) {
+            return recoveredActivePair;
+        }
+        return null;
+    }
+
+    /**
      * Chooses the cursor to persist at the current crash boundary.
      *
      * <p>A live authoritative observation is self-identifying and therefore
