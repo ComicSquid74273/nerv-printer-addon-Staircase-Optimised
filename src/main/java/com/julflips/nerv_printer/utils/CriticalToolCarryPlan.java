@@ -14,9 +14,9 @@ import java.util.Set;
  * Plans the small tool inventory carried while building.
  *
  * <p>Exactly one compatible stack is required for every requested tool item.
- * Any tool above the critical durability threshold remains in inventory.
- * Tools at or below the threshold are routed to used-tool storage and do not
- * satisfy the carry requirement.</p>
+ * Any tool at or above the configured remaining-durability percentage stays
+ * in inventory. Tools below that floor are routed to used-tool storage and do
+ * not satisfy the carry requirement.</p>
  */
 public final class CriticalToolCarryPlan {
     private CriticalToolCarryPlan() {
@@ -26,10 +26,14 @@ public final class CriticalToolCarryPlan {
         int slot,
         K item,
         int remainingDurability,
+        int maximumDurability,
         boolean compatible
     ) {
         public ToolStack {
-            if (slot < 0 || remainingDurability < 0) {
+            if (slot < 0
+                || maximumDurability <= 1
+                || remainingDurability < 0
+                || remainingDurability > maximumDurability) {
                 throw new IllegalArgumentException(
                     "Invalid critical tool stack."
                 );
@@ -71,15 +75,14 @@ public final class CriticalToolCarryPlan {
     public static <K> Result<K> plan(
         Set<? extends K> requiredItems,
         List<ToolStack<K>> inventoryTools,
-        int criticalDurability
+        double minimumRemainingFraction
     ) {
         Objects.requireNonNull(requiredItems, "requiredItems");
         Objects.requireNonNull(inventoryTools, "inventoryTools");
-        if (criticalDurability < 0) {
-            throw new IllegalArgumentException(
-                "Critical durability cannot be negative."
-            );
-        }
+        ToolDurabilityPolicy.minimumRemaining(
+            2,
+            minimumRemainingFraction
+        );
 
         LinkedHashMap<K, Integer> requiredCounts =
             new LinkedHashMap<>();
@@ -102,7 +105,11 @@ public final class CriticalToolCarryPlan {
                     "Inventory tool slot is duplicated: " + tool.slot()
                 );
             }
-            if (tool.remainingDurability() <= criticalDurability) {
+            if (!ToolDurabilityPolicy.isReusable(
+                tool.remainingDurability(),
+                tool.maximumDurability(),
+                minimumRemainingFraction
+            )) {
                 used.add(tool.slot());
                 continue;
             }

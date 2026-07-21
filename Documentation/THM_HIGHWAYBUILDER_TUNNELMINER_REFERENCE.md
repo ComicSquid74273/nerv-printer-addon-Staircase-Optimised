@@ -186,9 +186,13 @@ traversal only when no selected route can safely finish the remainder; the U
 under the recovering player always retains mandatory local ownership.
 
 Managed hotbar swaps, chest restocks, dump throws, and used-tool deposits are
-bounded server-confirmed transactions. Teardown restocking counts usable worn tools
-already carried but accepts only fresh, fully compatible chest tools for newly
-missing worst-case durability. It also freezes a configurable two- or three-stack
+bounded server-confirmed transactions. Teardown restocking applies one shared
+remaining-durability floor to compatible tools already carried and to source-chest
+candidates (ten percent, with persisted lower values clamped upward). Immediately
+before each U it demands two pickaxes and one axe. Below-floor tools are moved by
+exact slot to their typed used-tool chests before replacements are withdrawn.
+The percentage is not re-evaluated inside the U; the three-tool loadout remains
+frozen until the next traversal entry. It also freezes a configurable two- or three-stack
 cobblestone reserve (default three), merges refill into carried partial stacks
 before charging new inventory slots, and confirms that reserve at every teardown
 entry.
@@ -215,8 +219,8 @@ preparation uses server-confirmed inventory `SWAP` packets without changing the
 visible selected slot; the material or tool is selected only when its action is
 dispatched. Pickaxe/axe changes target only the reserved tool slot, returning
 the previous tool to the known source slot. Teardown independently freezes two
-pickaxe assignments and one axe assignment after worst-case restocking. An
-exhausted teardown tool can be replaced only in its preassigned same-item slot,
+pickaxe assignments and one axe assignment after threshold-based restocking. A
+below-floor teardown tool is retired only during the next pre-entry plan,
 so neither phase has an arbitrary hotbar-eviction fallback.
 
 Circular inventory lookahead has no fixed four-column cap. It reserves every

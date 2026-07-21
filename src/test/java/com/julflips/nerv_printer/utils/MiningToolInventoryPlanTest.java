@@ -20,7 +20,7 @@ class MiningToolInventoryPlanTest {
     }
 
     @Test
-    void createsAbsoluteDemandFromCompatibleOnHandAndMissingFreshTools() {
+    void createsAbsoluteDemandFromCompatibleOnHandAndMissingUsableTools() {
         MiningToolInventoryPlan<
             String,
             ToolSpec,
@@ -43,7 +43,7 @@ class MiningToolInventoryPlanTest {
     }
 
     @Test
-    void wornCarriedToolCountsButCannotSatisfyFreshChestDemand() {
+    void carriedAndChestToolsShareTheTenPercentFloor() {
         MiningToolInventoryPlan<
             String,
             ToolSpec,
@@ -52,15 +52,19 @@ class MiningToolInventoryPlanTest {
             List.of(tool("pickaxe", 20, 100, "stone", 5)),
             Map.of("pickaxe", 1)
         );
-        MiningToolInventoryPlan.Tool<String, ToolSpec> worn =
-            tool("pickaxe", 80, 100, "stone", 5);
-        MiningToolInventoryPlan.Tool<String, ToolSpec> fresh =
-            tool("pickaxe", 100, 100, "stone", 5);
+        MiningToolInventoryPlan.Tool<String, ToolSpec> sixtyPercent =
+            tool("pickaxe", 60, 100, "stone", 5);
+        MiningToolInventoryPlan.Tool<String, ToolSpec> boundary =
+            tool("pickaxe", 10, 100, "stone", 5);
+        MiningToolInventoryPlan.Tool<String, ToolSpec> belowFloor =
+            tool("pickaxe", 9, 100, "stone", 5);
 
-        assertTrue(plan.isUsableCompatiblePlayerTool(worn));
-        assertFalse(plan.isFreshCompatibleChestCandidate(worn));
-        assertTrue(plan.isUsableCompatiblePlayerTool(fresh));
-        assertTrue(plan.isFreshCompatibleChestCandidate(fresh));
+        assertTrue(plan.isUsableCompatiblePlayerTool(sixtyPercent));
+        assertTrue(plan.isUsableCompatibleChestCandidate(sixtyPercent));
+        assertTrue(plan.isUsableCompatiblePlayerTool(boundary));
+        assertTrue(plan.isUsableCompatibleChestCandidate(boundary));
+        assertFalse(plan.isUsableCompatiblePlayerTool(belowFloor));
+        assertFalse(plan.isUsableCompatibleChestCandidate(belowFloor));
 
         RestockDemand<String> demand =
             plan.restockDemand("pickaxe").orElseThrow();
@@ -80,7 +84,7 @@ class MiningToolInventoryPlanTest {
 
         assertFalse(plan.isUsableCompatiblePlayerTool(exhausted));
         assertFalse(
-            plan.isFreshCompatibleChestCandidate(exhausted)
+            plan.isUsableCompatibleChestCandidate(exhausted)
         );
     }
 
@@ -103,16 +107,17 @@ class MiningToolInventoryPlanTest {
             requirements,
             List.of(),
             Map.of("pickaxe", 1),
+            0.10,
             MiningToolInventoryPlanTest::isCompatible
         );
 
         assertFalse(
-            plan.isFreshCompatibleChestCandidate(
+            plan.isUsableCompatibleChestCandidate(
                 tool("pickaxe", 100, 100, "stone", 5)
             )
         );
         assertFalse(
-            plan.isFreshCompatibleChestCandidate(
+            plan.isUsableCompatibleChestCandidate(
                 new MiningToolInventoryPlan.Tool<>(
                     "pickaxe",
                     new ToolSpec(Set.of("stone", "ore"), 4),
@@ -122,7 +127,7 @@ class MiningToolInventoryPlanTest {
             )
         );
         assertTrue(
-            plan.isFreshCompatibleChestCandidate(
+            plan.isUsableCompatibleChestCandidate(
                 new MiningToolInventoryPlan.Tool<>(
                     "pickaxe",
                     new ToolSpec(Set.of("stone", "ore"), 5),
@@ -188,6 +193,7 @@ class MiningToolInventoryPlanTest {
             requirements,
             List.of(tool("shovel", 30, 100, "dirt", 1)),
             missing,
+            0.10,
             MiningToolInventoryPlanTest::isCompatible
         );
 
@@ -224,6 +230,7 @@ class MiningToolInventoryPlanTest {
                 requirements,
                 List.of(),
                 Map.of("shovel", 1),
+                0.10,
                 MiningToolInventoryPlanTest::isCompatible
             )
         );
@@ -233,6 +240,7 @@ class MiningToolInventoryPlanTest {
                 Map.of("pickaxe", List.of()),
                 List.of(),
                 Map.of("pickaxe", 1),
+                0.10,
                 MiningToolInventoryPlanTest::isCompatible
             )
         );
@@ -242,6 +250,7 @@ class MiningToolInventoryPlanTest {
                 requirements,
                 List.of(),
                 Map.of("pickaxe", -1),
+                0.10,
                 MiningToolInventoryPlanTest::isCompatible
             )
         );
@@ -263,6 +272,7 @@ class MiningToolInventoryPlanTest {
                 requirements,
                 List.of(),
                 Map.of("pickaxe", 1),
+                0.10,
                 null
             )
         );
@@ -283,6 +293,7 @@ class MiningToolInventoryPlanTest {
             ),
             carried,
             missing,
+            0.10,
             MiningToolInventoryPlanTest::isCompatible
         );
     }

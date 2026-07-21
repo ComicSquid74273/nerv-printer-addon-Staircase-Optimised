@@ -13,12 +13,10 @@ import java.util.function.BiPredicate;
 /**
  * Pure strict-restock plan for damageable mining tools.
  *
- * <p>Compatible tools already carried by the player may contribute even when
- * worn, provided more than the reserved final durability point remains. A
- * chest candidate is deliberately stricter: it must be fully fresh as well
- * as compatible. The resulting {@link RestockDemand} therefore keeps its
- * absolute target based on usable compatible tools already on hand, while
- * fresh missing tools are the only admissible restock sources.</p>
+ * <p>Compatible tools already carried by the player or found in a registered
+ * source chest contribute while they meet one shared remaining-durability
+ * percentage. The resulting {@link RestockDemand} keeps an absolute target
+ * based on reusable compatible tools already on hand.</p>
  *
  * @param <K> item identity
  * @param <T> tool descriptor inspected for compatibility
@@ -56,12 +54,14 @@ public final class MiningToolInventoryPlan<K, T, R> {
             }
         }
 
-        public boolean hasUsableDurability() {
-            return remainingDurability > 1;
-        }
-
-        public boolean isFresh() {
-            return remainingDurability == maximumDurability;
+        public boolean meetsMinimumDurability(
+            double minimumRemainingFraction
+        ) {
+            return ToolDurabilityPolicy.isReusable(
+                remainingDurability,
+                maximumDurability,
+                minimumRemainingFraction
+            );
         }
     }
 
@@ -69,12 +69,14 @@ public final class MiningToolInventoryPlan<K, T, R> {
     private final Map<K, Integer> compatibleOnHandCounts;
     private final Map<K, RestockDemand<K>> restockDemands;
     private final BiPredicate<? super T, ? super R> compatibility;
+    private final double minimumRemainingFraction;
 
     private MiningToolInventoryPlan(
         Map<K, List<R>> compatibilityRequirements,
         Map<K, Integer> compatibleOnHandCounts,
         Map<K, RestockDemand<K>> restockDemands,
-        BiPredicate<? super T, ? super R> compatibility
+        BiPredicate<? super T, ? super R> compatibility,
+        double minimumRemainingFraction
     ) {
         this.compatibilityRequirements =
             immutableRequirements(compatibilityRequirements);
@@ -82,10 +84,11 @@ public final class MiningToolInventoryPlan<K, T, R> {
             immutableLinkedMap(compatibleOnHandCounts);
         this.restockDemands = immutableLinkedMap(restockDemands);
         this.compatibility = compatibility;
+        this.minimumRemainingFraction = minimumRemainingFraction;
     }
 
     /**
-     * Creates a plan from authoritative player tools and missing fresh counts.
+     * Creates a plan from authoritative player tools and missing usable counts.
      *
      * <p>Every item with a missing-count entry must have at least one
      * compatibility requirement. A zero missing count is retained as a
@@ -98,7 +101,8 @@ public final class MiningToolInventoryPlan<K, T, R> {
             ? extends Collection<? extends R>
         > compatibilityRequirements,
         List<? extends Tool<K, T>> carriedTools,
-        Map<? extends K, Integer> missingFreshCounts,
+        Map<? extends K, Integer> missingUsableCounts,
+        double minimumRemainingFraction,
         BiPredicate<? super T, ? super R> compatibility
     ) {
         Objects.requireNonNull(
@@ -107,10 +111,14 @@ public final class MiningToolInventoryPlan<K, T, R> {
         );
         Objects.requireNonNull(carriedTools, "carriedTools");
         Objects.requireNonNull(
-            missingFreshCounts,
-            "missingFreshCounts"
+            missingUsableCounts,
+            "missingUsableCounts"
         );
         Objects.requireNonNull(compatibility, "compatibility");
+        ToolDurabilityPolicy.minimumRemaining(
+            2,
+            minimumRemainingFraction
+        );
 
         LinkedHashMap<K, List<R>> requirements =
             copyRequirements(compatibilityRequirements);
@@ -127,7 +135,8 @@ public final class MiningToolInventoryPlan<K, T, R> {
                 requirements,
                 onHandCounts,
                 Map.of(),
-                compatibility
+                compatibility,
+                minimumRemainingFraction
             );
         for (Tool<K, T> tool : tools) {
             if (!classifier.isUsableCompatiblePlayerTool(tool)) continue;
@@ -137,24 +146,24 @@ public final class MiningToolInventoryPlan<K, T, R> {
         LinkedHashMap<K, RestockDemand<K>> demands =
             new LinkedHashMap<>();
         for (Map.Entry<? extends K, Integer> entry
-            : missingFreshCounts.entrySet()) {
+            : missingUsableCounts.entrySet()) {
             K item = Objects.requireNonNull(
                 entry.getKey(),
-                "missing-fresh item"
+                "missing-usable item"
             );
             Integer missing = Objects.requireNonNull(
                 entry.getValue(),
-                "missing-fresh count"
+                "missing-usable count"
             );
             if (missing < 0) {
                 throw new IllegalArgumentException(
-                    "Missing fresh tool count cannot be negative."
+                    "Missing usable tool count cannot be negative."
                 );
             }
             List<R> itemRequirements = requirements.get(item);
             if (itemRequirements == null || itemRequirements.isEmpty()) {
                 throw new IllegalArgumentException(
-                    "Missing fresh tool demand has no compatibility "
+                    "Missing usable tool demand has no compatibility "
                         + "requirements for item: " + item
                 );
             }
@@ -172,7 +181,8 @@ public final class MiningToolInventoryPlan<K, T, R> {
             requirements,
             onHandCounts,
             demands,
-            compatibility
+            compatibility,
+            minimumRemainingFraction
         );
     }
 
@@ -182,17 +192,21 @@ public final class MiningToolInventoryPlan<K, T, R> {
      */
     public boolean isUsableCompatiblePlayerTool(Tool<K, T> tool) {
         Objects.requireNonNull(tool, "tool");
-        return tool.hasUsableDurability() && satisfiesRequirements(tool);
+        return tool.meetsMinimumDurability(
+            minimumRemainingFraction
+        ) && satisfiesRequirements(tool);
     }
 
     /**
-     * Returns whether a chest tool may be transferred for a missing fresh
-     * demand. A merely usable but worn tool always returns {@code false}.
+     * Returns whether a chest tool may be transferred for a missing demand.
+     * Chest and player classifications deliberately share the same threshold
+     * so an accepted transfer cannot be rejected by the next snapshot.
      */
-    public boolean isFreshCompatibleChestCandidate(Tool<K, T> tool) {
+    public boolean isUsableCompatibleChestCandidate(Tool<K, T> tool) {
         Objects.requireNonNull(tool, "tool");
-        return tool.isFresh()
-            && tool.hasUsableDurability()
+        return tool.meetsMinimumDurability(
+            minimumRemainingFraction
+        )
             && satisfiesRequirements(tool);
     }
 

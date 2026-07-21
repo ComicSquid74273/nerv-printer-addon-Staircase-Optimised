@@ -19,16 +19,18 @@ class CriticalToolCarryPlanTest {
                         3,
                         "pickaxe",
                         21,
+                        100,
                         true
                     ),
                     new CriticalToolCarryPlan.ToolStack<>(
                         5,
                         "axe",
                         200,
+                        1000,
                         true
                     )
                 ),
-                20
+                0.20
             );
 
         assertEquals(
@@ -41,7 +43,7 @@ class CriticalToolCarryPlanTest {
     }
 
     @Test
-    void replacesToolsAtTheCriticalThreshold() {
+    void replacesToolsBelowTheCriticalThreshold() {
         CriticalToolCarryPlan.Result<String> result =
             CriticalToolCarryPlan.plan(
                 Set.of("pickaxe"),
@@ -49,11 +51,12 @@ class CriticalToolCarryPlanTest {
                     new CriticalToolCarryPlan.ToolStack<>(
                         7,
                         "pickaxe",
-                        20,
+                        19,
+                        100,
                         true
                     )
                 ),
-                20
+                0.20
             );
 
         assertEquals(Map.of("pickaxe", 1), result.requiredItemCounts());
@@ -72,16 +75,18 @@ class CriticalToolCarryPlanTest {
                         1,
                         "hoe",
                         100,
+                        200,
                         true
                     ),
                     new CriticalToolCarryPlan.ToolStack<>(
                         2,
                         "shears",
                         10,
+                        200,
                         true
                     )
                 ),
-                20
+                0.10
             );
 
         assertEquals(
@@ -102,22 +107,25 @@ class CriticalToolCarryPlanTest {
                         4,
                         "pickaxe",
                         200,
+                        500,
                         false
                     ),
                     new CriticalToolCarryPlan.ToolStack<>(
                         6,
                         "pickaxe",
                         40,
+                        500,
                         true
                     ),
                     new CriticalToolCarryPlan.ToolStack<>(
                         8,
                         "pickaxe",
                         300,
+                        500,
                         true
                     )
                 ),
-                20
+                0.05
             );
 
         assertEquals(Set.of(8), result.requiredKeepSlots());

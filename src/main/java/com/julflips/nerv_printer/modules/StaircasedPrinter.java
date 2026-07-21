@@ -65,6 +65,8 @@ import org.lwjgl.util.tinyfd.TinyFileDialogs;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.stream.Collectors;
@@ -134,10 +136,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final int TEARDOWN_BREAK_MAX_PENDING_TICKS = 1200;
     private static final double
         TEARDOWN_REACH_POSITION_TOLERANCE = 0.20;
+    private static final double
+        TEARDOWN_STANDING_EYE_HEIGHT = 1.62;
     private static final int MINING_RECOVERY_STABLE_SNAPSHOT_TICKS = 2;
     private static final int DEBUG_ACTION_BUDGET_INTERVAL_TICKS = 20;
     private static final int LOCAL_CYCLE_HEARTBEAT_TICKS = 20;
-    private static final int BUILD_TOOL_CRITICAL_DURABILITY = 20;
+    private static final double MINIMUM_TOOL_DURABILITY_FRACTION =
+        0.10;
     private static final int BUILD_MATERIAL_HOTBAR_SLOT_COUNT = 8;
     private static final int BUILD_REQUIRED_MANAGED_HOTBAR_SLOTS = 9;
     private static final int TEARDOWN_PICKAXE_HOTBAR_COUNT = 2;
@@ -403,12 +408,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Double> durabilityBuffer = sgAdvanced.add(new DoubleSetting.Builder()
-        .name("durability-buffer")
-        .description("The additional required durability for restocked mining tools on top of the predicted one (in %).")
-        .defaultValue(0.2)
-        .min(0)
-        .sliderRange(0, 1)
+    private final Setting<Double> minimumToolDurability = sgAdvanced.add(new DoubleSetting.Builder()
+        .name("minimum-tool-durability")
+        .description("Keep a compatible carried or chest tool while at least this fraction of its durability remains. Tools below it are replaced.")
+        .defaultValue(MINIMUM_TOOL_DURABILITY_FRACTION)
+        .min(MINIMUM_TOOL_DURABILITY_FRACTION)
+        .max(1)
+        .sliderRange(MINIMUM_TOOL_DURABILITY_FRACTION, 1)
         .build()
     );
 
@@ -878,6 +884,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     HashMap<Integer, Integer>
         optimizedDeferredMiningRouteAssignments;
     boolean circularMiningOptimizationReady;
+    CircularTeardownReachTopology.Snapshot
+        circularTeardownReachTopology;
+    Path circularTeardownReachTopologyFile;
+    HashMap<BlockPos, CircularTeardownTargetReference>
+        circularTeardownTargetReferences;
     int preferredRecoveredMiningPair;
     DurableTeardownRecoveryCursor.Cursor retainedTeardownRecoveryCursor;
     HashSet<BlockPos> confirmedBuildTargetsThisRun;
@@ -1156,6 +1167,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         optimizedDeferredMiningTargets = new HashMap<>();
         optimizedDeferredMiningRouteAssignments = new HashMap<>();
         circularMiningOptimizationReady = false;
+        circularTeardownReachTopology = null;
+        circularTeardownReachTopologyFile = null;
+        circularTeardownTargetReferences = new HashMap<>();
         preferredRecoveredMiningPair = -1;
         retainedTeardownRecoveryCursor = null;
         confirmedBuildTargetsThisRun = new HashSet<>();
@@ -1279,6 +1293,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         logisticsSidestepUsed = false;
         logisticsProgressWatchdog.reset();
         compactPlan = null;
+        circularTeardownReachTopology = null;
+        circularTeardownReachTopologyFile = null;
+        if (circularTeardownTargetReferences != null) {
+            circularTeardownTargetReferences.clear();
+        }
         northWalkwayRelativeY = null;
         generatedMapFile = null;
         currentMapArchived = false;
@@ -2503,6 +2522,23 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ItemStack before,
         int attempts
     ) {
+        if (ToolUtils.isTool(before)) {
+            pendingDumpTransfer = null;
+            warning(
+                "Refusing to send "
+                    + before.getName().getString()
+                    + " to the material DumpStation; tools may only "
+                    + "be transferred to registered used-tool chests."
+            );
+            debugLog(
+                "Dump",
+                "blocked tool transfer playerSlot=" + playerSlot
+                    + " item="
+                        + Registries.ITEM.getId(before.getItem())
+                    + " damage=" + before.getDamage()
+            );
+            return;
+        }
         if (mc.player.currentScreenHandler.syncId != 0) {
             failInventoryTransaction(
                 "Cannot submit an authoritative dump while a container "
@@ -2551,6 +2587,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     "Dump",
                     "staged retry no longer needed; local playerSlot="
                         + pending.playerSlot() + " is empty"
+                );
+                pendingDumpTransfer = null;
+                return false;
+            }
+            if (ToolUtils.isTool(stack)) {
+                debugLog(
+                    "Dump",
+                    "cancelled staged retry because playerSlot="
+                        + pending.playerSlot()
+                        + " now contains tool="
+                        + Registries.ITEM.getId(stack.getItem())
                 );
                 pendingDumpTransfer = null;
                 return false;
@@ -3693,8 +3740,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ) {
         if (plannedRepairToolDemand.containsKey(requestedItem)) {
             return isCompatiblePlannedRepairTool(stack)
-                && remainingToolDurability(stack)
-                    > BUILD_TOOL_CRITICAL_DURABILITY;
+                && hasMinimumToolDurability(stack);
         }
         if (strictMiningRestockActive
             && requestedItem == Items.COBBLESTONE) {
@@ -3708,7 +3754,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 ? strictMiningInventoryPlan
                     .isUsableCompatiblePlayerTool(tool)
                 : strictMiningInventoryPlan
-                    .isFreshCompatibleChestCandidate(tool);
+                    .isUsableCompatibleChestCandidate(tool);
         }
         return true;
     }
@@ -5515,6 +5561,35 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 }
             }
         }
+        boolean persistedMiningRecoveryCheckpoint =
+            state == State.Walking
+                && !checkpoints.isEmpty()
+                && isPersistedMiningRecoveryCheckpoint(
+                    checkpoints.getFirst()
+                );
+        if (persistedMiningRecoveryCheckpoint) {
+            Pair<Vec3d, Pair<String, BlockPos>> checkpoint =
+                checkpoints.getFirst();
+            BlockPos requiredSupport = supportBelowCheckpoint(
+                checkpoint.getLeft()
+            );
+            if (checkpoint.getRight().getRight() == null
+                || !requiredSupport.equals(
+                    checkpoint.getRight().getRight()
+                )
+                || !isWalkableExteriorRecoverySupport(
+                    requiredSupport
+                )) {
+                stopMovement();
+                error(
+                    "The verified exterior teardown recovery path "
+                        + "changed at "
+                        + requiredSupport.toShortString() + "."
+                );
+                toggle();
+                return;
+            }
+        }
         ActiveOrderedUTraversal activeOrderedUTraversal =
             activeOrderedUTraversal();
         if (state == State.MiningUTraversal
@@ -5653,7 +5728,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (activeOrderedUMovement
             || followingCircularConnector
             || state == State.MiningUTraversal
-            || activeCircularBuildPair >= 0) {
+            || activeCircularBuildPair >= 0
+            || persistedMiningRecoveryCheckpoint) {
             steerTowardGoal(movementGoal);
         }
 
@@ -5707,6 +5783,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             followingCircularConnector
                 || state.equals(State.MiningUTraversal)
                 || preciseCircularBuildCheckpoint
+                || persistedMiningRecoveryCheckpoint
                 || isLogisticsDetourCheckpoint(checkpoints.get(0));
         double checkpointDistance = usesThreeDimensionalCheckpoint
             ? PlayerUtils.distanceTo(checkpointGoal)
@@ -5723,6 +5800,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             followingCircularConnector
                 || (state == State.MiningUTraversal && isUTraversalCheckpoint(checkpoints.get(0)))
                 || preciseCircularBuildCheckpoint
+                || persistedMiningRecoveryCheckpoint
                 || isLogisticsDetourCheckpoint(checkpoints.get(0));
         String currentCheckpointAction =
             checkpoints.get(0).getRight().getLeft();
@@ -5750,7 +5828,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
         if (state == State.Walking
-            && preciseCircularBuildCheckpoint
+            && (preciseCircularBuildCheckpoint
+                || persistedMiningRecoveryCheckpoint)
             && isHorizontallyOverCheckpointSupport(checkpointGoal)
             && !isGroundedOnCheckpointSupport(checkpointGoal)) {
             stopMovement();
@@ -5800,6 +5879,43 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         return;
                     }
                     break;
+                case "persistedMiningRecoveryStep":
+                    break;
+                case "resumePersistedMiningFromWalkway": {
+                    BlockPos walkway = checkpointAction.getRight();
+                    BlockPos relativeWalkway = walkway == null
+                        ? null
+                        : walkway.subtract(mapCorner);
+                    if (relativeWalkway == null
+                        || relativeWalkway.getZ() != -1
+                        || northWalkwayRelativeY == null
+                        || relativeWalkway.getY()
+                            != northWalkwayRelativeY
+                        || !isSafeNorthWalkway(
+                            relativeWalkway.getX()
+                        )
+                        || !isPlayerStandingOnSupport(walkway)) {
+                        stopMovement();
+                        error(
+                            "Persisted teardown recovery did not reach "
+                                + "its verified north-walkway support."
+                        );
+                        toggle();
+                        return;
+                    }
+                    debugLog(
+                        "Recovery",
+                        "verified exterior recovery handoff support="
+                            + walkway.toShortString()
+                            + " retainedPair="
+                                + recoveredActiveMiningPair
+                            + " retainedSupportIndex="
+                                + recoveredActiveMiningTargetIndex
+                    );
+                    stopMovement();
+                    beginMapMining(true, true);
+                    return;
+                }
                 case "lineEnd":
                     activeCircularBuildPair = -1;
                     activeCircularConnectorIndex = -1;
@@ -6239,75 +6355,54 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     checkpoints.add(new Pair(mc.player.getEntityPos(), new Pair<>("miningLineEnd", null)));
                     break;
                 case "verifyUTools":
+                case "resumeUTools":
                     int miningPairIndex = checkpointAction.getRight().getX();
-                    CompactCircularNbtPlan.PairRoute miningRoute =
-                        compactPlan.pairRoutes().get(miningPairIndex);
-                    HashMap<Item, Integer> stillMissingTools =
-                        missingCircularMiningTools(miningRoute);
-                    if (stillMissingTools == null || !stillMissingTools.isEmpty()) {
-                        error(
-                            "Required worst-case tool durability was not available at the U entry. "
-                                + "Stopping before entering pair " + miningPairIndex + "."
-                        );
-                        toggle();
-                        return;
-                    }
-                    if (!hasCompleteTeardownScaffoldReserve()) {
-                        error(
-                            "The configured cobblestone scaffold reserve "
-                                + "was not complete at U entry for pair "
-                                + miningPairIndex + "."
-                        );
-                        toggle();
-                        return;
-                    }
-                    HotbarPreparation uHotbarPreparation =
-                        prepareTeardownHotbarLoadout();
-                    if (uHotbarPreparation
-                        != HotbarPreparation.READY) {
-                        if (uHotbarPreparation
-                            == HotbarPreparation.WAITING) {
-                            checkpoints.add(0, new Pair<>(
-                                checkpointGoal,
-                                new Pair<>(
-                                    "verifyUTools",
-                                    checkpointAction.getRight()
-                                )
-                            ));
-                        } else if (isActive()) {
+                    boolean enforceUEntryDurability =
+                        currentCheckpointAction.equals("verifyUTools");
+                    if (enforceUEntryDurability) {
+                        CompactCircularNbtPlan.PairRoute miningRoute =
+                            compactPlan.pairRoutes().get(miningPairIndex);
+                        HashMap<Item, Integer> stillMissingTools =
+                            missingCircularMiningTools(miningRoute);
+                        if (stillMissingTools == null) {
+                            error(
+                                "Could not authoritatively reconcile the "
+                                    + "teardown tools at the U entry for pair "
+                                    + miningPairIndex + "."
+                            );
                             toggle();
+                            return;
                         }
-                        stopMovement();
+                        if (!stillMissingTools.isEmpty()
+                            || !hasCompleteTeardownScaffoldReserve()) {
+                            info(
+                                "Teardown inventory changed before pair "
+                                    + miningPairIndex
+                                    + " entry; re-planning tool and "
+                                    + "cobblestone scaffold restock."
+                            );
+                            restartCurrentMiningAssignment();
+                            return;
+                        }
+                    }
+                    if (!prepareTeardownCheckpointHotbar(
+                        currentCheckpointAction,
+                        checkpointGoal,
+                        checkpointAction.getRight(),
+                        enforceUEntryDurability,
+                        false
+                    )) {
                         return;
                     }
-                    strictMiningRestockActive = false;
-                    strictMiningInventoryPlan = null;
-                    if (!activeContinuousTeardownStages.isEmpty()) {
-                        activeContinuousTeardownStageIndex = 0;
-                        activeCircularRouteSupportIndex = 0;
-                        activeContinuousTeardownArmed = true;
-                        debugLog(
-                            "Movement",
-                            "activated shared teardown U movement pair="
-                                + miningPairIndex
-                                + " currentSupport="
-                                + activeContinuousTeardownStages
-                                    .getFirst().support()
-                                    .toShortString()
-                                + (activeContinuousTeardownStages.size()
-                                        < 2
-                                    ? ""
-                                    : " nextSupport="
-                                        + activeContinuousTeardownStages
-                                            .get(1).support()
-                                            .toShortString())
-                                + " stages="
-                                + activeContinuousTeardownStages.size()
-                        );
-                    }
+                    armContinuousTeardownRoute(
+                        "Movement",
+                        "shared teardown U movement",
+                        miningPairIndex
+                    );
                     stopMovement();
                     return;
                 case "verifyTeardownScaffold":
+                case "resumeTeardownScaffold":
                     ActiveTeardownScaffoldRecovery scaffoldRecovery =
                         activeTeardownScaffoldRecovery;
                     int scaffoldPair =
@@ -6327,59 +6422,52 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         );
                         return;
                     }
-                    HashMap<Item, Integer> missingScaffoldTools =
-                        missingMiningTools(
-                            scaffoldRecovery.plannedToolStates()
-                                .keySet(),
-                            scaffoldRecovery.plannedToolStates()
+                    boolean enforceScaffoldEntryDurability =
+                        currentCheckpointAction.equals(
+                            "verifyTeardownScaffold"
                         );
-                    if (missingScaffoldTools == null
-                        || !missingScaffoldTools.isEmpty()
-                        || !hasCompleteTeardownScaffoldReserve()) {
-                        error(
-                            "Sparse teardown scaffold inventory changed "
-                                + "before pair " + scaffoldPair
-                                + " entry."
-                        );
-                        toggle();
-                        return;
-                    }
-                    HotbarPreparation scaffoldTools =
-                        prepareTeardownHotbarLoadout();
-                    HotbarPreparation scaffoldMaterial =
-                        scaffoldTools == HotbarPreparation.READY
-                            ? prepareTeardownScaffoldHotbar()
-                            : scaffoldTools;
-                    if (scaffoldMaterial
-                        != HotbarPreparation.READY) {
-                        if (scaffoldMaterial
-                            == HotbarPreparation.WAITING) {
-                            checkpoints.add(0, new Pair<>(
-                                checkpointGoal,
-                                new Pair<>(
-                                    "verifyTeardownScaffold",
-                                    checkpointAction.getRight()
-                                )
-                            ));
-                        } else if (isActive()) {
-                            toggle();
+                    if (enforceScaffoldEntryDurability) {
+                        HashMap<Item, Integer> missingScaffoldTools =
+                            missingMiningTools(
+                                scaffoldRecovery.plannedToolStates()
+                                    .keySet(),
+                                scaffoldRecovery.plannedToolStates()
+                            );
+                        if (missingScaffoldTools == null) {
+                            failTeardownMining(
+                                "Could not authoritatively reconcile sparse "
+                                    + "teardown scaffold tools at entry."
+                            );
+                            return;
                         }
-                        stopMovement();
+                        if (!missingScaffoldTools.isEmpty()
+                            || !hasCompleteTeardownScaffoldReserve()) {
+                            info(
+                                "Sparse teardown scaffold inventory changed "
+                                    + "before pair " + scaffoldPair
+                                    + " entry; re-planning tool and "
+                                    + "cobblestone restock."
+                            );
+                            restartCurrentMiningAssignment();
+                            return;
+                        }
+                    }
+                    if (!prepareTeardownCheckpointHotbar(
+                        currentCheckpointAction,
+                        checkpointGoal,
+                        checkpointAction.getRight(),
+                        enforceScaffoldEntryDurability,
+                        true
+                    )) {
                         return;
                     }
-                    strictMiningRestockActive = false;
-                    strictMiningInventoryPlan = null;
-                    activeContinuousTeardownStageIndex = 0;
-                    activeCircularRouteSupportIndex = 0;
-                    activeContinuousTeardownArmed = true;
-                    debugLog(
+                    armContinuousTeardownRoute(
                         "TeardownScaffold",
-                        "activated scaffold route pair="
-                            + scaffoldPair + " phase="
-                            + teardownScaffoldPhase + " stages="
-                            + activeContinuousTeardownStages.size()
+                        "scaffold route phase="
+                            + teardownScaffoldPhase
                             + " cobblestoneSlot="
-                            + activeTeardownScaffoldHotbarSlot
+                            + activeTeardownScaffoldHotbarSlot,
+                        scaffoldPair
                     );
                     stopMovement();
                     return;
@@ -6387,22 +6475,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     int independentLine = checkpointAction.getRight().getX();
                     HashMap<Item, Integer> missingIndependentTools =
                         missingMiningTools(independentMiningTargets(independentLine));
-                    if (missingIndependentTools == null
-                        || !missingIndependentTools.isEmpty()) {
+                    if (missingIndependentTools == null) {
                         error(
-                            "Required worst-case tool durability was not available at "
-                                + "the entry to independent line " + independentLine + "."
+                            "Could not authoritatively reconcile the "
+                                + "teardown tools at independent line "
+                                + independentLine + "."
                         );
                         toggle();
                         return;
                     }
-                    if (!hasCompleteTeardownScaffoldReserve()) {
-                        error(
-                            "The configured cobblestone scaffold reserve "
-                                + "was not complete at independent line "
-                                + independentLine + "."
+                    if (!missingIndependentTools.isEmpty()
+                        || !hasCompleteTeardownScaffoldReserve()) {
+                        info(
+                            "Teardown inventory changed before independent "
+                                + "line " + independentLine
+                                + "; re-planning tool and cobblestone "
+                                + "scaffold restock."
                         );
-                        toggle();
+                        restartCurrentMiningAssignment();
                         return;
                     }
                     HotbarPreparation independentHotbarPreparation =
@@ -10165,7 +10255,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 targetState
             )
             && remainingToolDurability(reserved)
-                > BUILD_TOOL_CRITICAL_DURABILITY) {
+                >= minimumReusableToolDurability(reserved)) {
             if (!InvUtils.swap(
                 plannedBuildToolHotbarSlot,
                 false
@@ -11410,8 +11500,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private boolean isCompatiblePlannedRepairTool(ItemStack stack) {
         if (stack.isEmpty()
             || !plannedRepairToolDemand.containsKey(stack.getItem())
-            || remainingToolDurability(stack)
-                <= BUILD_TOOL_CRITICAL_DURABILITY) {
+            || !hasMinimumToolDurability(stack)) {
             return false;
         }
         Integer minimumEfficiency =
@@ -11534,6 +11623,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return action.equals("preparePair")
             || action.equals("uBuildRecoveryExit")
             || action.equals("finishPair");
+    }
+
+    private boolean isPersistedMiningRecoveryCheckpoint(
+        Pair<Vec3d, Pair<String, BlockPos>> checkpoint
+    ) {
+        String action = checkpoint.getRight().getLeft();
+        return action.equals("persistedMiningRecoveryStep")
+            || action.equals("resumePersistedMiningFromWalkway");
     }
 
     /**
@@ -12284,6 +12381,177 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (isNearRegisteredPosition(station.getRight())) return true;
         }
         return false;
+    }
+
+    /**
+     * Reconnect recovery may begin on the exterior logistics platform rather
+     * than on the exact north-walkway row. Accepting that location as merely
+     * "safe" would still allow the normal checkpoint walker to cut diagonally
+     * across an unverified gap. Instead, prove a cardinal, grounded path back
+     * to any intact north-walkway support and enqueue every support in order.
+     */
+    private boolean schedulePersistedMiningExteriorRecovery() {
+        Optional<GroundedSupportPathPlanner.Plan> planned =
+            planPersistedMiningExteriorRecovery();
+        if (planned.isEmpty()) {
+            BlockPos support = mc.player == null || mapCorner == null
+                ? null
+                : supportBelowCheckpoint(
+                    mc.player.getEntityPos()
+                );
+            debugLog(
+                "Recovery",
+                "no connected grounded exterior approach from support="
+                    + (support == null
+                        ? "unknown"
+                        : support.toShortString())
+                    + " to the verified north walkway"
+            );
+            return false;
+        }
+
+        GroundedSupportPathPlanner.Plan plan = planned.orElseThrow();
+        checkpoints.clear();
+        List<GroundedSupportPathPlanner.Cell> path = plan.path();
+        for (int index = 1; index < path.size(); index++) {
+            BlockPos support = exteriorRecoveryWorld(path.get(index));
+            boolean endpoint = index == path.size() - 1;
+            checkpoints.add(new Pair<>(
+                walkingPosition(support),
+                new Pair<>(
+                    endpoint
+                        ? "resumePersistedMiningFromWalkway"
+                        : "persistedMiningRecoveryStep",
+                    support
+                )
+            ));
+        }
+        if (checkpoints.isEmpty()) return false;
+
+        BlockPos start = exteriorRecoveryWorld(path.getFirst());
+        BlockPos endpoint = exteriorRecoveryWorld(plan.endpoint());
+        state = State.Walking;
+        stopMovement();
+        info(
+            "Recovered teardown is on a connected exterior support; "
+                + "following the verified grounded approach to the "
+                + "north walkway before resuming pair "
+                + recoveredActiveMiningPair + "."
+        );
+        debugLog(
+            "Recovery",
+            "planned persisted teardown exterior approach start="
+                + start.toShortString()
+                + " endpoint=" + endpoint.toShortString()
+                + " supports=" + path.size()
+                + " retainedPair=" + recoveredActiveMiningPair
+                + " retainedSupportIndex="
+                    + recoveredActiveMiningTargetIndex
+        );
+        return true;
+    }
+
+    private Optional<GroundedSupportPathPlanner.Plan>
+        planPersistedMiningExteriorRecovery() {
+        if (mc.player == null
+            || mc.world == null
+            || mapCorner == null
+            || map == null
+            || workingInterval == null
+            || northWalkwayRelativeY == null) {
+            return Optional.empty();
+        }
+
+        BlockPos startWorld = supportBelowCheckpoint(
+            mc.player.getEntityPos()
+        );
+        if (!isPlayerStandingOnSupport(startWorld)
+            || !isWalkableExteriorRecoverySupport(startWorld)) {
+            return Optional.empty();
+        }
+        BlockPos startRelative = startWorld.subtract(mapCorner);
+        // Z=-1 is the canonical walkway itself. Z>=0 is inside the map and
+        // must only be recovered through an owned U route.
+        if (startRelative.getZ() >= -1) return Optional.empty();
+
+        int minimumX = Math.max(0, workingInterval.getLeft());
+        int maximumX = Math.min(
+            map.length - 1,
+            workingInterval.getRight()
+        );
+        if (startRelative.getX() < minimumX
+            || startRelative.getX() > maximumX) {
+            return Optional.empty();
+        }
+
+        HashSet<GroundedSupportPathPlanner.Cell> goals =
+            new HashSet<>();
+        for (int x = minimumX; x <= maximumX; x++) {
+            if (isSafeNorthWalkway(x)) {
+                goals.add(new GroundedSupportPathPlanner.Cell(
+                    x,
+                    northWalkwayRelativeY,
+                    -1
+                ));
+            }
+        }
+        if (goals.isEmpty()) return Optional.empty();
+
+        GroundedSupportPathPlanner.Cell start =
+            new GroundedSupportPathPlanner.Cell(
+                startRelative.getX(),
+                startRelative.getY(),
+                startRelative.getZ()
+            );
+        int horizontalDepth = -1 - startRelative.getZ();
+        int minimumY = Math.min(
+            startRelative.getY(),
+            northWalkwayRelativeY
+        ) - horizontalDepth;
+        int maximumY = Math.max(
+            startRelative.getY(),
+            northWalkwayRelativeY
+        ) + horizontalDepth;
+        long domainSize = (long) (maximumX - minimumX + 1)
+            * (horizontalDepth + 1L)
+            * (maximumY - minimumY + 1L);
+        int nodeCap = (int) Math.min(
+            16_384L,
+            Math.max(64L, domainSize)
+        );
+
+        return GroundedSupportPathPlanner.findPath(
+            start,
+            goals,
+            candidate ->
+                candidate.x() >= minimumX
+                    && candidate.x() <= maximumX
+                    && candidate.z() >= startRelative.getZ()
+                    && candidate.z() <= -1
+                    && candidate.y() >= minimumY
+                    && candidate.y() <= maximumY,
+            candidate -> isWalkableExteriorRecoverySupport(
+                exteriorRecoveryWorld(candidate)
+            ),
+            nodeCap
+        );
+    }
+
+    private BlockPos exteriorRecoveryWorld(
+        GroundedSupportPathPlanner.Cell cell
+    ) {
+        return mapCorner.add(cell.x(), cell.y(), cell.z());
+    }
+
+    private boolean isWalkableExteriorRecoverySupport(
+        BlockPos support
+    ) {
+        if (mc.world == null) return false;
+        BlockState state = MapAreaCache.getCachedBlockState(support);
+        return !state.isAir()
+            && state.isSolidBlock(mc.world, support)
+            && MapAreaCache.getCachedBlockState(support.up()).isAir()
+            && MapAreaCache.getCachedBlockState(support.up(2)).isAir();
     }
 
     private boolean isNearRegisteredPosition(Vec3d position) {
@@ -13069,6 +13337,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private void refreshCircularMiningTraversalOptimization() {
+        refreshCircularMiningTraversalOptimization(
+            preferredRecoveredMiningPair
+        );
+    }
+
+    private void refreshCircularMiningTraversalOptimization(
+        int mandatoryLocalPair
+    ) {
         optimizedCircularMiningTraversalPairs.clear();
         optimizedDeferredMiningTargets.clear();
         optimizedDeferredMiningRouteAssignments.clear();
@@ -13077,6 +13353,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || compactPlan == null
             || mapCorner == null
             || mc.player == null) {
+            return;
+        }
+        if (!ensureCircularTeardownReachTopology()) {
+            error(
+                "The compiled circular teardown reach plan is unavailable; "
+                    + "stopping before route ownership is assigned."
+            );
             return;
         }
 
@@ -13101,7 +13384,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
             boolean preferredLocalRoute =
                 route.pairIndex()
-                    == preferredRecoveredMiningPair;
+                    == mandatoryLocalPair;
             CircularTeardownRouteEligibility.Result eligibility =
                 CircularTeardownRouteEligibility.classify(
                     recovery.mode(),
@@ -13147,15 +13430,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
 
+        if (useCompiledIntactCircularTeardownPlan(
+            routes,
+            mandatoryLocalPair
+        )) {
+            return;
+        }
+
         ReachOptimizedTeardownPlan.Plan<BlockPos> plan =
             ReachOptimizedTeardownPlan.create(
                 routes,
                 (sourceTargets, destinationPair) ->
-                    monotonicTeardownReachSchedule(
+                    cachedTeardownReachSchedule(
                         sourceTargets,
-                        compactPlan.pairRoutes().get(
-                            destinationPair
-                        )
+                        destinationPair
                     )
             );
         optimizedCircularMiningTraversalPairs.addAll(
@@ -13198,61 +13486,158 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
-    private Optional<List<Integer>>
-        monotonicTeardownReachSchedule(
-            List<BlockPos> orderedSourceTargets,
-            CompactCircularNbtPlan.PairRoute destinationRoute
-        ) {
-        ArrayList<BlockReachWindow.Cell> supports =
-            new ArrayList<>();
-        for (BlockPos relative :
-            circularPairTargets(destinationRoute)) {
-            BlockPos world = mapCorner.add(relative);
-            supports.add(
-                new BlockReachWindow.Cell(
-                    world.getX(),
-                    world.getY(),
-                    world.getZ()
-                )
+    private boolean useCompiledIntactCircularTeardownPlan(
+        List<ReachOptimizedTeardownPlan.Route<BlockPos>> routes,
+        int mandatoryLocalPair
+    ) {
+        if (circularTeardownReachTopology == null
+            || mandatoryLocalPair >= 0
+            || routes.size()
+                != circularTeardownReachTopology.targetCounts().size()) {
+            return false;
+        }
+        for (ReachOptimizedTeardownPlan.Route<BlockPos> route : routes) {
+            int routeIndex = route.routeIndex();
+            if (routeIndex < 0
+                || routeIndex
+                    >= circularTeardownReachTopology.targetCounts().size()
+                || route.mustTraverse()
+                || !route.canHostRemoteTeardown()
+                || route.orderedTargets().size()
+                    != circularTeardownReachTopology.targetCounts().get(
+                        routeIndex
+                    )) {
+                return false;
+            }
+        }
+
+        HashMap<Integer, ReachOptimizedTeardownPlan.Route<BlockPos>>
+            routeByIndex = new HashMap<>();
+        routes.forEach(route ->
+            routeByIndex.put(route.routeIndex(), route)
+        );
+        optimizedCircularMiningTraversalPairs.addAll(
+            circularTeardownReachTopology.fullMapTraversalRoutes()
+        );
+        for (CircularTeardownReachTopology.RouteAssignment assignment
+             : circularTeardownReachTopology
+                .fullMapRouteAssignments()) {
+            ReachOptimizedTeardownPlan.Route<BlockPos> source =
+                routeByIndex.get(assignment.sourceRouteIndex());
+            CircularTeardownReachTopology.Relation relation =
+                circularTeardownReachTopology.relation(
+                    assignment.sourceRouteIndex(),
+                    assignment.destinationRouteIndex()
+                ).orElseThrow(() -> new IllegalStateException(
+                    "The compiled intact teardown assignment lost its "
+                        + "reach relation."
+                ));
+            if (!relation.preserveStartFullyReachable()
+                || relation.preserveStartDestinationSupports().size()
+                    != source.orderedTargets().size()) {
+                throw new IllegalStateException(
+                    "The compiled intact teardown assignment is incomplete."
+                );
+            }
+            ArrayList<
+                ReachOptimizedTeardownPlan.ScheduledTarget<BlockPos>
+            > scheduled = new ArrayList<>(source.orderedTargets().size());
+            for (int targetIndex = 0;
+                 targetIndex < source.orderedTargets().size();
+                 targetIndex++) {
+                scheduled.add(
+                    new ReachOptimizedTeardownPlan.ScheduledTarget<>(
+                        assignment.sourceRouteIndex(),
+                        source.orderedTargets().get(targetIndex),
+                        relation.preserveStartDestinationSupports().get(
+                            targetIndex
+                        ),
+                        targetIndex
+                    )
+                );
+            }
+            optimizedDeferredMiningTargets.computeIfAbsent(
+                assignment.destinationRouteIndex(),
+                ignored -> new ArrayList<>()
+            ).addAll(scheduled);
+            optimizedDeferredMiningRouteAssignments.put(
+                assignment.sourceRouteIndex(),
+                assignment.destinationRouteIndex()
             );
         }
-        double standingEyeHeight =
-            mc.player.getEyePos().y - mc.player.getY();
-        int previousSupport = 0;
-        ArrayList<Integer> schedule = new ArrayList<>(
+        optimizedDeferredMiningTargets.replaceAll((pair, targets) -> {
+            ArrayList<
+                ReachOptimizedTeardownPlan.ScheduledTarget<BlockPos>
+            > ordered = new ArrayList<>(targets);
+            ordered.sort((left, right) -> {
+                int support = Integer.compare(
+                    left.destinationSupportIndex(),
+                    right.destinationSupportIndex()
+                );
+                if (support != 0) return support;
+                int source = Integer.compare(
+                    left.sourceRouteIndex(),
+                    right.sourceRouteIndex()
+                );
+                if (source != 0) return source;
+                return Integer.compare(
+                    left.sourceTargetIndex(),
+                    right.sourceTargetIndex()
+                );
+            });
+            return List.copyOf(ordered);
+        });
+        circularMiningOptimizationReady = true;
+        debugLog(
+            "TeardownPlan",
+            "using persisted intact-map topology file="
+                + (circularTeardownReachTopologyFile == null
+                    ? "unknown"
+                    : circularTeardownReachTopologyFile.getFileName())
+                + " selected="
+                + circularTeardownReachTopology.fullMapTraversalRoutes()
+                + " remoteAssignments="
+                + optimizedDeferredMiningRouteAssignments
+        );
+        return true;
+    }
+
+    private Optional<List<Integer>>
+        cachedTeardownReachSchedule(
+            List<BlockPos> orderedSourceTargets,
+            int destinationPair
+        ) {
+        if (circularTeardownReachTopology == null
+            || orderedSourceTargets.isEmpty()) {
+            return Optional.empty();
+        }
+        int sourcePair = -1;
+        ArrayList<Integer> sourceTargetIndices = new ArrayList<>(
             orderedSourceTargets.size()
         );
         for (BlockPos relativeTarget : orderedSourceTargets) {
-            BlockPos world = mapCorner.add(relativeTarget);
-            Optional<BlockReachWindow.Window> window =
-                BlockReachWindow.find(
-                    new BlockReachWindow.Cell(
-                        world.getX(),
-                        world.getY(),
-                        world.getZ()
-                    ),
-                    supports,
-                    standingEyeHeight,
-                    Math.max(
-                        0.1,
-                        effectiveBuildInteractionRange()
-                            - TEARDOWN_REACH_POSITION_TOLERANCE
-                    )
+            CircularTeardownTargetReference reference =
+                circularTeardownTargetReferences.get(relativeTarget);
+            if (reference == null) {
+                throw new IllegalStateException(
+                    "The compiled teardown topology cannot identify target "
+                        + relativeTarget.toShortString() + "."
                 );
-            if (window.isEmpty()) return Optional.empty();
-            int selectedSupport = -1;
-            for (int candidate :
-                window.get().reachableSupportIndices()) {
-                if (candidate >= previousSupport) {
-                    selectedSupport = candidate;
-                    break;
-                }
             }
-            if (selectedSupport < 0) return Optional.empty();
-            previousSupport = selectedSupport;
-            schedule.add(previousSupport);
+            if (sourcePair < 0) {
+                sourcePair = reference.pairIndex();
+            } else if (sourcePair != reference.pairIndex()) {
+                throw new IllegalArgumentException(
+                    "A remote teardown schedule cannot mix source U routes."
+                );
+            }
+            sourceTargetIndices.add(reference.targetIndex());
         }
-        return Optional.of(List.copyOf(schedule));
+        return circularTeardownReachTopology.monotonicSchedule(
+            sourcePair,
+            sourceTargetIndices,
+            destinationPair
+        );
     }
 
     private List<
@@ -13524,8 +13909,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         Pair<String, BlockPos> action = checkpoint.getRight();
         if ((!action.getLeft().equals("verifyUTools")
+                && !action.getLeft().equals("resumeUTools")
                 && !action.getLeft().equals(
                     "verifyTeardownScaffold"
+                )
+                && !action.getLeft().equals(
+                    "resumeTeardownScaffold"
                 ))
             || action.getRight() == null) {
             return false;
@@ -13565,7 +13954,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         String action = checkpoint.getRight().getLeft();
         return action.isEmpty()
             || action.equals("verifyUTools")
+            || action.equals("resumeUTools")
             || action.equals("verifyTeardownScaffold")
+            || action.equals("resumeTeardownScaffold")
             || action.equals("uMiningRecoveryExit")
             || action.equals("uMiningTaskEnd")
             || action.equals("teardownScaffoldTaskEnd");
@@ -13785,7 +14176,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             localOutwardIndex >= 0 || standingOnTerminal;
         if (locallyOnRecoveryPath) {
             HashMap<Item, Integer> missingLocalTools =
-                missingMiningTools(
+                missingOperationalMiningTools(
                     plannedToolStates.keySet(),
                     plannedToolStates
                 );
@@ -13841,7 +14232,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         checkpoints.add(new Pair<>(
             walkingPosition(verificationSupport),
             new Pair<>(
-                "verifyTeardownScaffold",
+                locallyOnRecoveryPath
+                    ? "resumeTeardownScaffold"
+                    : "verifyTeardownScaffold",
                 new BlockPos(route.pairIndex(), 0, 0)
             )
         ));
@@ -14118,7 +14511,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             checkpoints.add(new Pair<>(
                 walkingPosition(local.support()),
                 new Pair<>(
-                    "verifyUTools",
+                    "resumeUTools",
                     new BlockPos(route.pairIndex(), 0, 0)
                 )
             ));
@@ -14314,7 +14707,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ) {
         String action = checkpoint.getRight().getLeft();
         return action.equals("verifyUTools")
+            || action.equals("resumeUTools")
             || action.equals("verifyTeardownScaffold")
+            || action.equals("resumeTeardownScaffold")
             || action.equals("uMiningRecoveryExit")
             || action.equals("uMiningTaskEnd")
             || action.equals("teardownScaffoldTaskEnd");
@@ -14719,6 +15114,48 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         BlockPos nextSupport = activeContinuousTeardownStages.get(
             nextSupportIndex
         ).support();
+        if (!isTeardownTargetReachableFromSupport(
+            target,
+            nextSupport
+        )) {
+            return false;
+        }
+
+        // A server acknowledgement for optional remote work may remain
+        // pending after its stage cursor advances. Do not let that lease move
+        // past any mandatory current-U work which becomes due at the proposed
+        // support. This keeps the primary U route inside its proven live
+        // deadline even under delayed acknowledgements.
+        int firstDueStage = Math.max(
+            0,
+            activeContinuousTeardownStageIndex
+        );
+        int lastDueStage = Math.min(
+            nextSupportIndex,
+            activeContinuousTeardownStages.size() - 1
+        );
+        for (int stageIndex = firstDueStage;
+             stageIndex <= lastDueStage;
+             stageIndex++) {
+            for (BlockPos dueTarget :
+                activeContinuousTeardownStages.get(stageIndex)
+                    .breakTargets()) {
+                if (!MapAreaCache.getCachedBlockState(dueTarget).isAir()
+                    && !isTeardownTargetReachableFromSupport(
+                        dueTarget,
+                        nextSupport
+                    )) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean isTeardownTargetReachableFromSupport(
+        BlockPos target,
+        BlockPos support
+    ) {
         double standingEyeHeight =
             mc.player.getEyePos().y - mc.player.getY();
         return BlockReachWindow.find(
@@ -14729,9 +15166,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             ),
             List.of(
                 new BlockReachWindow.Cell(
-                    nextSupport.getX(),
-                    nextSupport.getY(),
-                    nextSupport.getZ()
+                    support.getX(),
+                    support.getY(),
+                    support.getZ()
                 )
             ),
             standingEyeHeight,
@@ -15145,7 +15582,74 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
+    private boolean prepareTeardownCheckpointHotbar(
+        String checkpointAction,
+        Vec3d checkpointGoal,
+        BlockPos checkpointData,
+        boolean enforceEntryDurability,
+        boolean includeScaffoldMaterial
+    ) {
+        HotbarPreparation preparation =
+            prepareTeardownHotbarLoadout(
+                enforceEntryDurability
+            );
+        if (includeScaffoldMaterial
+            && preparation == HotbarPreparation.READY) {
+            preparation = prepareTeardownScaffoldHotbar();
+        }
+        if (preparation != HotbarPreparation.READY) {
+            if (preparation == HotbarPreparation.WAITING) {
+                checkpoints.add(0, new Pair<>(
+                    checkpointGoal,
+                    new Pair<>(
+                        checkpointAction,
+                        checkpointData
+                    )
+                ));
+            } else if (isActive()) {
+                toggle();
+            }
+            stopMovement();
+            return false;
+        }
+        strictMiningRestockActive = false;
+        strictMiningInventoryPlan = null;
+        return true;
+    }
+
+    private void armContinuousTeardownRoute(
+        String category,
+        String description,
+        int pairIndex
+    ) {
+        if (activeContinuousTeardownStages.isEmpty()) return;
+        activeContinuousTeardownStageIndex = 0;
+        activeCircularRouteSupportIndex = 0;
+        activeContinuousTeardownArmed = true;
+        debugLog(
+            category,
+            "activated " + description
+                + " pair=" + pairIndex
+                + " currentSupport="
+                    + activeContinuousTeardownStages
+                        .getFirst().support().toShortString()
+                + (activeContinuousTeardownStages.size() < 2
+                    ? ""
+                    : " nextSupport="
+                        + activeContinuousTeardownStages
+                            .get(1).support().toShortString())
+                + " stages="
+                    + activeContinuousTeardownStages.size()
+        );
+    }
+
     private HotbarPreparation prepareTeardownHotbarLoadout() {
+        return prepareTeardownHotbarLoadout(true);
+    }
+
+    private HotbarPreparation prepareTeardownHotbarLoadout(
+        boolean enforceEntryDurability
+    ) {
         if (confirmedMiningHotbarSwap.isPending()
             || confirmedBuildHotbarSwap.isPending()
             || pendingInventoryMetadataSwap != null) {
@@ -15173,7 +15677,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     && minimum.containsKey(stack.getItem())
                     && isUsableTeardownLoadoutTool(
                         stack,
-                        stack.getItem()
+                        stack.getItem(),
+                        enforceEntryDurability
                     )) {
                     current.put(slot, stack.getItem());
                 }
@@ -15200,14 +15705,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 mc.player.getInventory().getStack(targetSlot);
             if (isUsableTeardownLoadoutTool(
                 target,
-                expectedItem
+                expectedItem,
+                enforceEntryDurability
             )) {
                 continue;
             }
 
             int sourceSlot =
                 findBestTeardownMainInventoryTool(
-                    expectedItem
+                    expectedItem,
+                    enforceEntryDurability
                 );
             if (sourceSlot < 0) {
                 error(
@@ -15364,9 +15871,23 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ItemStack stack,
         Item expectedItem
     ) {
+        return isUsableTeardownLoadoutTool(
+            stack,
+            expectedItem,
+            true
+        );
+    }
+
+    private boolean isUsableTeardownLoadoutTool(
+        ItemStack stack,
+        Item expectedItem,
+        boolean enforceEntryDurability
+    ) {
         if (stack.isEmpty()
             || !stack.getItem().equals(expectedItem)
-            || remainingToolDurability(stack) <= 1) {
+            || !(enforceEntryDurability
+                ? hasMinimumToolDurability(stack)
+                : hasOperationalToolDurability(stack))) {
             return false;
         }
         ItemStack template = toolSet.stream()
@@ -15386,7 +15907,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private int findBestTeardownMainInventoryTool(
-        Item expectedItem
+        Item expectedItem,
+        boolean enforceEntryDurability
     ) {
         int bestSlot = -1;
         int bestRemaining = -1;
@@ -15396,7 +15918,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 mc.player.getInventory().getStack(slot);
             if (!isUsableTeardownLoadoutTool(
                 stack,
-                expectedItem
+                expectedItem,
+                enforceEntryDurability
             )) {
                 continue;
             }
@@ -15430,7 +15953,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             bestTool,
             targetState,
             -1,
-            false
+            false,
+            false,
+            0.0
         );
         if (confirmedMiningHotbarSwap.isPending()) return false;
 
@@ -15450,10 +15975,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                             bestTool,
                             targetState
                         )
-                            || remainingToolDurability(
+                            || !hasOperationalToolDurability(
                                 mc.player.getInventory()
                                     .getStack(slot)
-                            ) <= 1)
+                            ))
                     .findFirst();
             if (plannedTarget.isEmpty()) {
                 error(
@@ -15488,7 +16013,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             stopMovement();
             return false;
         }
-        error("Required mining tool is missing from the inventory: " + bestTool.getName().getString() + ".");
+        if (state == State.MiningUTraversal
+            || state == State.AwaitUBlockBreak) {
+            info(
+                "No operational "
+                    + bestTool.getName().getString()
+                    + " remains in the preloaded teardown loadout; "
+                    + "leaving the U through its verified endpoint "
+                    + "before rebuilding the next entry plan."
+            );
+            miningRecoveryPending = true;
+            miningRecoveryNeedsTools = false;
+            stopMovement();
+            return false;
+        }
+        error(
+            "Required mining tool is missing from the inventory: "
+                + bestTool.getName().getString() + "."
+        );
         toggle();
         return false;
     }
@@ -15511,7 +16053,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 continue;
             }
             int remaining = remainingToolDurability(stack);
-            if (remaining <= 1) continue;
+            if (!hasOperationalToolDurability(stack)) continue;
             double score =
                 ToolUtils.getEffectiveMiningScore(
                     stack,
@@ -15553,6 +16095,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean accountRepairShadow,
         boolean requireMainInventory
     ) {
+        return findBestMiningInventorySlot(
+            preferredTool,
+            targetState,
+            excludedSlot,
+            accountRepairShadow,
+            requireMainInventory,
+            minimumToolDurabilityFraction()
+        );
+    }
+
+    private int findBestMiningInventorySlot(
+        ItemStack preferredTool,
+        BlockState targetState,
+        int excludedSlot,
+        boolean accountRepairShadow,
+        boolean requireMainInventory,
+        double minimumRemainingFraction
+    ) {
         int bestSlot = -1;
         double bestMiningScore = Double.NEGATIVE_INFINITY;
         int bestRemainingDurability = -1;
@@ -15580,7 +16140,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     );
                 }
             }
-            if (remaining <= 1) continue;
+            if (!ToolDurabilityPolicy.isReusable(
+                remaining,
+                stack.getMaxDamage(),
+                minimumRemainingFraction
+            )) continue;
             double miningScore =
                 ToolUtils.getEffectiveMiningScore(stack, targetState);
             boolean better = miningScore > bestMiningScore
@@ -15842,17 +16406,45 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             : Math.max(0, stack.getMaxDamage() - stack.getDamage());
     }
 
-    private int usableToolDurability(int slot, ItemStack stack) {
-        if (stack.getMaxDamage() <= 0) return 0;
-        int shadowUses = Optional.ofNullable(
-                repairToolShadows.get(slot)
-            )
-            .map(RepairToolShadow::unacknowledgedUses)
-            .orElse(0);
-        return Math.max(
-            0,
-            remainingToolDurability(stack) - shadowUses - 1
+    private int minimumReusableToolDurability(ItemStack stack) {
+        return ToolDurabilityPolicy.minimumRemaining(
+            stack.getMaxDamage(),
+            minimumToolDurabilityFraction()
         );
+    }
+
+    private double minimumToolDurabilityFraction() {
+        // Clamp persisted configurations written by builds whose former
+        // default was five percent. Teardown must never plan below the new
+        // ten-percent entry contract.
+        return Math.max(
+            MINIMUM_TOOL_DURABILITY_FRACTION,
+            minimumToolDurability.get()
+        );
+    }
+
+    private boolean hasMinimumToolDurability(ItemStack stack) {
+        return hasToolDurability(
+            stack,
+            minimumToolDurabilityFraction()
+        );
+    }
+
+    private boolean hasOperationalToolDurability(ItemStack stack) {
+        return hasToolDurability(stack, 0.0);
+    }
+
+    private boolean hasToolDurability(
+        ItemStack stack,
+        double minimumRemainingFraction
+    ) {
+        return !stack.isEmpty()
+            && stack.getMaxDamage() > 1
+            && ToolDurabilityPolicy.isReusable(
+                remainingToolDurability(stack),
+                stack.getMaxDamage(),
+                minimumRemainingFraction
+            );
     }
 
     private void reserveToolUseShadow(int toolSlot) {
@@ -15860,19 +16452,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mc.player.getInventory().getStack(toolSlot);
         RepairToolShadow previous =
             repairToolShadows.get(toolSlot);
-        int nextDebits = previous == null
-            ? 1
-            : Math.addExact(
-                previous.unacknowledgedUses(),
-                1
-            );
+        // RepairMineController owns only one unresolved break lease at a
+        // time. A retry or a later lease replaces that single prediction;
+        // it must not accumulate a durability debit when Unbreaking causes
+        // the server to send no damage update for a successful break.
+        int observedRemaining = remainingToolDurability(stack);
         repairToolShadows.put(
             toolSlot,
             new RepairToolShadow(
-                previous == null
-                    ? remainingToolDurability(stack)
-                    : previous.observedRemainingDurability(),
-                nextDebits,
+                observedRemaining,
+                1,
                 serverHotbarUpdateSequences[toolSlot]
             )
         );
@@ -15881,10 +16470,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             "reserved predicted use playerSlot=" + toolSlot
                 + " item=" + Registries.ITEM.getId(stack.getItem())
                 + " observedRemaining="
-                    + (previous == null
-                        ? remainingToolDurability(stack)
-                        : previous.observedRemainingDurability())
-                + " unacknowledgedUses=" + nextDebits
+                    + observedRemaining
+                + " pendingUses=1"
+                + " replacedPending=" + (previous != null)
                 + " inventoryRevision="
                     + serverHotbarUpdateSequences[toolSlot]
         );
@@ -15916,13 +16504,37 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Collection<BlockPos> relativeTargets,
         Map<BlockPos, BlockState> plannedTargetStates
     ) {
+        return missingMiningTools(
+            relativeTargets,
+            plannedTargetStates,
+            minimumToolDurabilityFraction()
+        );
+    }
+
+    private HashMap<Item, Integer> missingOperationalMiningTools(
+        Collection<BlockPos> relativeTargets,
+        Map<BlockPos, BlockState> plannedTargetStates
+    ) {
+        return missingMiningTools(
+            relativeTargets,
+            plannedTargetStates,
+            0.0
+        );
+    }
+
+    private HashMap<Item, Integer> missingMiningTools(
+        Collection<BlockPos> relativeTargets,
+        Map<BlockPos, BlockState> plannedTargetStates,
+        double minimumRemainingFraction
+    ) {
         MiningToolInventoryPlan<
             Item,
             ItemStack,
             MiningToolRequirement
         > plan = createMiningToolInventoryPlan(
             relativeTargets,
-            plannedTargetStates
+            plannedTargetStates,
+            minimumRemainingFraction
         );
         if (plan == null) return null;
 
@@ -15956,12 +16568,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Collection<BlockPos> relativeTargets,
         Map<BlockPos, BlockState> plannedTargetStates
     ) {
+        return createMiningToolInventoryPlan(
+            relativeTargets,
+            plannedTargetStates,
+            minimumToolDurabilityFraction()
+        );
+    }
+
+    private MiningToolInventoryPlan<
+        Item,
+        ItemStack,
+        MiningToolRequirement
+    > createMiningToolInventoryPlan(
+        Collection<BlockPos> relativeTargets,
+        Map<BlockPos, BlockState> plannedTargetStates,
+        double minimumRemainingFraction
+    ) {
         Objects.requireNonNull(
             plannedTargetStates,
             "plannedTargetStates"
         );
-        HashMap<Item, Integer> rawUses = new HashMap<>();
-        HashMap<Item, Integer> maximumDamage = new HashMap<>();
+        LinkedHashSet<Item> requiredToolItems =
+            new LinkedHashSet<>();
         HashMap<Item, ArrayList<MiningToolRequirement>>
             compatibilityRequirements = new HashMap<>();
         LinkedHashMap<Item, Integer> minimumHotbarCounts =
@@ -15984,8 +16612,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return null;
             }
             Item item = bestTool.getItem();
-            rawUses.put(item, rawUses.getOrDefault(item, 0) + 1);
-            maximumDamage.put(item, bestTool.getMaxDamage() - 1);
+            requiredToolItems.add(item);
             compatibilityRequirements.computeIfAbsent(
                 item,
                 ignored -> new ArrayList<>()
@@ -16015,18 +16642,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
                 return null;
             }
-            rawUses.putIfAbsent(entry.getKey(), 0);
-            maximumDamage.putIfAbsent(
-                entry.getKey(),
-                template.getMaxDamage() - 1
-            );
+            requiredToolItems.add(entry.getKey());
             compatibilityRequirements.computeIfAbsent(
                 entry.getKey(),
                 ignored -> new ArrayList<>()
             ).add(MiningToolRequirement.itemOnly(template.copy()));
         }
 
-        HashMap<Item, Long> remainingDurability = new HashMap<>();
         HashMap<Item, Integer> compatibleCarriedCounts =
             new HashMap<>();
         ArrayList<
@@ -16035,7 +16657,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         for (int slot : availableSlots) {
             if (slot < 0 || slot >= 36) continue;
             ItemStack stack = mc.player.getInventory().getStack(slot);
-            if (stack.isEmpty() || !rawUses.containsKey(stack.getItem())) continue;
+            if (stack.isEmpty()
+                || !requiredToolItems.contains(stack.getItem())) {
+                continue;
+            }
             boolean compatible =
                 compatibilityRequirements.get(stack.getItem())
                     .stream()
@@ -16044,25 +16669,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                             stack,
                             requirement
                         )
-                    );
+            );
             if (!compatible) continue;
-            long remaining = usableToolDurability(slot, stack);
-            int shadowUses = Optional.ofNullable(
-                    repairToolShadows.get(slot)
-                )
-                .map(RepairToolShadow::unacknowledgedUses)
-                .orElse(0);
             carriedTools.add(
                 miningInventoryTool(
                     stack.copy(),
-                    shadowUses
+                    0
                 )
             );
-            remainingDurability.put(
-                stack.getItem(),
-                remainingDurability.getOrDefault(stack.getItem(), 0L) + remaining
-            );
-            if (remaining > 1) {
+            if (hasToolDurability(
+                stack,
+                minimumRemainingFraction
+            )) {
                 compatibleCarriedCounts.merge(
                     stack.getItem(),
                     1,
@@ -16073,28 +16691,23 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         LinkedHashMap<Item, Integer> missingTools =
             new LinkedHashMap<>();
-        for (Map.Entry<Item, Integer> entry : rawUses.entrySet()) {
-            Item item = entry.getKey();
-            int missing = MiningToolBudget.missingFreshToolsForTraversal(
-                entry.getValue(),
-                durabilityBuffer.get(),
-                maximumDamage.get(item),
-                remainingDurability.getOrDefault(item, 0L)
-            );
-            int minimumCountMissing = Math.max(
-                0,
+        for (Item item : requiredToolItems) {
+            int requiredCount = Math.max(
+                1,
                 minimumHotbarCounts.getOrDefault(item, 0)
+            );
+            int missing = Math.max(
+                0,
+                requiredCount
                     - compatibleCarriedCounts.getOrDefault(item, 0)
             );
-            missingTools.put(
-                item,
-                Math.max(missing, minimumCountMissing)
-            );
+            missingTools.put(item, missing);
         }
         return MiningToolInventoryPlan.plan(
             compatibilityRequirements,
             carriedTools,
             missingTools,
+            minimumRemainingFraction,
             (candidate, requirement) ->
                 isCompatibleMiningTool(
                     candidate,
@@ -16250,6 +16863,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         TeardownScaffoldMaterialPlan.Plan scaffoldReserve =
             teardownScaffoldMaterialPlan();
+        LinkedHashSet<Integer> usedToolDepositSlots =
+            teardownEntryUsedToolDepositSlots(
+                strictMiningInventoryPlan
+                    .compatibilityRequirements()
+                    .keySet()
+            );
+        if (usedToolDepositSlots == null) return false;
 
         int freeSlots = 0;
         for (int slot : availableSlots) {
@@ -16263,9 +16883,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 .mapToInt(RestockDemand::remainingAmount)
                 .sum()
                 + scaffoldReserve.additionalSlotsRequired();
+        int effectiveFreeSlots = Math.addExact(
+            freeSlots,
+            usedToolDepositSlots.size()
+        );
         debugRestock(
             "mining-tool capacity freeSlots=" + freeSlots
-                + " requiredFreshToolSlots=" + requiredSlots
+                + " retiringToolSlots="
+                    + usedToolDepositSlots.size()
+                + " effectiveFreeSlots=" + effectiveFreeSlots
+                + " requiredToolSlots=" + requiredSlots
                 + " scaffoldReserve="
                     + scaffoldReserve.onHandAmount() + "/"
                     + scaffoldReserve.targetAmount()
@@ -16274,11 +16901,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + " demandTypes="
                     + strictMiningInventoryPlan.restockDemands().size()
         );
-        if (requiredSlots > freeSlots) {
+        if (requiredSlots > effectiveFreeSlots) {
             error(
                 traversalName + " needs " + requiredSlots
-                    + " fresh tool slots, but only " + freeSlots
-                    + " inventory slots are empty. Stopping before mining."
+                    + " tool/scaffold slots, but only "
+                    + effectiveFreeSlots
+                    + " slots are or will become empty after retiring "
+                    + "below-threshold tools. Stopping before mining."
             );
             return false;
         }
@@ -16296,9 +16925,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return false;
             }
             info(
-                "Preloading §a" + demand.remainingAmount() + " fresh "
+                "Restocking §a" + demand.remainingAmount() + " usable "
                     + demand.item().getName().getString()
-                    + " for worst-case durability on " + traversalName
+                    + " below the configured "
+                    + String.format(
+                        Locale.ROOT,
+                        "%.1f%%",
+                        minimumToolDurabilityFraction() * 100.0
+                    )
+                    + " floor for " + traversalName
             );
             restockList.add(demand);
             debugRestock(
@@ -16349,6 +16984,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + " demands=" + restockList.size()
         );
         addClosestRestockCheckpoint();
+        prependTeardownEntryUsedToolDeposits(
+            usedToolDepositSlots
+        );
         return true;
     }
 
@@ -17113,7 +17751,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         for (int slot : availableSlots) {
             ItemStack stack =
                 mc.player.getInventory().getStack(slot);
-            if (!ToolUtils.isTool(stack)) continue;
+            if (!ToolUtils.isTool(stack)
+                || stack.getMaxDamage() <= 1) {
+                continue;
+            }
             List<MiningToolRequirement> requirementsForItem =
                 repairCompatibilityRequirements.getOrDefault(
                     stack.getItem(),
@@ -17139,6 +17780,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     slot,
                     stack.getItem(),
                     remainingToolDurability(stack),
+                    stack.getMaxDamage(),
                     compatible
                 )
             );
@@ -17147,7 +17789,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             CriticalToolCarryPlan.plan(
                 requiredRepairTools,
                 inventoryTools,
-                BUILD_TOOL_CRITICAL_DURABILITY
+                minimumToolDurabilityFraction()
             );
         HashMap<Item, Integer> repairToolDemand = new HashMap<>(
             toolCarryPlan.requiredItemCounts()
@@ -17155,8 +17797,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (emitDiagnostics) {
             debugLog(
                 "Inventory",
-                "critical tool carry threshold="
-                    + BUILD_TOOL_CRITICAL_DURABILITY
+                "critical tool carry minimumRemaining="
+                    + String.format(
+                        Locale.ROOT,
+                        "%.1f%%",
+                        minimumToolDurabilityFraction() * 100.0
+                    )
                     + " required=" + repairToolDemand
                     + " selectedSlots="
                         + toolCarryPlan.requiredKeepSlots()
@@ -18014,6 +18660,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
+    private record CircularTeardownTargetReference(
+        int pairIndex,
+        int targetIndex
+    ) {
+        private CircularTeardownTargetReference {
+            if (pairIndex < 0 || targetIndex < 0) {
+                throw new IllegalArgumentException(
+                    "Circular teardown target indices cannot be negative."
+                );
+            }
+        }
+    }
+
     private void startMining() {
         beginMapMining(true);
     }
@@ -18086,11 +18745,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (recoveringExistingMining
             && localSupport.isEmpty()
             && !isAtKnownSafeBuildRecoveryLocation()) {
+            if (schedulePersistedMiningExteriorRecovery()) {
+                return;
+            }
             error(
                 "Persisted teardown cannot resume because the player "
                     + "is neither on a verified remaining U route, "
-                    + "the safe north walkway, nor a registered "
-                    + "station. Stopping before diagonal movement."
+                    + "the safe north walkway, a connected grounded "
+                    + "exterior approach, nor a registered station. "
+                    + "Stopping before unsafe movement."
             );
             stopMovement();
             toggle();
@@ -18150,6 +18813,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         recoveredActiveMiningPair = -1;
         recoveredActiveMiningTargetIndex = -1;
         refreshCircularMiningTraversalOptimization();
+        if (circularTraversalForCurrentMap
+            && !circularMiningOptimizationReady) {
+            toggle();
+            return;
+        }
         mapCyclePhase = MapCyclePhase.MINING;
         if (!persistFileCoordinationCheckpoint("mining-start")) return;
         info("Start mining map");
@@ -18428,13 +19096,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 circularMiningLocalSupport(route);
             if (localSupport.isPresent()) {
                 HashMap<Item, Integer> locallyMissingTools =
-                    missingCircularMiningTools(route);
+                    missingOperationalMiningTools(
+                        circularMiningInventoryTargets(route),
+                        Map.of()
+                    );
                 if (locallyMissingTools == null) {
                     toggle();
                     return;
                 }
                 allowLocalResume =
-                    locallyMissingTools.isEmpty();
+                    locallyMissingTools.isEmpty()
+                        && hasCompleteTeardownScaffoldReserve();
                 if (!allowLocalResume) {
                     if (!calculateCircularMiningRecoveryEgress(
                         route,
@@ -18442,7 +19114,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     )) {
                         error(
                             "Could not generate a safe U egress before "
-                                + "tool restock for pair "
+                                + "tool or cobblestone scaffold restock "
+                                + "for pair "
                                 + route.pairIndex() + "."
                         );
                         toggle();
@@ -18457,7 +19130,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 allowLocalResume
             )) {
                 currentMiningPaired = true;
-                if (!ensureCircularMiningToolDurability(route)) {
+                if (!allowLocalResume
+                    && !ensureCircularMiningToolDurability(route)) {
                     toggle();
                 }
                 return;
@@ -18524,6 +19198,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             currentMiningLines
         );
         info("Re-evaluating mining route after an interrupted U traversal");
+        if (assignment.paired()) {
+            refreshCircularMiningTraversalOptimization(
+                assignment.anchorLine() / 2
+            );
+            if (!circularMiningOptimizationReady) {
+                toggle();
+                return;
+            }
+        }
         beginMiningAssignment(assignment);
     }
 
@@ -18683,6 +19366,160 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return items;
     }
 
+    /**
+     * Resolves the only legal destination for a tool removed from managed
+     * inventory. Typed single-chest registrations always win. The original
+     * Used Pickaxe Chest remains a compatibility destination only for
+     * pickaxes; axes and every other tool require their own typed chest.
+     */
+    private Pair<BlockPos, Vec3d> registeredUsedToolDestination(
+        Item item
+    ) {
+        Pair<BlockPos, Vec3d> typed = usedToolChests == null
+            ? null
+            : usedToolChests.get(item);
+        if (typed != null) return typed;
+        ItemStack stack = item.getDefaultStack();
+        return stack.isIn(ItemTags.PICKAXES)
+            ? usedToolChest
+            : null;
+    }
+
+    /**
+     * Selects exact below-threshold tool slots for retirement before a
+     * teardown entry. Only slots with a legal used-tool destination are
+     * counted as future free capacity. A required pickaxe/axe without its
+     * destination fails entry planning rather than leaking into a material
+     * dump or being overwritten by restock.
+     */
+    private LinkedHashSet<Integer> teardownEntryUsedToolDepositSlots(
+        Set<Item> requiredToolItems
+    ) {
+        Objects.requireNonNull(
+            requiredToolItems,
+            "requiredToolItems"
+        );
+        LinkedHashSet<Integer> slots = new LinkedHashSet<>();
+        for (int slot : availableSlots) {
+            if (slot < 0 || slot >= 36) continue;
+            ItemStack stack =
+                mc.player.getInventory().getStack(slot);
+            if (!ToolUtils.isTool(stack)
+                || stack.getMaxDamage() <= 1
+                || hasMinimumToolDurability(stack)) {
+                continue;
+            }
+            Pair<BlockPos, Vec3d> destination =
+                registeredUsedToolDestination(stack.getItem());
+            if (destination != null) {
+                slots.add(slot);
+                continue;
+            }
+            if (requiredToolItems.contains(stack.getItem())) {
+                error(
+                    "Cannot replace below-threshold "
+                        + stack.getName().getString()
+                        + " because its typed used-tool chest is not "
+                        + "registered. The tool was retained and teardown "
+                        + "will not enter the traversal."
+                );
+                return null;
+            }
+            warning(
+                "Retaining below-threshold "
+                    + stack.getName().getString()
+                    + " because no typed used-tool chest is registered."
+            );
+        }
+        return slots;
+    }
+
+    private void prependTeardownEntryUsedToolDeposits(
+        Set<Integer> depositSlots
+    ) {
+        if (depositSlots.isEmpty()) return;
+        usedToolDepositPlan.clear();
+        usedToolDepositSlotPlan.clear();
+        currentUsedToolDepositItems.clear();
+        currentUsedToolDepositSlots.clear();
+        pendingUsedToolDeposit = null;
+        activeUsedToolDepositChest = null;
+
+        HashMap<BlockPos, Pair<Vec3d, Set<Integer>>> destinations =
+            new HashMap<>();
+        HashMap<BlockPos, Set<Item>> destinationItems =
+            new HashMap<>();
+        for (int slot : depositSlots) {
+            ItemStack stack =
+                mc.player.getInventory().getStack(slot);
+            if (!ToolUtils.isTool(stack)
+                || hasMinimumToolDurability(stack)) {
+                continue;
+            }
+            Pair<BlockPos, Vec3d> destination =
+                registeredUsedToolDestination(stack.getItem());
+            if (destination == null) {
+                throw new IllegalStateException(
+                    "A planned teardown used-tool slot lost its typed "
+                        + "destination."
+                );
+            }
+            destinations.computeIfAbsent(
+                destination.getLeft(),
+                ignored -> new Pair<>(
+                    destination.getRight(),
+                    new LinkedHashSet<>()
+                )
+            ).getRight().add(slot);
+            destinationItems.computeIfAbsent(
+                destination.getLeft(),
+                ignored -> new LinkedHashSet<>()
+            ).add(stack.getItem());
+        }
+
+        ArrayList<Map.Entry<BlockPos, Pair<Vec3d, Set<Integer>>>>
+            orderedDestinations =
+                new ArrayList<>(destinations.entrySet());
+        orderedDestinations.sort(
+            Comparator.comparingDouble(entry ->
+                PlayerUtils.distanceTo(entry.getValue().getLeft()))
+        );
+        ArrayList<Pair<Vec3d, Pair<String, BlockPos>>>
+            depositCheckpoints = new ArrayList<>();
+        for (Map.Entry<BlockPos, Pair<Vec3d, Set<Integer>>> entry
+            : orderedDestinations) {
+            usedToolDepositPlan.put(
+                entry.getKey(),
+                Set.copyOf(
+                    destinationItems.getOrDefault(
+                        entry.getKey(),
+                        Set.of()
+                    )
+                )
+            );
+            usedToolDepositSlotPlan.put(
+                entry.getKey(),
+                Set.copyOf(entry.getValue().getRight())
+            );
+            depositCheckpoints.add(new Pair<>(
+                entry.getValue().getLeft(),
+                new Pair<>("usedToolChest", entry.getKey())
+            ));
+        }
+        checkpoints.addAll(0, depositCheckpoints);
+        info(
+            "Routing " + depositSlots.size()
+                + " below-"
+                + String.format(
+                    Locale.ROOT,
+                    "%.1f%%",
+                    minimumToolDurabilityFraction() * 100.0
+                )
+                + " teardown tool slot(s) to typed used-tool storage "
+                + "before traversal restock."
+        );
+    }
+
     private void prependPlannedBuildUsedToolDeposits() {
         if (!buildingActive
             || plannedBuildUsedToolDepositSlots.isEmpty()) {
@@ -18705,8 +19542,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 mc.player.getInventory().getStack(slot);
             if (!ToolUtils.isTool(stack)) continue;
             Pair<BlockPos, Vec3d> destination =
-                usedToolChests.get(stack.getItem());
-            if (destination == null) destination = usedToolChest;
+                registeredUsedToolDestination(stack.getItem());
             if (destination == null) {
                 warning(
                     "No used-tool chest is registered for "
@@ -18790,8 +19626,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         HashMap<BlockPos, Pair<Vec3d, Set<Item>>> destinations = new HashMap<>();
         for (Item item : getInventoryToolItems()) {
-            Pair<BlockPos, Vec3d> destination = usedToolChests.get(item);
-            if (destination == null) destination = usedToolChest;
+            Pair<BlockPos, Vec3d> destination =
+                registeredUsedToolDestination(item);
             if (destination == null) {
                 warning("No used-tool chest registered for " + item.getName().getString());
                 continue;
@@ -21591,6 +22427,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             map = generateMapArray(compactPlan);
             generateRuntimeBuildPlan(compactPlan);
             activeCompactPlanSha256 = compactPlanFingerprint();
+            loadOrCompileCircularTeardownReachTopology();
 
             boolean sourceAlreadyArchived = mapFile.getParentFile() != null
                 && mapFile.getParentFile().getName().equals(
@@ -21682,6 +22519,157 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         return FileFingerprint.sha256(
             canonical.toString().getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    private double compiledTeardownInteractionReach() {
+        return Math.max(
+            0.1,
+            effectiveBuildInteractionRange()
+                - TEARDOWN_REACH_POSITION_TOLERANCE
+        );
+    }
+
+    private boolean ensureCircularTeardownReachTopology() {
+        if (compactPlan == null
+            || activeCompactPlanSha256 == null
+            || mapFolder == null) {
+            return false;
+        }
+        double reach = compiledTeardownInteractionReach();
+        if (circularTeardownReachTopology != null
+            && Objects.equals(
+                circularTeardownReachTopology.compactPlanSha256(),
+                activeCompactPlanSha256
+            )
+            && Double.compare(
+                circularTeardownReachTopology.standingEyeHeight(),
+                TEARDOWN_STANDING_EYE_HEIGHT
+            ) == 0
+            && Double.compare(
+                circularTeardownReachTopology.maximumReach(),
+                reach
+            ) == 0) {
+            return true;
+        }
+        try {
+            loadOrCompileCircularTeardownReachTopology();
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            warning(
+                "Could not prepare the compiled circular teardown reach "
+                    + "plan: " + failure.getMessage()
+            );
+            circularTeardownReachTopology = null;
+            circularTeardownReachTopologyFile = null;
+            circularTeardownTargetReferences.clear();
+            return false;
+        }
+    }
+
+    private void loadOrCompileCircularTeardownReachTopology()
+        throws IOException {
+        if (compactPlan == null
+            || activeCompactPlanSha256 == null
+            || mapFolder == null) {
+            throw new IOException(
+                "The compact NBT identity is incomplete."
+            );
+        }
+        double reach = compiledTeardownInteractionReach();
+        Path cacheFile = CircularTeardownReachTopologyStore.pathFor(
+            mapFolder.toPath(),
+            activeCompactPlanSha256,
+            TEARDOWN_STANDING_EYE_HEIGHT,
+            reach
+        );
+        CircularTeardownReachTopology.Snapshot topology = null;
+        boolean loaded = false;
+        if (Files.isRegularFile(cacheFile)) {
+            try {
+                topology = CircularTeardownReachTopologyStore.read(
+                    cacheFile,
+                    activeCompactPlanSha256,
+                    TEARDOWN_STANDING_EYE_HEIGHT,
+                    reach
+                );
+                loaded = true;
+            } catch (IOException invalidCache) {
+                warning(
+                    "Rebuilding invalid circular teardown reach plan "
+                        + cacheFile.getFileName() + ": "
+                        + invalidCache.getMessage()
+                );
+            }
+        }
+        if (topology == null) {
+            ArrayList<CircularTeardownReachTopology.Route> routes =
+                new ArrayList<>(compactPlan.pairRoutes().size());
+            for (CompactCircularNbtPlan.PairRoute route
+                 : compactPlan.pairRoutes()) {
+                List<BlockReachWindow.Cell> targets =
+                    circularPairTargets(route).stream()
+                        .map(position -> new BlockReachWindow.Cell(
+                            position.getX(),
+                            position.getY(),
+                            position.getZ()
+                        ))
+                        .toList();
+                routes.add(
+                    new CircularTeardownReachTopology.Route(
+                        route.pairIndex(),
+                        targets
+                    )
+                );
+            }
+            topology = CircularTeardownReachTopology.compile(
+                activeCompactPlanSha256,
+                routes,
+                TEARDOWN_STANDING_EYE_HEIGHT,
+                reach
+            );
+            CircularTeardownReachTopologyStore.save(
+                cacheFile,
+                topology
+            );
+        }
+
+        HashMap<BlockPos, CircularTeardownTargetReference> references =
+            new HashMap<>();
+        for (CompactCircularNbtPlan.PairRoute route
+             : compactPlan.pairRoutes()) {
+            ArrayList<BlockPos> targets = circularPairTargets(route);
+            for (int targetIndex = 0;
+                 targetIndex < targets.size();
+                 targetIndex++) {
+                CircularTeardownTargetReference previous = references.put(
+                    targets.get(targetIndex),
+                    new CircularTeardownTargetReference(
+                        route.pairIndex(),
+                        targetIndex
+                    )
+                );
+                if (previous != null) {
+                    throw new IOException(
+                        "Circular U routes share teardown target "
+                            + targets.get(targetIndex).toShortString() + "."
+                    );
+                }
+            }
+        }
+        circularTeardownReachTopology = topology;
+        circularTeardownReachTopologyFile = cacheFile;
+        circularTeardownTargetReferences.clear();
+        circularTeardownTargetReferences.putAll(references);
+        debugLog(
+            "TeardownTopology",
+            (loaded ? "loaded" : "compiled and saved")
+                + " plan=" + cacheFile.getFileName()
+                + " reach=" + String.format(Locale.ROOT, "%.2f", reach)
+                + " fullTraversalPairs="
+                + topology.fullMapTraversalRoutes()
+                + " fullAssignments="
+                + topology.fullMapRouteAssignments()
         );
     }
 
