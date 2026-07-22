@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "comic-auto-portal",
+  "version": "${version}",
+  "name": "Comic Auto Portal",
+  "description": "Meteor addon that automates portal resume behavior at spawn.",
+  "authors": [
+    "comicSquid"
+  ],
+  "contact": {
+    "sources": "https://github.com/comicSquid/ComicAutoPortal"
+  },
+  "icon": "assets/template/icon.png",
+  "environment": "client",
+  "mixins": [
+    "comic-auto-portal.mixins.json"
+  ],
+  "entrypoints": {
+    "meteor": [
+      "com.comicsquid.autoprt.AutoPortalAddon"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "225,25,25",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": ["${mc_version}"],
+    "meteor-client": "*"
+  }
+}
