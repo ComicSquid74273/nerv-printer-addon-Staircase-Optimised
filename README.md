@@ -6,6 +6,10 @@ The main work is in [`nerv-printer-addon`](nerv-printer-addon). It keeps Nerv Pr
 
 > **Development status:** this is an optimization branch, not a general upstream release. Test a new build under supervision before leaving bots unattended.
 
+## Download
+
+[**Download the Nerv Printer JAR**](nerv-printer-1.21.11.jar)
+
 ## What is optimized
 
 - **Compact circular U traversal** — builds paired columns as one outbound leg, connector, and return leg instead of treating every line independently.
