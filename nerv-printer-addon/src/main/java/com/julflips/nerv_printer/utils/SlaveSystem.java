@@ -5,12 +5,12 @@ import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.entity.Entity;
-import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.network.packet.s2c.play.ChatMessageS2CPacket;
-import net.minecraft.network.packet.s2c.play.GameMessageS2CPacket;
-import net.minecraft.util.Pair;
-import net.minecraft.util.math.BlockPos;
+import net.minecraft.core.BlockPos;
+import net.minecraft.network.protocol.game.ClientboundPlayerChatPacket;
+import net.minecraft.network.protocol.game.ClientboundSystemChatPacket;
+import com.julflips.nerv_printer.utils.Tuple;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
@@ -55,7 +55,7 @@ public final class SlaveSystem {
     private static ArrayList<String> toBeConfirmedSlaves = new ArrayList<>();
     private static HashSet<String> removedSlaves = new HashSet<>();
     private static HashMap<String, Long> pendingRemovalSince = new HashMap<>();
-    private static HashMap<String, Pair<Integer, Integer>> assignedIntervals =
+    private static HashMap<String, Tuple<Integer, Integer>> assignedIntervals =
         new HashMap<>();
     private static HashSet<String> acknowledgedIntervals = new HashSet<>();
     private static String master = null;
@@ -646,16 +646,16 @@ public final class SlaveSystem {
             && acknowledgedIntervals.contains(slave);
     }
 
-    public static Pair<Integer, Integer> assignedIntervalFor(String slave) {
+    public static Tuple<Integer, Integer> assignedIntervalFor(String slave) {
         return assignedIntervals.get(slave);
     }
 
     public static void queueAssignedInterval(String slave) {
-        Pair<Integer, Integer> interval = assignedIntervals.get(slave);
+        Tuple<Integer, Integer> interval = assignedIntervals.get(slave);
         if (interval == null) return;
         queueDM(
             slave,
-            "interval:" + interval.getLeft() + ":" + interval.getRight()
+            "interval:" + interval.getA() + ":" + interval.getB()
         );
     }
 
@@ -686,7 +686,7 @@ public final class SlaveSystem {
         for (String slave : slaves) {
             if (!removedSlaves.contains(slave)) participatingSlaves.add(slave);
         }
-        ArrayList<Pair<Integer, Integer>> intervals = new ArrayList<>(
+        ArrayList<Tuple<Integer, Integer>> intervals = new ArrayList<>(
             partitionCircularColumns(participatingSlaves.size() + 1)
         );
         assignedIntervals.clear();
@@ -707,11 +707,11 @@ public final class SlaveSystem {
 
         for (int i = 0; i < intervals.size(); i++) {
             String slave = sortedSlaves.get(i);
-            Pair<Integer, Integer> interval = intervals.get(i);
+            Tuple<Integer, Integer> interval = intervals.get(i);
             assignedIntervals.put(slave, interval);
             SlaveSystem.queueDM(
                 slave,
-                "interval:" + interval.getLeft() + ":" + interval.getRight()
+                "interval:" + interval.getA() + ":" + interval.getB()
             );
         }
     }
@@ -736,8 +736,8 @@ public final class SlaveSystem {
             return;
         }
         ArrayList<String> foundPlayers = new ArrayList<>();
-        for (Entity entity : mc.world.getEntities()) {
-            if (entity instanceof PlayerEntity player && !mc.player.equals(player)) {
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (entity instanceof Player player && !mc.player.equals(player)) {
                 foundPlayers.add(player.getName().getString());
             }
         }
@@ -827,8 +827,8 @@ public final class SlaveSystem {
     }
 
     public static boolean canSeePlayer(String playerName) {
-        for (Entity entity : mc.world.getEntities()) {
-            if (entity instanceof PlayerEntity player && player.getName().getString().equals(playerName)) {
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (entity instanceof Player player && player.getName().getString().equals(playerName)) {
                 return true;
             }
         }
@@ -872,10 +872,10 @@ public final class SlaveSystem {
             switch (command) {
                 case "interval":
                     if (colonSplit.length < 3) break;
-                    Pair<Integer, Integer> interval = new Pair<>(Integer.valueOf(colonSplit[1]), Integer.valueOf(colonSplit[2]));
+                    Tuple<Integer, Integer> interval = new Tuple<>(Integer.valueOf(colonSplit[1]), Integer.valueOf(colonSplit[2]));
                     printerModule.setInterval(interval);
                     queueMasterDM(
-                        "intervalAck:" + interval.getLeft() + ":" + interval.getRight()
+                        "intervalAck:" + interval.getA() + ":" + interval.getB()
                     );
                     break;
                 case "pause":
@@ -1017,12 +1017,12 @@ public final class SlaveSystem {
                     break;
                 case "intervalAck": {
                     if (colonSplit.length < 3) break;
-                    Pair<Integer, Integer> expected = assignedIntervals.get(sender);
+                    Tuple<Integer, Integer> expected = assignedIntervals.get(sender);
                     if (expected == null) break;
                     Integer left = Integer.valueOf(colonSplit[1]);
                     Integer right = Integer.valueOf(colonSplit[2]);
-                    if (expected.getLeft().equals(left)
-                        && expected.getRight().equals(right)) {
+                    if (expected.getA().equals(left)
+                        && expected.getB().equals(right)) {
                         acknowledgedIntervals.add(sender);
                         printerModule.slaveIntervalReady(sender);
                     }
@@ -1065,7 +1065,7 @@ public final class SlaveSystem {
      * important here: ceil-sized chunks can produce fewer chunks than bots
      * for counts such as 9 or 12, leaving a configured slave unassigned.
      */
-    static List<Pair<Integer, Integer>> partitionCircularColumns(
+    static List<Tuple<Integer, Integer>> partitionCircularColumns(
         int botCount
     ) {
         if (botCount < 1 || botCount > 64) {
@@ -1073,13 +1073,13 @@ public final class SlaveSystem {
                 "botCount must be between 1 and 64."
             );
         }
-        ArrayList<Pair<Integer, Integer>> intervals =
+        ArrayList<Tuple<Integer, Integer>> intervals =
             new ArrayList<>(botCount);
         for (int index = 0; index < botCount; index++) {
             int startPair = index * 64 / botCount;
             int endPair = (index + 1) * 64 / botCount - 1;
             intervals.add(
-                new Pair<>(startPair * 2, endPair * 2 + 1)
+                new Tuple<>(startPair * 2, endPair * 2 + 1)
             );
         }
         return List.copyOf(intervals);
@@ -1089,11 +1089,11 @@ public final class SlaveSystem {
     private static void onReceivePacket(PacketEvent.Receive event) {
         if (printerModule == null || isFileMode()) return;
 
-        if (event.packet instanceof ChatMessageS2CPacket packet) {
-            handleMessage(packet.body().content(), packet.serializedParameters().name().getString());
+        if (event.packet instanceof ClientboundPlayerChatPacket packet) {
+            handleMessage(packet.body().content(), packet.chatType().name().getString());
         }
 
-        if (event.packet instanceof GameMessageS2CPacket packet) {
+        if (event.packet instanceof ClientboundSystemChatPacket packet) {
             handleMessage(packet.content().getString(), null);
         }
     }
@@ -1109,13 +1109,13 @@ public final class SlaveSystem {
             pollFileBus();
             return;
         }
-        if (mc.getNetworkHandler() == null) return;
+        if (mc.getConnection() == null) return;
         if (timeout > 0) timeout--;
         if (!toBeSentMessages.isEmpty()) {
             if (timeout <= 0) {
                 String message = toBeSentMessages.remove(0);
                 if (randomLength > 0) message += ":" + UUID.randomUUID().toString().substring(0, randomLength);
-                mc.getNetworkHandler().sendChatCommand(message);
+                mc.getConnection().sendCommand(message);
                 timeout = commandDelay;
             }
         }

@@ -1,10 +1,9 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.util.math.BlockPos;
-
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalInt;
+import net.minecraft.core.BlockPos;
 
 /**
  * Resolves monotonic progress along an ordered walking route from the

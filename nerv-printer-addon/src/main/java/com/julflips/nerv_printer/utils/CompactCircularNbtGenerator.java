@@ -1,12 +1,11 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtElement;
-import net.minecraft.nbt.NbtInt;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
-import net.minecraft.nbt.NbtList;
-import net.minecraft.nbt.NbtSizeTracker;
-
+import net.minecraft.nbt.Tag;
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -39,7 +38,7 @@ public final class CompactCircularNbtGenerator {
     }
 
     public record GeneratedNbt(
-        NbtCompound root,
+        CompoundTag root,
         CompactCircularNbtPlan.Result plan,
         List<String> paletteNames
     ) {
@@ -54,7 +53,7 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
-    public static GeneratedNbt generate(NbtCompound sourceRoot) {
+    public static GeneratedNbt generate(CompoundTag sourceRoot) {
         if (sourceRoot != null && sourceRoot.get(MARKER_KEY) != null) {
             throw fail("A marked compact NBT must be loaded with loadOrGenerate().");
         }
@@ -67,7 +66,7 @@ public final class CompactCircularNbtGenerator {
      * canonical-regenerated before use; the marker or filename is never trusted
      * as proof that their geometry is valid.
      */
-    public static LoadedNbt loadOrGenerate(NbtCompound inputRoot) {
+    public static LoadedNbt loadOrGenerate(CompoundTag inputRoot) {
         if (inputRoot == null) throw fail("The structure root is missing.");
         if (inputRoot.get(MARKER_KEY) != null) {
             validateMarker(inputRoot);
@@ -80,7 +79,7 @@ public final class CompactCircularNbtGenerator {
         IllegalArgumentException sourceFailure;
         try {
             GeneratedNbt generated = generateCanonical(inputRoot);
-            NbtCompound legacyForm = withoutMarker(generated.root());
+            CompoundTag legacyForm = withoutMarker(generated.root());
             if (legacyForm.equals(inputRoot)) {
                 return new LoadedNbt(generated, InputKind.LEGACY_COMPACT);
             }
@@ -103,12 +102,12 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
-    private static GeneratedNbt generateCanonical(NbtCompound sourceRoot) {
+    private static GeneratedNbt generateCanonical(CompoundTag sourceRoot) {
         if (sourceRoot == null) throw fail("The structure root is missing.");
         if (sourceRoot.get(MARKER_KEY) != null) validateMarker(sourceRoot);
-        NbtList sourceSize = requiredList(sourceRoot, "size");
-        NbtList sourcePalette = requiredList(sourceRoot, "palette");
-        NbtList sourceBlockList = requiredList(sourceRoot, "blocks");
+        ListTag sourceSize = requiredList(sourceRoot, "size");
+        ListTag sourcePalette = requiredList(sourceRoot, "palette");
+        ListTag sourceBlockList = requiredList(sourceRoot, "blocks");
         if (sourceSize.size() != 3) throw fail("The structure size tag must contain exactly three integers.");
         requiredInt(sourceSize, 0, "size X");
         requiredInt(sourceSize, 1, "size Y");
@@ -116,9 +115,9 @@ public final class CompactCircularNbtGenerator {
         if (sourcePalette.isEmpty()) throw fail("The structure palette is empty.");
         if (sourceBlockList.isEmpty()) throw fail("The structure contains no blocks.");
 
-        NbtElement entitiesElement = sourceRoot.get("entities");
+        Tag entitiesElement = sourceRoot.get("entities");
         if (entitiesElement != null) {
-            if (!(entitiesElement instanceof NbtList entities)) {
+            if (!(entitiesElement instanceof ListTag entities)) {
                 throw fail("The entities tag must be a list.");
             }
             if (!entities.isEmpty()) throw fail("Entities are not supported.");
@@ -128,10 +127,10 @@ public final class CompactCircularNbtGenerator {
         List<CompactCircularNbtPlan.SourceBlock> sourceBlocks = readSourceBlocks(sourceBlockList);
         CompactCircularNbtPlan.Result plan = CompactCircularNbtPlan.generate(sourceBlocks, paletteNames);
 
-        NbtCompound outputRoot = sourceRoot.copy();
-        NbtList outputPalette = requiredList(outputRoot, "palette");
+        CompoundTag outputRoot = sourceRoot.copy();
+        ListTag outputPalette = requiredList(outputRoot, "palette");
         if (plan.cobblestoneState() == outputPalette.size()) {
-            NbtCompound cobblestone = new NbtCompound();
+            CompoundTag cobblestone = new CompoundTag();
             cobblestone.putString("Name", CompactCircularNbtPlan.COBBLESTONE_NAME);
             outputPalette.add(cobblestone);
             paletteNames = new ArrayList<>(paletteNames);
@@ -141,7 +140,7 @@ public final class CompactCircularNbtGenerator {
             throw fail("Could not resolve the cobblestone palette state.");
         }
 
-        NbtList outputBlocks = requiredList(outputRoot, "blocks");
+        ListTag outputBlocks = requiredList(outputRoot, "blocks");
         if (outputBlocks.size() != sourceBlocks.size()) {
             throw fail("The output working copy changed block count before transformation.");
         }
@@ -149,9 +148,9 @@ public final class CompactCircularNbtGenerator {
         for (CompactCircularNbtPlan.GeneratedBlock generated : plan.generatedBlocks()) {
             if (generated.connector()) continue;
             int sourceIndex = generated.sourceIndex();
-            NbtCompound block = outputBlocks.getCompound(sourceIndex)
+            CompoundTag block = outputBlocks.getCompound(sourceIndex)
                 .orElseThrow(() -> fail("Output block " + sourceIndex + " is not a compound."));
-            NbtList position = requiredList(block, "pos");
+            ListTag position = requiredList(block, "pos");
             if (position.size() != 3) {
                 throw fail("Output block " + sourceIndex + " has an invalid position.");
             }
@@ -159,25 +158,25 @@ public final class CompactCircularNbtGenerator {
             if (!readPosition(position).equals(expectedOriginal)) {
                 throw fail("The output working-copy block order changed before transformation.");
             }
-            position.set(1, NbtInt.of(generated.position().y()));
+            position.set(1, IntTag.valueOf(generated.position().y()));
             block.putInt("state", generated.state());
         }
 
         for (CompactCircularNbtPlan.GeneratedBlock connector : plan.connectorBlocks()) {
-            NbtCompound block = new NbtCompound();
-            NbtList position = new NbtList();
-            position.add(NbtInt.of(connector.position().x()));
-            position.add(NbtInt.of(connector.position().y()));
-            position.add(NbtInt.of(connector.position().z()));
+            CompoundTag block = new CompoundTag();
+            ListTag position = new ListTag();
+            position.add(IntTag.valueOf(connector.position().x()));
+            position.add(IntTag.valueOf(connector.position().y()));
+            position.add(IntTag.valueOf(connector.position().z()));
             block.put("pos", position);
             block.putInt("state", connector.state());
             outputBlocks.add(block);
         }
 
-        NbtList outputSize = requiredList(outputRoot, "size");
-        outputSize.set(0, NbtInt.of(plan.sizeX()));
-        outputSize.set(1, NbtInt.of(plan.sizeY()));
-        outputSize.set(2, NbtInt.of(plan.sizeZ()));
+        ListTag outputSize = requiredList(outputRoot, "size");
+        outputSize.set(0, IntTag.valueOf(plan.sizeX()));
+        outputSize.set(1, IntTag.valueOf(plan.sizeY()));
+        outputSize.set(2, IntTag.valueOf(plan.sizeZ()));
         installMarker(outputRoot, plan);
 
         GeneratedNbt generated = new GeneratedNbt(outputRoot, plan, paletteNames);
@@ -186,7 +185,7 @@ public final class CompactCircularNbtGenerator {
     }
 
     private static GeneratedNbt loadCanonicalCompact(
-        NbtCompound compactRoot,
+        CompoundTag compactRoot,
         boolean marked
     ) {
         if (marked) {
@@ -195,27 +194,27 @@ public final class CompactCircularNbtGenerator {
             throw fail("Legacy compact validation received a marked NBT.");
         }
 
-        NbtCompound reconstructedSource = reconstructSource(compactRoot);
+        CompoundTag reconstructedSource = reconstructSource(compactRoot);
         GeneratedNbt canonical = generateCanonical(reconstructedSource);
         if (marked) {
             verifyGeneratedNbt(canonical, compactRoot);
         } else {
-            NbtCompound upgraded = compactRoot.copy();
-            NbtCompound marker = requiredCompound(canonical.root(), MARKER_KEY);
+            CompoundTag upgraded = compactRoot.copy();
+            CompoundTag marker = requiredCompound(canonical.root(), MARKER_KEY);
             upgraded.put(MARKER_KEY, marker.copy());
             verifyGeneratedNbt(canonical, upgraded);
         }
         return canonical;
     }
 
-    private static NbtCompound reconstructSource(NbtCompound compactRoot) {
+    private static CompoundTag reconstructSource(CompoundTag compactRoot) {
         List<String> paletteNames = readPaletteNames(requiredList(compactRoot, "palette"));
         int cobblestoneState = paletteNames.indexOf(CompactCircularNbtPlan.COBBLESTONE_NAME);
         if (cobblestoneState < 0) {
             throw fail("A generated compact NBT has no cobblestone palette state.");
         }
 
-        NbtList compactBlocks = requiredList(compactRoot, "blocks");
+        ListTag compactBlocks = requiredList(compactRoot, "blocks");
         if (compactBlocks.isEmpty()) throw fail("The structure contains no blocks.");
         int[] startingTopY = new int[CompactCircularNbtPlan.MAP_WIDTH];
         int[] startingTopState = new int[CompactCircularNbtPlan.MAP_WIDTH];
@@ -223,7 +222,7 @@ public final class CompactCircularNbtGenerator {
 
         for (int index = 0; index < compactBlocks.size(); index++) {
             int blockIndex = index;
-            NbtCompound block = compactBlocks.getCompound(index)
+            CompoundTag block = compactBlocks.getCompound(index)
                 .orElseThrow(() -> fail("Generated block " + blockIndex + " is not a compound."));
             if (block.get("nbt") != null) {
                 throw fail("The generated structure unexpectedly contains a block entity.");
@@ -260,34 +259,34 @@ public final class CompactCircularNbtGenerator {
         }
 
         int globalYShift = startingTopY[0];
-        NbtCompound source = compactRoot.copy();
-        NbtList sourceBlocks = new NbtList();
+        CompoundTag source = compactRoot.copy();
+        ListTag sourceBlocks = new ListTag();
         for (int index = 0; index < compactBlocks.size(); index++) {
-            NbtCompound compactBlock = compactBlocks.getCompound(index).orElseThrow();
+            CompoundTag compactBlock = compactBlocks.getCompound(index).orElseThrow();
             CompactCircularNbtPlan.Position position =
                 readPosition(requiredList(compactBlock, "pos"));
             if (position.z() > CompactCircularNbtPlan.FAR_Z) continue;
 
-            NbtCompound sourceBlock = compactBlock.copy();
-            NbtList sourcePosition = requiredList(sourceBlock, "pos");
-            sourcePosition.set(1, NbtInt.of(position.y() - globalYShift));
+            CompoundTag sourceBlock = compactBlock.copy();
+            ListTag sourcePosition = requiredList(sourceBlock, "pos");
+            sourcePosition.set(1, IntTag.valueOf(position.y() - globalYShift));
             sourceBlocks.add(sourceBlock);
         }
         source.put("blocks", sourceBlocks);
 
-        NbtList sourceSize = new NbtList();
-        sourceSize.add(NbtInt.of(CompactCircularNbtPlan.MAP_WIDTH));
-        sourceSize.add(NbtInt.of(1));
-        sourceSize.add(NbtInt.of(CompactCircularNbtPlan.SOURCE_Z_SIZE));
+        ListTag sourceSize = new ListTag();
+        sourceSize.add(IntTag.valueOf(CompactCircularNbtPlan.MAP_WIDTH));
+        sourceSize.add(IntTag.valueOf(1));
+        sourceSize.add(IntTag.valueOf(CompactCircularNbtPlan.SOURCE_Z_SIZE));
         source.put("size", sourceSize);
         return source;
     }
 
     private static void installMarker(
-        NbtCompound root,
+        CompoundTag root,
         CompactCircularNbtPlan.Result plan
     ) {
-        NbtCompound marker = new NbtCompound();
+        CompoundTag marker = new CompoundTag();
         marker.putString("format", MARKER_FORMAT);
         marker.putInt("schema_version", MARKER_SCHEMA_VERSION);
         marker.putInt("geometry_version", MARKER_GEOMETRY_VERSION);
@@ -297,8 +296,8 @@ public final class CompactCircularNbtGenerator {
         root.put(MARKER_KEY, marker);
     }
 
-    private static void validateMarker(NbtCompound root) {
-        NbtCompound marker = requiredCompound(root, MARKER_KEY);
+    private static void validateMarker(CompoundTag root) {
+        CompoundTag marker = requiredCompound(root, MARKER_KEY);
         String format = marker.getString("format")
             .orElseThrow(() -> fail("The compact marker has no format."));
         int schemaVersion = marker.getInt("schema_version")
@@ -329,8 +328,8 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
-    private static NbtCompound withoutMarker(NbtCompound root) {
-        NbtCompound copy = root.copy();
+    private static CompoundTag withoutMarker(CompoundTag root) {
+        CompoundTag copy = root.copy();
         copy.remove(MARKER_KEY);
         return copy;
     }
@@ -361,9 +360,9 @@ public final class CompactCircularNbtGenerator {
         );
         try {
             NbtIo.writeCompressed(generated.root(), temporary);
-            NbtCompound written = NbtIo.readCompressed(
+            CompoundTag written = NbtIo.readCompressed(
                 temporary,
-                new NbtSizeTracker(MAX_NBT_BYTES, MAX_NBT_DEPTH)
+                new NbtAccounter(MAX_NBT_BYTES, MAX_NBT_DEPTH)
             );
             verifyGeneratedNbt(generated, written);
             try {
@@ -381,13 +380,13 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
-    public static void verifyGeneratedNbt(GeneratedNbt expected, NbtCompound actualRoot) {
+    public static void verifyGeneratedNbt(GeneratedNbt expected, CompoundTag actualRoot) {
         List<String> actualPaletteNames = readPaletteNames(requiredList(actualRoot, "palette"));
         if (!actualPaletteNames.equals(expected.paletteNames())) {
             throw fail("The generated palette changed while writing.");
         }
 
-        NbtList size = requiredList(actualRoot, "size");
+        ListTag size = requiredList(actualRoot, "size");
         if (size.size() != 3
             || requiredInt(size, 0, "size X") != expected.plan().sizeX()
             || requiredInt(size, 1, "size Y") != expected.plan().sizeY()
@@ -395,9 +394,9 @@ public final class CompactCircularNbtGenerator {
             throw fail("The generated structure size changed while writing.");
         }
 
-        NbtElement entitiesElement = actualRoot.get("entities");
+        Tag entitiesElement = actualRoot.get("entities");
         if (entitiesElement != null) {
-            if (!(entitiesElement instanceof NbtList entities)) {
+            if (!(entitiesElement instanceof ListTag entities)) {
                 throw fail("The generated entities tag is not a list.");
             }
             if (!entities.isEmpty()) {
@@ -405,7 +404,7 @@ public final class CompactCircularNbtGenerator {
             }
         }
 
-        NbtList actualBlocks = requiredList(actualRoot, "blocks");
+        ListTag actualBlocks = requiredList(actualRoot, "blocks");
         if (actualBlocks.size() != expected.plan().generatedBlocks().size()) {
             throw fail("The generated block count changed while writing.");
         }
@@ -420,7 +419,7 @@ public final class CompactCircularNbtGenerator {
         Map<CompactCircularNbtPlan.Position, Integer> actualRecords = new HashMap<>();
         for (int index = 0; index < actualBlocks.size(); index++) {
             int blockIndex = index;
-            NbtCompound block = actualBlocks.getCompound(index)
+            CompoundTag block = actualBlocks.getCompound(index)
                 .orElseThrow(() -> fail("Generated block " + blockIndex + " is not a compound."));
             if (block.get("nbt") != null) {
                 throw fail("The generated structure unexpectedly contains a block entity.");
@@ -443,11 +442,11 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
-    private static List<String> readPaletteNames(NbtList palette) {
+    private static List<String> readPaletteNames(ListTag palette) {
         List<String> names = new ArrayList<>(palette.size());
         for (int index = 0; index < palette.size(); index++) {
             int paletteIndex = index;
-            NbtCompound entry = palette.getCompound(index)
+            CompoundTag entry = palette.getCompound(index)
                 .orElseThrow(() -> fail("Palette entry " + paletteIndex + " is not a compound."));
             String name = entry.getString("Name")
                 .orElseThrow(() -> fail("Palette entry " + paletteIndex + " has no Name."));
@@ -456,11 +455,11 @@ public final class CompactCircularNbtGenerator {
         return names;
     }
 
-    private static List<CompactCircularNbtPlan.SourceBlock> readSourceBlocks(NbtList blocks) {
+    private static List<CompactCircularNbtPlan.SourceBlock> readSourceBlocks(ListTag blocks) {
         List<CompactCircularNbtPlan.SourceBlock> result = new ArrayList<>(blocks.size());
         for (int index = 0; index < blocks.size(); index++) {
             int blockIndex = index;
-            NbtCompound block = blocks.getCompound(index)
+            CompoundTag block = blocks.getCompound(index)
                 .orElseThrow(() -> fail("Block " + blockIndex + " is not a compound."));
             if (block.get("nbt") != null) {
                 throw fail("Block entities are not supported (block " + index + ").");
@@ -473,7 +472,7 @@ public final class CompactCircularNbtGenerator {
         return result;
     }
 
-    private static CompactCircularNbtPlan.Position readPosition(NbtList position) {
+    private static CompactCircularNbtPlan.Position readPosition(ListTag position) {
         if (position.size() != 3) throw fail("A block position must contain exactly three integers.");
         return new CompactCircularNbtPlan.Position(
             requiredInt(position, 0, "block X"),
@@ -482,17 +481,17 @@ public final class CompactCircularNbtGenerator {
         );
     }
 
-    private static int requiredInt(NbtList list, int index, String label) {
+    private static int requiredInt(ListTag list, int index, String label) {
         Optional<Integer> value = list.getInt(index);
         return value.orElseThrow(() -> fail("Missing or invalid " + label + "."));
     }
 
-    private static NbtList requiredList(NbtCompound compound, String key) {
+    private static ListTag requiredList(CompoundTag compound, String key) {
         return compound.getList(key)
             .orElseThrow(() -> fail("Missing or invalid " + key + " tag."));
     }
 
-    private static NbtCompound requiredCompound(NbtCompound compound, String key) {
+    private static CompoundTag requiredCompound(CompoundTag compound, String key) {
         return compound.getCompound(key)
             .orElseThrow(() -> fail("Missing or invalid " + key + " tag."));
     }

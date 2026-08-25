@@ -1,6 +1,6 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.util.Pair;
+import com.julflips.nerv_printer.utils.Tuple;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -13,15 +13,15 @@ class SlaveSystemIntervalPartitionTest {
     @Test
     void everySupportedBotCountOwnsEveryPairExactlyOnce() {
         for (int botCount = 1; botCount <= 64; botCount++) {
-            List<Pair<Integer, Integer>> intervals =
+            List<Tuple<Integer, Integer>> intervals =
                 SlaveSystem.partitionCircularColumns(botCount);
 
             assertEquals(botCount, intervals.size());
             int nextColumn = 0;
             int ownedPairs = 0;
-            for (Pair<Integer, Integer> interval : intervals) {
-                int start = interval.getLeft();
-                int end = interval.getRight();
+            for (Tuple<Integer, Integer> interval : intervals) {
+                int start = interval.getA();
+                int end = interval.getB();
                 assertEquals(nextColumn, start);
                 assertEquals(0, start % 2);
                 assertEquals(1, end % 2);

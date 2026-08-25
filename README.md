@@ -8,7 +8,7 @@ The main work is in [`nerv-printer-addon`](nerv-printer-addon). It keeps Nerv Pr
 
 ## Download
 
-[**Download the Nerv Printer JAR**](nerv-printer-1.21.11.jar)
+[**Download the Nerv Printer JAR**](nerv-printer-26.2.jar)
 
 ## What is optimized
 
@@ -37,11 +37,11 @@ The main work is in [`nerv-printer-addon`](nerv-printer-addon). It keeps Nerv Pr
 
 The checked-in Gradle configuration currently targets:
 
-- Minecraft `1.21.11`
-- Yarn mappings `1.21.11+build.4`
-- Fabric Loader `0.17.3`
-- Meteor Client `1.21.11-SNAPSHOT`
-- Java toolchain `21`
+- Minecraft `26.2`
+- Native Mojang names (Minecraft 26.2 is unobfuscated)
+- Fabric Loader `0.19.3`
+- Meteor Client `26.2-SNAPSHOT`
+- Java toolchain `25`
 
 These versions move with development. Treat [`gradle.properties`](nerv-printer-addon/gradle.properties) as the source of truth.
 
@@ -55,7 +55,9 @@ These versions move with development. Treat [`gradle.properties`](nerv-printer-a
 
 ## Build
 
-Install JDK 21, then run the Gradle wrapper from the main addon directory.
+Use JDK 25, then run the Gradle wrapper from the main addon directory. The
+wrapper can provision the Java 25 compilation toolchain automatically when a
+local JDK 25 installation is unavailable.
 
 This repository is not a top-level Gradle aggregate, so run build commands inside `nerv-printer-addon`. If a Windows checkout fails with `Filename too long`, enable Git long-path support before cloning again:
 

@@ -8,23 +8,22 @@ import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
-import net.minecraft.item.Item;
-import net.minecraft.item.ItemStack;
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtList;
-import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
-import net.minecraft.network.packet.c2s.play.PlayerInteractItemC2SPacket;
-import net.minecraft.network.packet.s2c.play.InventoryS2CPacket;
-import net.minecraft.registry.Registries;
-import net.minecraft.screen.slot.SlotActionType;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.Pair;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3d;
-
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
+import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
+import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.resources.Identifier;
+import com.julflips.nerv_printer.utils.Tuple;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
 import java.io.File;
 import java.util.*;
 import java.util.function.BiConsumer;
@@ -33,20 +32,24 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 
 public final class Utils {
 
+    public static String itemName(Item item) {
+        return item.getDefaultInstance().getHoverName().getString();
+    }
+
     private static int nextInteractID = 2;
 
     public static int getNextInteractID() {
         return nextInteractID;
     }
 
-    public static ArrayList<Pair<BlockPos, Vec3d>> saveAdd(ArrayList<Pair<BlockPos, Vec3d>> list, BlockPos blockPos, Vec3d openPos) {
-        for (Pair<BlockPos, Vec3d> pair : list) {
-            if (pair.getLeft().equals(blockPos)) {
+    public static ArrayList<Tuple<BlockPos, Vec3>> saveAdd(ArrayList<Tuple<BlockPos, Vec3>> list, BlockPos blockPos, Vec3 openPos) {
+        for (Tuple<BlockPos, Vec3> pair : list) {
+            if (pair.getA().equals(blockPos)) {
                 list.remove(pair);
                 break;
             }
         }
-        list.add(new Pair(blockPos, openPos));
+        list.add(new Tuple(blockPos, openPos));
         return list;
     }
 
@@ -72,17 +75,17 @@ public final class Utils {
     }
 
     public static int maximumStackSize(Item item) {
-        return new ItemStack(item).getMaxCount();
+        return new ItemStack(item).getMaxStackSize();
     }
 
-    public static ArrayList<Integer> getAvailableSlots(HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materials) {
+    public static ArrayList<Integer> getAvailableSlots(HashMap<Item, ArrayList<Tuple<BlockPos, Vec3>>> materials) {
         ArrayList<Integer> slots = new ArrayList<>();
         for (int slot = 0; slot < 36; slot++) {
-            if (mc.player.getInventory().getStack(slot).isEmpty()) {
+            if (mc.player.getInventory().getItem(slot).isEmpty()) {
                 slots.add(slot);
                 continue;
             }
-            Item item = mc.player.getInventory().getStack(slot).getItem();
+            Item item = mc.player.getInventory().getItem(slot).getItem();
             if (materials.containsKey(item)) {
                 slots.add(slot);
             }
@@ -90,12 +93,12 @@ public final class Utils {
         return slots;
     }
 
-    public static Pair<ArrayList<Integer>, HashMap<Item, Integer>> getInvInformation(HashMap<Item, Integer> requiredItems, ArrayList<Integer> availableSlots) {
+    public static Tuple<ArrayList<Integer>, HashMap<Item, Integer>> getInvInformation(HashMap<Item, Integer> requiredItems, ArrayList<Integer> availableSlots) {
         //Return a list of slots to be dumped and a Hashmap of material-amount we can keep in the inventory
         ArrayList<InventoryKeepAllocator.StackEntry<Item>> inventoryStacks =
             new ArrayList<>();
         for (int slot : availableSlots) {
-            ItemStack stack = mc.player.getInventory().getStack(slot);
+            ItemStack stack = mc.player.getInventory().getItem(slot);
             if (stack.isEmpty()) continue;
             inventoryStacks.add(
                 new InventoryKeepAllocator.StackEntry<>(
@@ -105,7 +108,7 @@ public final class Utils {
                     stack.getMaxDamage() > 0
                         ? Math.max(
                             0,
-                            stack.getMaxDamage() - stack.getDamage()
+                            stack.getMaxDamage() - stack.getDamageValue()
                         )
                         : 0
                 )
@@ -115,7 +118,7 @@ public final class Utils {
             InventoryKeepAllocator.allocate(requiredItems, inventoryStacks);
         requiredItems.clear();
         requiredItems.putAll(allocation.missingDemand());
-        return new Pair<>(
+        return new Tuple<>(
             new ArrayList<>(allocation.dumpSlots()),
             new HashMap<>(allocation.keptCounts())
         );
@@ -157,23 +160,23 @@ public final class Utils {
     }
 
     public static void setForwardPressed(boolean pressed) {
-        mc.options.forwardKey.setPressed(pressed);
-        Input.setKeyState(mc.options.forwardKey, pressed);
+        mc.options.keyUp.setDown(pressed);
+        Input.setKeyState(mc.options.keyUp, pressed);
     }
 
     public static void setBackwardPressed(boolean pressed) {
-        mc.options.backKey.setPressed(pressed);
-        Input.setKeyState(mc.options.backKey, pressed);
+        mc.options.keyDown.setDown(pressed);
+        Input.setKeyState(mc.options.keyDown, pressed);
     }
 
     public static void setJumpPressed(boolean pressed) {
-        mc.options.jumpKey.setPressed(pressed);
-        Input.setKeyState(mc.options.jumpKey, pressed);
+        mc.options.keyJump.setDown(pressed);
+        Input.setKeyState(mc.options.keyJump, pressed);
     }
 
-    public static int findHighestFreeSlot(InventoryS2CPacket packet) {
-        for (int i = packet.contents().size() - 1; i > packet.contents().size() - 1 - 36; i--) {
-            ItemStack stack = packet.contents().get(i);
+    public static int findHighestFreeSlot(ClientboundContainerSetContentPacket packet) {
+        for (int i = packet.items().size() - 1; i > packet.items().size() - 1 - 36; i--) {
+            ItemStack stack = packet.items().get(i);
             if (stack.isEmpty()) {
                 return i;
             }
@@ -185,13 +188,13 @@ public final class Utils {
         mc.player.getInventory().setSelectedSlot(toSlot);
 
         IClientPlayerInteractionManager cim =
-            (IClientPlayerInteractionManager) mc.interactionManager;
+            (IClientPlayerInteractionManager) mc.gameMode;
 
-        cim.clickSlot(
-            mc.player.currentScreenHandler.syncId,
+        cim.handleContainerInput(
+            mc.player.containerMenu.containerId,
             fromSlot,
             toSlot,
-            SlotActionType.SWAP,
+            ContainerInput.SWAP,
             mc.player
         );
     }
@@ -201,10 +204,10 @@ public final class Utils {
         int toSlot
     ) {
         performAuthoritativeInventoryClick(
-            mc.player.currentScreenHandler.syncId,
+            mc.player.containerMenu.containerId,
             fromSlot,
             toSlot,
-            SlotActionType.SWAP
+            ContainerInput.SWAP
         );
     }
 
@@ -212,11 +215,11 @@ public final class Utils {
         int syncId,
         int slotId,
         int button,
-        SlotActionType actionType
+        ContainerInput actionType
     ) {
         IClientPlayerInteractionManager cim =
-            (IClientPlayerInteractionManager) mc.interactionManager;
-        cim.clickSlotWithForcedFullSync(
+            (IClientPlayerInteractionManager) mc.gameMode;
+        cim.handleContainerInputWithForcedFullSync(
             syncId,
             slotId,
             button,
@@ -230,7 +233,7 @@ public final class Utils {
         int py = startingPos.getY();
         int pz = startingPos.getZ();
 
-        BlockPos.Mutable blockPos = new BlockPos.Mutable();
+        BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
 
         int hRadius = Math.max(0, horizontalRadius);
         int vRadius = Math.max(0, verticalRadius);
@@ -247,38 +250,38 @@ public final class Utils {
 
     }
 
-    public static HashMap<Integer, Pair<Block, Integer>> getBlockPalette(NbtList paletteList) {
-        HashMap<Integer, Pair<Block, Integer>> blockPaletteDict = new HashMap<>();
+    public static HashMap<Integer, Tuple<Block, Integer>> getBlockPalette(ListTag paletteList) {
+        HashMap<Integer, Tuple<Block, Integer>> blockPaletteDict = new HashMap<>();
         for (int i = 0; i < paletteList.size(); i++) {
-            Optional<NbtCompound> block = paletteList.getCompound(i);
+            Optional<CompoundTag> block = paletteList.getCompound(i);
             if (block.isEmpty()) continue;
 
             Optional<String> blockName = block.get().getString("Name");
             if (blockName.isEmpty()) continue;
 
-            blockPaletteDict.put(i, new Pair(Registries.BLOCK.get(Identifier.of(blockName.get())), 0));
+            blockPaletteDict.put(i, new Tuple(BuiltInRegistries.BLOCK.getValue(Identifier.parse(blockName.get())), 0));
         }
         return blockPaletteDict;
     }
 
-    public static Block[][] generateMapArray(NbtList blockList, HashMap<Integer, Pair<Block, Integer>> blockPalette) {
+    public static Block[][] generateMapArray(ListTag blockList, HashMap<Integer, Tuple<Block, Integer>> blockPalette) {
         //Calculating the map offset
         int maxHeight = Integer.MIN_VALUE;
         int minX = Integer.MAX_VALUE;
         int maxZ = Integer.MIN_VALUE;
         for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
+            Optional<CompoundTag> blockOpt = blockList.getCompound(i);
             if (blockOpt.isEmpty()) continue;
 
-            NbtCompound block = blockOpt.get();
+            CompoundTag block = blockOpt.get();
 
             Optional<Integer> blockIdOpt = block.getInt("state");
             if (blockIdOpt.isEmpty() || !blockPalette.containsKey(blockIdOpt.get())) continue;
 
-            Optional<NbtList> posOpt = block.getList("pos");
+            Optional<ListTag> posOpt = block.getList("pos");
             if (posOpt.isEmpty()) continue;
 
-            NbtList pos = posOpt.get();
+            ListTag pos = posOpt.get();
             if (pos.size() < 3) continue;
 
             Optional<Integer> xOpt = pos.getInt(0);
@@ -297,17 +300,17 @@ public final class Utils {
         //Extracting the map block positions
         Block[][] map = new Block[128][128];
         for (int i = 0; i < blockList.size(); i++) {
-            Optional<NbtCompound> blockOpt = blockList.getCompound(i);
+            Optional<CompoundTag> blockOpt = blockList.getCompound(i);
             if (blockOpt.isEmpty()) continue;
-            NbtCompound block = blockOpt.get();
+            CompoundTag block = blockOpt.get();
 
             Optional<Integer> blockIdOpt = block.getInt("state");
             if (blockIdOpt.isEmpty() || !blockPalette.containsKey(blockIdOpt.get())) continue;
 
-            Optional<NbtList> posOpt = block.getList("pos");
+            Optional<ListTag> posOpt = block.getList("pos");
             if (posOpt.isEmpty()) continue;
 
-            NbtList pos = posOpt.get();
+            ListTag pos = posOpt.get();
             if (pos.size() < 3) continue;
 
             Optional<Integer> xOpt = pos.getInt(0);
@@ -326,27 +329,27 @@ public final class Utils {
             // If block is within map area, increase counter for the block ID
             if (y == maxHeight && x < map.length && z < map.length & x >= 0 && z >= 0) {
                 int blockId = blockIdOpt.get();
-                map[x][z] = blockPalette.get(blockId).getLeft();
-                blockPalette.put(blockId, new Pair(blockPalette.get(blockId).getLeft(), blockPalette.get(blockId).getRight() + 1));
+                map[x][z] = blockPalette.get(blockId).getA();
+                blockPalette.put(blockId, new Tuple(blockPalette.get(blockId).getA(), blockPalette.get(blockId).getB() + 1));
             }
         }
 
         //Remove unused blocks from the blockPalette
         ArrayList<Integer> toBeRemoved = new ArrayList<>();
         for (int key : blockPalette.keySet()) {
-            if (blockPalette.get(key).getRight() == 0) toBeRemoved.add(key);
+            if (blockPalette.get(key).getB() == 0) toBeRemoved.add(key);
         }
         for (int key : toBeRemoved) blockPalette.remove(key);
 
         return map;
     }
 
-    public static ArrayList<BlockPos> getInvalidPlacements(BlockPos mapCorner, Pair<Integer, Integer> interval, Block[][] map, ArrayList<BlockPos> knownErrors) {
+    public static ArrayList<BlockPos> getInvalidPlacements(BlockPos mapCorner, Tuple<Integer, Integer> interval, Block[][] map, ArrayList<BlockPos> knownErrors) {
         ArrayList<BlockPos> invalidPlacements = new ArrayList<>();
-        for (int x = interval.getRight(); x >= interval.getLeft(); x--) {
+        for (int x = interval.getB(); x >= interval.getA(); x--) {
             for (int z = 127; z >= 0; z--) {
                 BlockPos relativePos = new BlockPos(x, 0, z);
-                BlockPos absolutePos = mapCorner.add(relativePos);
+                BlockPos absolutePos = mapCorner.offset(relativePos);
                 if (knownErrors.contains(absolutePos)) continue;
                 BlockState blockState = MapAreaCache.getCachedBlockState(absolutePos);
                 Block block = blockState.getBlock();
@@ -359,7 +362,7 @@ public final class Utils {
     }
 
     public static void getOneItem(int sourceSlot, boolean avoidFirstHotBar, ArrayList<Integer> availableSlots,
-                                  ArrayList<Integer> availableHotBarSlots, InventoryS2CPacket packet) {
+                                  ArrayList<Integer> availableHotBarSlots, ClientboundContainerSetContentPacket packet) {
         int targetSlot = availableHotBarSlots.get(0);
         if (avoidFirstHotBar) {
             targetSlot = availableSlots.get(0);
@@ -372,10 +375,10 @@ public final class Utils {
         } else {
             targetSlot -= 9;
         }
-        targetSlot = packet.contents().size() - 36 + targetSlot;
-        mc.interactionManager.clickSlot(packet.syncId(), sourceSlot, 0, SlotActionType.PICKUP, mc.player);
-        mc.interactionManager.clickSlot(packet.syncId(), targetSlot, 1, SlotActionType.PICKUP, mc.player);
-        mc.interactionManager.clickSlot(packet.syncId(), sourceSlot, 0, SlotActionType.PICKUP, mc.player);
+        targetSlot = packet.items().size() - 36 + targetSlot;
+        mc.gameMode.handleContainerInput(packet.containerId(), sourceSlot, 0, ContainerInput.PICKUP, mc.player);
+        mc.gameMode.handleContainerInput(packet.containerId(), targetSlot, 1, ContainerInput.PICKUP, mc.player);
+        mc.gameMode.handleContainerInput(packet.containerId(), sourceSlot, 0, ContainerInput.PICKUP, mc.player);
     }
 
     public static File getNextMapFile(File mapFolder, ArrayList<File> startedFiles, boolean areMoved) {
@@ -401,7 +404,7 @@ public final class Utils {
         double minDistance = Double.MAX_VALUE;
         Direction bestSide = Direction.UP;
         for (Direction side : Direction.values()) {
-            double neighbourDistance = mc.player.getEyePos().distanceTo(blockPos.offset(side).toCenterPos());
+            double neighbourDistance = mc.player.getEyePosition().distanceTo(Vec3.atCenterOf(blockPos.relative(side)));
             if (neighbourDistance < minDistance) {
                 minDistance = neighbourDistance;
                 bestSide = side;
@@ -410,8 +413,8 @@ public final class Utils {
         return bestSide;
     }
 
-    public static boolean isInInterval(Pair<Integer, Integer> interval, int number) {
-        return number >= interval.getLeft() && number <= interval.getRight();
+    public static boolean isInInterval(Tuple<Integer, Integer> interval, int number) {
+        return number >= interval.getA() && number <= interval.getB();
     }
 
     @EventHandler
@@ -421,11 +424,11 @@ public final class Utils {
 
     @EventHandler(priority = EventPriority.HIGHEST - 1)
     private static void onRecievePacket(PacketEvent.Receive event) {
-        if (event.packet instanceof PlayerInteractItemC2SPacket packet) {
+        if (event.packet instanceof ServerboundUseItemPacket packet) {
             nextInteractID = packet.getSequence() + 1;
         }
 
-        if (event.packet instanceof PlayerInteractBlockC2SPacket packet) {
+        if (event.packet instanceof ServerboundUseItemOnPacket packet) {
             nextInteractID = packet.getSequence() + 1;
         }
     }
