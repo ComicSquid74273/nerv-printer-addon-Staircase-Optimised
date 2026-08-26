@@ -65,8 +65,10 @@ target server before enabling a Nerv optimization.
 The add-on deliberately does not reinterpret THM's `blocks-per-tick = 30` as a
 safe direct port. Nerv exposes a hard maximum of 30 new block-action attempts per
 real second, optionally scales it by `TPS / 20`, pauses below the configured TPS or
-after a 1.5-second stale server-tick sample, and prevents idle credits from becoming
-an unbounded burst.
+after the periodic server timing sample exceeds an adaptive stale window, and
+prevents idle credits from becoming an unbounded burst. That window is at least
+1.5 seconds and expands to one-and-a-half expected sample intervals at the
+configured minimum TPS.
 
 Printing keeps the complete current two-column U as its mandatory inventory and
 placement plan. Before the refill trip, dependency-closed nearby surface targets

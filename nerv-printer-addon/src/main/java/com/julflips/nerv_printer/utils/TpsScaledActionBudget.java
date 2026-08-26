@@ -21,6 +21,8 @@ import java.math.RoundingMode;
  */
 public final class TpsScaledActionBudget {
     public static final double NORMAL_SERVER_TPS = 20.0;
+    private static final double SERVER_TPS_SAMPLE_INTERVAL_TICKS = 20.0;
+    private static final double STALE_SAMPLE_GRACE_INTERVALS = 1.5;
 
     public enum PauseReason {
         NONE,
@@ -82,7 +84,16 @@ public final class TpsScaledActionBudget {
         this.maximumActionsPerSecond =
             BigDecimal.valueOf(maximumActionsPerSecond);
         this.minimumTps = minimumTps;
-        this.staleAfterSeconds = staleAfterSeconds;
+        // Meteor refreshes TickRate from the periodic server time packet,
+        // normally once per 20 server ticks. Size the stale window for the
+        // slowest TPS this budget accepts so a healthy low-TPS server does not
+        // alternate between paused and resumed states between normal samples.
+        this.staleAfterSeconds = Math.max(
+            staleAfterSeconds,
+            SERVER_TPS_SAMPLE_INTERVAL_TICKS
+                * STALE_SAMPLE_GRACE_INTERVALS
+                / minimumTps
+        );
         this.perTickBurstCap = perTickBurstCap;
     }
 

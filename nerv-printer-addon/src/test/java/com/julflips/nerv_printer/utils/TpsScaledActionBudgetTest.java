@@ -45,6 +45,10 @@ class TpsScaledActionBudgetTest {
     void invalidAndStaleSamplesPauseWithSpecificReasons() {
         TpsScaledActionBudget budget = newBudget(30.0, 100);
 
+        // Meteor's timing sample normally arrives once per 20 server ticks.
+        // At the accepted 10 TPS floor, 3 seconds covers 1.5 sample intervals.
+        assertEquals(3.0, budget.staleAfterSeconds());
+
         assertEquals(0, budget.beginTick(0L, Double.NaN, 0.0));
         assertEquals(
             TpsScaledActionBudget.PauseReason.INVALID_TPS,
@@ -68,7 +72,12 @@ class TpsScaledActionBudgetTest {
         );
         assertEquals(
             0,
-            budget.beginTick(3 * CLIENT_TICK_NANOS, 20.0, 1.500_001)
+            budget.beginTick(3 * CLIENT_TICK_NANOS, 10.0, 2.0)
+        );
+        assertFalse(budget.paused());
+        assertEquals(
+            0,
+            budget.beginTick(4 * CLIENT_TICK_NANOS, 20.0, 3.000_001)
         );
         assertEquals(
             TpsScaledActionBudget.PauseReason.STALE_SERVER_TICK,
@@ -78,9 +87,21 @@ class TpsScaledActionBudgetTest {
         // The configured boundary itself is still fresh.
         assertEquals(
             0,
-            budget.beginTick(4 * CLIENT_TICK_NANOS, 20.0, 1.5)
+            budget.beginTick(5 * CLIENT_TICK_NANOS, 20.0, 3.0)
         );
         assertFalse(budget.paused());
+    }
+
+    @Test
+    void higherMinimumTpsKeepsTheOnePointFiveSecondFloor() {
+        TpsScaledActionBudget budget = new TpsScaledActionBudget(
+            30.0,
+            20.0,
+            1.5,
+            3
+        );
+
+        assertEquals(1.5, budget.staleAfterSeconds());
     }
 
     @Test
