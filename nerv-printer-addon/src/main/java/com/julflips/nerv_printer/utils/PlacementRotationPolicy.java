@@ -1,9 +1,8 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.block.BlockState;
-
 import java.util.Collection;
 import java.util.Set;
+import net.minecraft.world.level.block.state.BlockState;
 
 /**
  * Identifies blocks whose placement result is derived from player yaw/pitch.

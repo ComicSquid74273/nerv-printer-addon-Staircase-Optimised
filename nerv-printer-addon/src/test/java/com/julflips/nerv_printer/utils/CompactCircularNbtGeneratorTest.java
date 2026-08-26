@@ -1,10 +1,10 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtInt;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
 import net.minecraft.nbt.NbtIo;
-import net.minecraft.nbt.NbtList;
-import net.minecraft.nbt.NbtSizeTracker;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtAccounter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -21,8 +21,8 @@ class CompactCircularNbtGeneratorTest {
 
     @Test
     void transformsCopiesAndTransactionallyReloadValidatesTheNbt() throws Exception {
-        NbtCompound source = flatSourceNbt();
-        NbtCompound untouchedSource = source.copy();
+        CompoundTag source = flatSourceNbt();
+        CompoundTag untouchedSource = source.copy();
 
         CompactCircularNbtGenerator.GeneratedNbt generated =
             CompactCircularNbtGenerator.generate(source);
@@ -34,7 +34,7 @@ class CompactCircularNbtGeneratorTest {
         assertEquals(128, generated.plan().sizeX());
         assertEquals(1, generated.plan().sizeY());
         assertEquals(129, generated.plan().sizeZ());
-        NbtCompound marker = generated.root()
+        CompoundTag marker = generated.root()
             .getCompound("nerv_printer:compact_circular_u")
             .orElseThrow();
         assertEquals("compact_circular_u", marker.getString("format").orElseThrow());
@@ -43,9 +43,9 @@ class CompactCircularNbtGeneratorTest {
 
         Path destination = temporaryDirectory.resolve("flat_compact.nbt");
         CompactCircularNbtGenerator.writeValidated(generated, destination);
-        NbtCompound reloaded = NbtIo.readCompressed(
+        CompoundTag reloaded = NbtIo.readCompressed(
             destination,
-            new NbtSizeTracker(0x20000000L, 100)
+            new NbtAccounter(0x20000000L, 100)
         );
         CompactCircularNbtGenerator.verifyGeneratedNbt(generated, reloaded);
         assertEquals(generated.root(), reloaded);
@@ -53,7 +53,7 @@ class CompactCircularNbtGeneratorTest {
 
     @Test
     void loadsMarkedAndLegacyGeneratedNbtWithoutGeneratingConnectorsTwice() {
-        NbtCompound source = steppedSourceNbt();
+        CompoundTag source = steppedSourceNbt();
         CompactCircularNbtGenerator.LoadedNbt sourceLoad =
             CompactCircularNbtGenerator.loadOrGenerate(source);
 
@@ -74,7 +74,7 @@ class CompactCircularNbtGeneratorTest {
             markedLoad.generated().plan().connectorBlocks().size()
         );
 
-        NbtCompound legacy = sourceLoad.generated().root().copy();
+        CompoundTag legacy = sourceLoad.generated().root().copy();
         legacy.remove("nerv_printer:compact_circular_u");
         CompactCircularNbtGenerator.LoadedNbt legacyLoad =
             CompactCircularNbtGenerator.loadOrGenerate(legacy);
@@ -87,14 +87,14 @@ class CompactCircularNbtGeneratorTest {
 
     @Test
     void rejectsMarkedCompactNbtWhoseConnectorWasChanged() {
-        NbtCompound corrupt = CompactCircularNbtGenerator.generate(steppedSourceNbt())
+        CompoundTag corrupt = CompactCircularNbtGenerator.generate(steppedSourceNbt())
             .root()
             .copy();
-        NbtList blocks = corrupt.getList("blocks").orElseThrow();
+        ListTag blocks = corrupt.getList("blocks").orElseThrow();
         boolean changed = false;
         for (int index = 0; index < blocks.size(); index++) {
-            NbtCompound block = blocks.getCompound(index).orElseThrow();
-            NbtList position = block.getList("pos").orElseThrow();
+            CompoundTag block = blocks.getCompound(index).orElseThrow();
+            ListTag position = block.getList("pos").orElseThrow();
             if (position.getInt(2).orElseThrow() > CompactCircularNbtPlan.FAR_Z) {
                 block.putInt("state", 0);
                 changed = true;
@@ -110,7 +110,7 @@ class CompactCircularNbtGeneratorTest {
 
     @Test
     void treatsAnUnmarkedCanonicalFixedPointAsLegacyCompact() {
-        NbtCompound canonicalFlat = CompactCircularNbtGenerator.generate(flatSourceNbt())
+        CompoundTag canonicalFlat = CompactCircularNbtGenerator.generate(flatSourceNbt())
             .root()
             .copy();
         canonicalFlat.remove("nerv_printer:compact_circular_u");
@@ -127,81 +127,81 @@ class CompactCircularNbtGeneratorTest {
 
     @Test
     void rejectsEntitiesAndBlockEntitiesInsteadOfSilentlyDroppingTheirCoordinates() {
-        NbtCompound withEntity = flatSourceNbt();
-        withEntity.getList("entities").orElseThrow().add(new NbtCompound());
+        CompoundTag withEntity = flatSourceNbt();
+        withEntity.getList("entities").orElseThrow().add(new CompoundTag());
         assertThrows(
             IllegalArgumentException.class,
             () -> CompactCircularNbtGenerator.generate(withEntity)
         );
 
-        NbtCompound withBlockEntity = flatSourceNbt();
-        NbtCompound firstBlock = withBlockEntity.getList("blocks")
+        CompoundTag withBlockEntity = flatSourceNbt();
+        CompoundTag firstBlock = withBlockEntity.getList("blocks")
             .orElseThrow()
             .getCompound(0)
             .orElseThrow();
-        firstBlock.put("nbt", new NbtCompound());
+        firstBlock.put("nbt", new CompoundTag());
         assertThrows(
             IllegalArgumentException.class,
             () -> CompactCircularNbtGenerator.generate(withBlockEntity)
         );
 
-        NbtCompound withInvalidEntitiesTag = flatSourceNbt();
-        withInvalidEntitiesTag.put("entities", new NbtCompound());
+        CompoundTag withInvalidEntitiesTag = flatSourceNbt();
+        withInvalidEntitiesTag.put("entities", new CompoundTag());
         assertThrows(
             IllegalArgumentException.class,
             () -> CompactCircularNbtGenerator.generate(withInvalidEntitiesTag)
         );
     }
 
-    private static NbtCompound flatSourceNbt() {
-        NbtCompound root = new NbtCompound();
+    private static CompoundTag flatSourceNbt() {
+        CompoundTag root = new CompoundTag();
         root.putString("author", "compact-test");
 
-        NbtList size = new NbtList();
-        size.add(NbtInt.of(128));
-        size.add(NbtInt.of(1));
-        size.add(NbtInt.of(129));
+        ListTag size = new ListTag();
+        size.add(IntTag.valueOf(128));
+        size.add(IntTag.valueOf(1));
+        size.add(IntTag.valueOf(129));
         root.put("size", size);
 
-        NbtList palette = new NbtList();
-        NbtCompound stone = new NbtCompound();
+        ListTag palette = new ListTag();
+        CompoundTag stone = new CompoundTag();
         stone.putString("Name", "minecraft:stone");
         palette.add(stone);
         root.put("palette", palette);
 
-        NbtList blocks = new NbtList();
+        ListTag blocks = new ListTag();
         for (int x = 0; x < 128; x++) {
             for (int z = 0; z < 129; z++) {
-                NbtCompound block = new NbtCompound();
-                NbtList position = new NbtList();
-                position.add(NbtInt.of(x));
-                position.add(NbtInt.of(0));
-                position.add(NbtInt.of(z));
+                CompoundTag block = new CompoundTag();
+                ListTag position = new ListTag();
+                position.add(IntTag.valueOf(x));
+                position.add(IntTag.valueOf(0));
+                position.add(IntTag.valueOf(z));
                 block.put("pos", position);
                 block.putInt("state", 0);
                 blocks.add(block);
             }
         }
         root.put("blocks", blocks);
-        root.put("entities", new NbtList());
+        root.put("entities", new ListTag());
         return root;
     }
 
-    private static NbtCompound steppedSourceNbt() {
-        NbtCompound root = flatSourceNbt();
-        NbtList blocks = root.getList("blocks").orElseThrow();
+    private static CompoundTag steppedSourceNbt() {
+        CompoundTag root = flatSourceNbt();
+        ListTag blocks = root.getList("blocks").orElseThrow();
         for (int z = 1; z < CompactCircularNbtPlan.SOURCE_Z_SIZE; z++) {
             int index = CompactCircularNbtPlan.SOURCE_Z_SIZE + z;
-            NbtCompound block = blocks.getCompound(index).orElseThrow();
+            CompoundTag block = blocks.getCompound(index).orElseThrow();
             block.getList("pos")
                 .orElseThrow()
-                .set(1, NbtInt.of(Math.min(z, 6)));
+                .set(1, IntTag.valueOf(Math.min(z, 6)));
         }
-        NbtCompound deepBlock = new NbtCompound();
-        NbtList deepPosition = new NbtList();
-        deepPosition.add(NbtInt.of(0));
-        deepPosition.add(NbtInt.of(-7));
-        deepPosition.add(NbtInt.of(0));
+        CompoundTag deepBlock = new CompoundTag();
+        ListTag deepPosition = new ListTag();
+        deepPosition.add(IntTag.valueOf(0));
+        deepPosition.add(IntTag.valueOf(-7));
+        deepPosition.add(IntTag.valueOf(0));
         deepBlock.put("pos", deepPosition);
         deepBlock.putInt("state", 0);
         blocks.add(deepBlock);

@@ -1,11 +1,10 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.util.math.BlockPos;
-
 import java.util.List;
 import java.util.Objects;
 import java.util.OptionalInt;
 import java.util.function.Predicate;
+import net.minecraft.core.BlockPos;
 
 /**
  * Shared ordered-support movement model for circular printing and teardown.
@@ -450,7 +449,7 @@ public final class OrderedUTraversalMovement {
                     + " ordered U support is not walkable from its endpoint."
             );
         }
-        return endpoint.add(-directionX, 0, -directionZ);
+        return endpoint.offset(-directionX, 0, -directionZ);
     }
 
     private static void requireHorizontalStep(int deltaX, int deltaZ) {

@@ -3,14 +3,6 @@ package com.julflips.nerv_printer.utils;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import net.minecraft.item.Item;
-import net.minecraft.item.ItemStack;
-import net.minecraft.registry.Registries;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.Pair;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Vec3d;
-
 import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
@@ -19,6 +11,13 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import com.julflips.nerv_printer.utils.Tuple;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.Vec3;
 
 public final class ConfigDeserializer {
 
@@ -30,18 +29,18 @@ public final class ConfigDeserializer {
         );
     }
 
-    private static Vec3d jsonToVec3d(JsonObject obj) {
-        return new Vec3d(
+    private static Vec3 jsonToVec3d(JsonObject obj) {
+        return new Vec3(
             obj.get("x").getAsDouble(),
             obj.get("y").getAsDouble(),
             obj.get("z").getAsDouble()
         );
     }
 
-    private static Pair<BlockPos, Vec3d> jsonToBlockPosVecPair(JsonObject obj) {
+    private static Tuple<BlockPos, Vec3> jsonToBlockPosVecPair(JsonObject obj) {
         BlockPos pos = jsonToBlockPos(obj.getAsJsonObject("blockPos"));
-        Vec3d openPos = jsonToVec3d(obj.getAsJsonObject("openPos"));
-        return new Pair<>(pos, openPos);
+        Vec3 openPos = jsonToVec3d(obj.getAsJsonObject("openPos"));
+        return new Tuple<>(pos, openPos);
     }
 
     /**
@@ -49,19 +48,19 @@ public final class ConfigDeserializer {
      */
     public static class ConfigData {
         public String type;
-        public Pair<BlockPos, Vec3d> reset;
-        public Pair<BlockPos, Vec3d> cartographyTable;
-        public Pair<BlockPos, Vec3d> finishedMapChest;
-        public Pair<BlockPos, Vec3d> usedToolChest;
-        public Pair<BlockPos, Vec3d> bed;
-        public Pair<BlockPos, Vec3d> anvil;
-        public Pair<BlockPos, Vec3d> enderChest;
-        public Pair<BlockPos, Vec3d> craftingTable;
-        public ArrayList<Pair<BlockPos, Vec3d>> mapMaterialChests;
-        public Pair<Vec3d, Pair<Float, Float>> dumpStation;
+        public Tuple<BlockPos, Vec3> reset;
+        public Tuple<BlockPos, Vec3> cartographyTable;
+        public Tuple<BlockPos, Vec3> finishedMapChest;
+        public Tuple<BlockPos, Vec3> usedToolChest;
+        public Tuple<BlockPos, Vec3> bed;
+        public Tuple<BlockPos, Vec3> anvil;
+        public Tuple<BlockPos, Vec3> enderChest;
+        public Tuple<BlockPos, Vec3> craftingTable;
+        public ArrayList<Tuple<BlockPos, Vec3>> mapMaterialChests;
+        public Tuple<Vec3, Tuple<Float, Float>> dumpStation;
         public BlockPos mapCorner;
-        public HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict;
-        public HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests;
+        public HashMap<Item, ArrayList<Tuple<BlockPos, Vec3>>> materialDict;
+        public HashMap<Item, Tuple<BlockPos, Vec3>> usedToolChests;
         public Set<ItemStack> toolSet;
         public HashMap<Item, Integer> toolMinimumEfficiency;
     }
@@ -111,11 +110,11 @@ public final class ConfigDeserializer {
             if (root.has("dumpStation")) {
                 JsonObject dump = root.getAsJsonObject("dumpStation");
 
-                Vec3d pos = jsonToVec3d(dump.getAsJsonObject("pos"));
+                Vec3 pos = jsonToVec3d(dump.getAsJsonObject("pos"));
                 float yaw = dump.get("yaw").getAsFloat();
                 float pitch = dump.get("pitch").getAsFloat();
 
-                data.dumpStation = new Pair<>(pos, new Pair<>(yaw, pitch));
+                data.dumpStation = new Tuple<>(pos, new Tuple<>(yaw, pitch));
             } else {
                 data.dumpStation = null;
             }
@@ -126,9 +125,9 @@ public final class ConfigDeserializer {
             if (root.has("materialDict")) {
                 JsonObject materialDictObj = root.getAsJsonObject("materialDict");
                 for (String key : materialDictObj.keySet()) {
-                    Identifier id = Identifier.of(key);
-                    Item item = Registries.ITEM.get(id);
-                    ArrayList<Pair<BlockPos, Vec3d>> list = new ArrayList<>();
+                    Identifier id = Identifier.parse(key);
+                    Item item = BuiltInRegistries.ITEM.getValue(id);
+                    ArrayList<Tuple<BlockPos, Vec3>> list = new ArrayList<>();
                     for (JsonElement e : materialDictObj.getAsJsonArray(key)) {
                         list.add(jsonToBlockPosVecPair(e.getAsJsonObject()));
                     }
@@ -141,8 +140,8 @@ public final class ConfigDeserializer {
             if (root.has("toolSet")) {
                 for (JsonElement e : root.getAsJsonArray("toolSet")) {
                     JsonObject o = e.getAsJsonObject();
-                    Identifier id = Identifier.of(o.get("item").getAsString());
-                    Item item = Registries.ITEM.get(id);
+                    Identifier id = Identifier.parse(o.get("item").getAsString());
+                    Item item = BuiltInRegistries.ITEM.getValue(id);
                     data.toolSet.add(
                         new ItemStack(item)
                     );
@@ -160,8 +159,8 @@ public final class ConfigDeserializer {
             if (root.has("usedToolChests")) {
                 JsonObject usedToolChestsObj = root.getAsJsonObject("usedToolChests");
                 for (String key : usedToolChestsObj.keySet()) {
-                    Identifier id = Identifier.of(key);
-                    Item item = Registries.ITEM.get(id);
+                    Identifier id = Identifier.parse(key);
+                    Item item = BuiltInRegistries.ITEM.getValue(id);
                     data.usedToolChests.put(
                         item,
                         jsonToBlockPosVecPair(usedToolChestsObj.getAsJsonObject(key))

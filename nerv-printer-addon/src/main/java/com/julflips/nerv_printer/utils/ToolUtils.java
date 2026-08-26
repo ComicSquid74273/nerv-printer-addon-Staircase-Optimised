@@ -1,14 +1,13 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.block.BlockState;
-import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.enchantment.Enchantments;
-import net.minecraft.item.ItemStack;
-import net.minecraft.item.ShearsItem;
-import net.minecraft.registry.Registries;
-import net.minecraft.registry.tag.ItemTags;
-
 import java.util.Set;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.ItemTags;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ShearsItem;
+import net.minecraft.world.item.enchantment.EnchantmentHelper;
+import net.minecraft.world.item.enchantment.Enchantments;
+import net.minecraft.world.level.block.state.BlockState;
 
 public final class ToolUtils {
 
@@ -33,7 +32,7 @@ public final class ToolUtils {
         // improves on hand mining for this block.
         if (bestStack == null) {
             for (ItemStack tool : tools) {
-                if (tool.isIn(ItemTags.PICKAXES)
+                if (tool.is(ItemTags.PICKAXES)
                     && isDeterministicallyBetter(
                         tool,
                         bestStack,
@@ -67,7 +66,7 @@ public final class ToolUtils {
                 "Efficiency level cannot be negative."
             );
         }
-        float baseSpeed = tool.getMiningSpeedMultiplier(targetBlock);
+        float baseSpeed = tool.getDestroySpeed(targetBlock);
         double effectiveSpeed = baseSpeed;
         if (baseSpeed > 1.0F && efficiency > 0) {
             effectiveSpeed += efficiency * efficiency + 1.0;
@@ -77,19 +76,19 @@ public final class ToolUtils {
         // 30. Encoding that ratio keeps cross-item selection aligned with
         // actual breaking progress without depending on the currently held
         // stack.
-        if (targetBlock.isToolRequired()
-            && !tool.isSuitableFor(targetBlock)) {
+        if (targetBlock.requiresCorrectToolForDrops()
+            && !tool.isCorrectToolForDrops(targetBlock)) {
             effectiveSpeed *= 0.3;
         }
         return effectiveSpeed;
     }
 
     public static int getEfficiencyLevel(ItemStack stack) {
-        for (var entry : EnchantmentHelper.getEnchantments(stack)
-            .getEnchantmentEntries()) {
-            if (entry.getKey().getKey().isPresent()
-                && entry.getKey().getKey().get().getValue().equals(
-                    Enchantments.EFFICIENCY.getValue()
+        for (var entry : EnchantmentHelper.getEnchantmentsForCrafting(stack)
+            .entrySet()) {
+            if (entry.getKey().unwrapKey().isPresent()
+                && entry.getKey().unwrapKey().get().identifier().equals(
+                    Enchantments.EFFICIENCY.identifier()
                 )) {
                 return entry.getIntValue();
             }
@@ -98,10 +97,10 @@ public final class ToolUtils {
     }
 
     public static boolean isTool(ItemStack itemStack) {
-        if (itemStack.isIn(ItemTags.PICKAXES)
-            || itemStack.isIn(ItemTags.AXES)
-            || itemStack.isIn(ItemTags.SHOVELS)
-            || itemStack.isIn(ItemTags.HOES)
+        if (itemStack.is(ItemTags.PICKAXES)
+            || itemStack.is(ItemTags.AXES)
+            || itemStack.is(ItemTags.SHOVELS)
+            || itemStack.is(ItemTags.HOES)
             || itemStack.getItem() instanceof ShearsItem) {
             return true;
         }
@@ -128,14 +127,14 @@ public final class ToolUtils {
         if (efficiencyComparison != 0) return efficiencyComparison > 0;
 
         int speedComparison = Float.compare(
-            candidate.getMiningSpeedMultiplier(targetBlock),
-            current.getMiningSpeedMultiplier(targetBlock)
+            candidate.getDestroySpeed(targetBlock),
+            current.getDestroySpeed(targetBlock)
         );
         if (speedComparison != 0) return speedComparison > 0;
 
-        return Registries.ITEM.getId(candidate.getItem()).toString()
+        return BuiltInRegistries.ITEM.getKey(candidate.getItem()).toString()
             .compareTo(
-                Registries.ITEM.getId(current.getItem()).toString()
+                BuiltInRegistries.ITEM.getKey(current.getItem()).toString()
             ) < 0;
     }
 }

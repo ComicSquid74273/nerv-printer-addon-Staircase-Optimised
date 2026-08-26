@@ -1,9 +1,8 @@
 package com.julflips.nerv_printer.utils;
 
-import net.minecraft.component.DataComponentTypes;
-import net.minecraft.item.ItemStack;
-
 import java.util.Objects;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.ItemStack;
 
 /**
  * Immutable, structural key for an {@link ItemStack}'s item and components.
@@ -25,7 +24,7 @@ public final class StructuralItemStackKey {
             ? ItemStack.EMPTY
             : source.copyWithCount(1);
         if (!stack.isEmpty() && ignoreDamage) {
-            stack.remove(DataComponentTypes.DAMAGE);
+            stack.remove(DataComponents.DAMAGE);
         }
     }
 
@@ -43,7 +42,7 @@ public final class StructuralItemStackKey {
     public boolean equals(Object other) {
         return this == other
             || (other instanceof StructuralItemStackKey key
-                && ItemStack.areItemsAndComponentsEqual(
+                && ItemStack.isSameItemSameComponents(
                     stack,
                     key.stack
                 ));

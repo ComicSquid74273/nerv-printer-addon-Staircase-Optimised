@@ -3,10 +3,9 @@ package com.julflips.nerv_printer.utils;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
-import net.minecraft.entity.Entity;
-import net.minecraft.util.math.MathHelper;
-import net.minecraft.util.math.Vec3d;
-
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.Vec3;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -128,7 +127,7 @@ public final class BoatFlyAdapter {
         return true;
     }
 
-    public void drive(Entity vehicle, Vec3d target, DriveMode mode) {
+    public void drive(Entity vehicle, Vec3 target, DriveMode mode) {
         if (snapshot == null || mc.player == null || vehicle == null || target == null) {
             stop();
             return;
@@ -159,13 +158,13 @@ public final class BoatFlyAdapter {
         Utils.setRightPressed(false);
         if (!horizontalArrived) {
             float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
-            mc.player.setYaw(MathHelper.wrapDegrees(yaw));
-            vehicle.setYaw(MathHelper.wrapDegrees(yaw));
+            mc.player.setYRot(Mth.wrapDegrees(yaw));
+            vehicle.setYRot(Mth.wrapDegrees(yaw));
             Utils.setForwardPressed(true);
         } else {
             Utils.setForwardPressed(false);
-            Vec3d velocity = vehicle.getVelocity();
-            vehicle.setVelocity(0.0, velocity.y, 0.0);
+            Vec3 velocity = vehicle.getDeltaMovement();
+            vehicle.setDeltaMovement(0.0, velocity.y, 0.0);
         }
         Utils.setBackwardPressed(false);
         Utils.setJumpPressed(dy > 0.10);
@@ -197,7 +196,7 @@ public final class BoatFlyAdapter {
                     verticalVelocity
                 )
         );
-        vehicle.setVelocity(
+        vehicle.setDeltaMovement(
             horizontalStep.x(),
             verticalVelocity,
             horizontalStep.z()
@@ -263,7 +262,7 @@ public final class BoatFlyAdapter {
         clearInjectedKeys();
         if (mc.player != null && mc.player.getVehicle() != null) {
             Entity vehicle = mc.player.getVehicle();
-            vehicle.setVelocity(0, 0, 0);
+            vehicle.setDeltaMovement(0, 0, 0);
         }
     }
 
