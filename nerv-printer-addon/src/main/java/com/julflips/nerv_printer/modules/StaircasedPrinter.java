@@ -11,6 +11,7 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.utils.StarscriptTextBoxRenderer;
 import meteordevelopment.meteorclient.gui.widgets.WWidget;
+import meteordevelopment.meteorclient.gui.widgets.WLabel;
 import meteordevelopment.meteorclient.gui.widgets.containers.WTable;
 import meteordevelopment.meteorclient.gui.widgets.containers.WVerticalList;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
@@ -30,9 +31,13 @@ import meteordevelopment.orbit.EventPriority;
 import net.minecraft.block.*;
 import net.minecraft.block.enums.ChestType;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.ContainerComponent;
 import net.minecraft.component.type.MapIdComponent;
 import net.minecraft.enchantment.EnchantmentHelper;
 import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.ItemEntity;
+import net.minecraft.entity.vehicle.AbstractBoatEntity;
 import net.minecraft.item.*;
 import net.minecraft.item.map.MapState;
 import net.minecraft.nbt.NbtCompound;
@@ -47,6 +52,7 @@ import net.minecraft.network.packet.s2c.play.InventoryS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.network.packet.s2c.play.ScreenHandlerSlotUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.SetPlayerInventoryS2CPacket;
+import net.minecraft.network.packet.s2c.play.VehicleMoveS2CPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.screen.slot.SlotActionType;
@@ -59,6 +65,7 @@ import net.minecraft.util.Pair;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import org.lwjgl.util.tinyfd.TinyFileDialogs;
 
@@ -73,6 +80,34 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class StaircasedPrinter extends Module implements MapPrinter {
+    private static final int RASTER_PRINT_BAND_ROWS = 1;
+    private static final int RASTER_ROUTE_MAX_SEGMENT_CELLS = 8;
+    private static final int RASTER_ROUTE_STUCK_TICKS = 40;
+    private static final int RASTER_ROUTE_SEARCH_STUCK_TICKS = 40;
+    private static final double RASTER_ROUTE_CLEARANCE_LOOKAHEAD = 2.0;
+    private static final double RASTER_ROUTE_CLEARANCE_SAMPLE_STEP = 0.25;
+    private static final double RASTER_BUILD_INTERACTION_RANGE =
+        RasterSideLanePlanner.ABSOLUTE_REACH;
+    private static final double RASTER_EXTERIOR_CRUISE_HEIGHT_ABOVE_MAP = 2.0;
+    private static final double RASTER_INGRESS_MAX_EXTRA_CRUISE_HEIGHT = 12.0;
+    private static final double RASTER_INGRESS_CRUISE_HEIGHT_STEP = 1.0;
+    private static final double RASTER_LOCAL_RESUME_VERTICAL_TOLERANCE = 4.0;
+    private static final int RASTER_WALK_MAX_FAILURES = 3;
+    private static final int RASTER_SAFE_RETRY_COOLDOWN_TICKS = 100;
+    private static final int RASTER_RESTOCK_MAX_LANDING_FAILURES = 8;
+    private static final int RASTER_RESTOCK_LANDING_SEARCH_RADIUS = 24;
+    private static final int RASTER_CONTAINER_CLOSE_SETTLE_TICKS = 2;
+    private static final int RASTER_LAUNCH_SCAFFOLD_TIMEOUT_TICKS = 100;
+    private static final int RASTER_LAUNCH_SCAFFOLD_RETRY_TICKS = 5;
+    private static final int RASTER_STAGING_BREAK_WATCHDOG_TICKS = 240;
+    private static final double RASTER_ROUTE_WAYPOINT_TOLERANCE = 0.55;
+    private static final double RASTER_EXTERIOR_WAYPOINT_TOLERANCE = 0.10;
+    private static final double RASTER_EXTERIOR_VERTICAL_WAYPOINT_TOLERANCE = 0.10;
+    private static final double RASTER_BOAT_UNDERSIDE_AIR_GAP = 1.0;
+    private static final double RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN = 0.25;
+    private static final int RASTER_ROUTE_REJOIN_REPLAY_POINTS = 3;
+    private static final int RASTER_ROUTE_VALIDATION_SEGMENTS_PER_TICK = 64;
+    private static final int RASTER_FIXED_ROUTE_EAGER_VALIDATION_LIMIT = 64;
     private static final String FILE_META_MODULE = "module";
     private static final String FILE_META_JOB_ID = "jobId";
     private static final String FILE_META_GENERATION = "generation";
@@ -168,12 +203,34 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private final Setting<Double> interactionRange = sgGeneral.add(new DoubleSetting.Builder()
         .name("interaction-range")
-        .description("Maximum fullblock placement range. Never exceeds the bot's five-block reach.")
-        .defaultValue(5)
+        .description("Maximum fullblock placement range. Staircased Printer has an absolute 5.90-block eye-to-interaction limit.")
+        .defaultValue(5.9)
         .min(1)
-        .max(5)
-        .sliderRange(1, 5)
+        .max(5.9)
+        .sliderRange(1, 5.9)
         .build()
+    );
+
+    private final Setting<Double> boatRasterTravelSpeed = sgGeneral.add(
+        new DoubleSetting.Builder()
+            .name("boat-raster-travel-speed")
+            .description("BoatFly speed while repositioning and travelling to logistics. Exterior travel stays level until its final endpoint handoff.")
+            .defaultValue(20)
+            .min(1)
+            .max(20)
+            .sliderRange(1, 20)
+            .build()
+    );
+
+    private final Setting<Double> boatRasterBuildSpeed = sgGeneral.add(
+        new DoubleSetting.Builder()
+            .name("boat-raster-build-speed")
+            .description("Strict BoatFly speed while placement is active. Motion is speed-bounded every client tick.")
+            .defaultValue(15)
+            .min(1)
+            .max(15)
+            .sliderRange(1, 15)
+            .build()
     );
 
     private final Setting<Double> maxBlockActionsPerSecond = sgGeneral.add(new DoubleSetting.Builder()
@@ -208,6 +265,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("nearby-range-placement")
         .description("Before restocking, reserve the complete active U first, then fill remaining managed capacity for dependency-safe nearby surface blocks. Nearby work never displaces the U.")
         .defaultValue(true)
+        .visible(() -> false)
         .build()
     );
 
@@ -215,6 +273,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("repair-current-u-pair")
         .description("Break and replace wrong blocks only inside the two-column U currently being printed.")
         .defaultValue(true)
+        .visible(() -> false)
         .build()
     );
 
@@ -222,7 +281,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("thm-instant-repair")
         .description("Temporarily configures Meteor Speed Mine like THM (Damage mode with instamine) only while repairing the active U, then restores its prior state.")
         .defaultValue(true)
-        .visible(repairCurrentUPair::get)
+        .visible(() -> false)
         .onChanged(enabled -> {
             if (!enabled) releaseBuildRepairSpeedMine();
         })
@@ -233,6 +292,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("thm-instant-teardown")
         .description("Temporarily configures Meteor Speed Mine for the one ordered teardown target owned by the U/column traversal, then restores its prior state.")
         .defaultValue(true)
+        .visible(() -> false)
         .onChanged(enabled -> {
             if (!enabled) releaseTeardownSpeedMine();
         })
@@ -251,6 +311,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             .min(2)
             .max(3)
             .sliderRange(2, 3)
+            .visible(() -> false)
             .build()
     );
 
@@ -260,6 +321,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .defaultValue(1)
         .min(0.5)
         .sliderRange(0.5, 2)
+        .visible(() -> false)
         .build()
     );
 
@@ -276,6 +338,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("sprint-mode")
         .description("How to sprint.")
         .defaultValue(SprintMode.Off)
+        .visible(() -> false)
         .build()
     );
 
@@ -301,6 +364,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("sleep")
         .description("Sleep in bed when starting a map to avoid Phantoms.")
         .defaultValue(true)
+        .visible(() -> false)
         .build()
     );
 
@@ -354,6 +418,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private final Setting<Integer> invActionDelay = sgAdvanced.add(new IntSetting.Builder()
         .name("inventory-action-delay")
         .description("How many ticks to wait between each inventory action (moving a stack).")
+        .defaultValue(2)
+        .min(1)
+        .sliderRange(1, 40)
+        .build()
+    );
+
+    private final Setting<Integer> boatRasterRestockActionDelay = sgAdvanced.add(new IntSetting.Builder()
+        .name("boat-raster-restock-action-delay")
+        .description("Ticks between Boat Raster inventory actions.")
         .defaultValue(2)
         .min(1)
         .sliderRange(1, 40)
@@ -472,7 +545,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private final Setting<Boolean> saveGeneratedNbt = sgAdvanced.add(new BoolSetting.Builder()
         .name("save-compact-nbt")
-        .description("When a raw NBT is loaded, write and reload-validate its exact compact circular form in _generated_compact. Printing always uses the validated compact plan.")
+        .description("Write and reload-validate the canonical normalized map surface used by Boat Raster.")
         .defaultValue(true)
         .build()
     );
@@ -481,6 +554,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("circular-u-traversal")
         .description("Build and mine a compact U route only when the complete joined pair is safe.")
         .defaultValue(true)
+        .visible(() -> false)
         .build()
     );
 
@@ -498,7 +572,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("require-complete-u-inventory")
         .description("Stop at the north endpoint instead of silently downgrading when the complete U and its repair tools cannot fit.")
         .defaultValue(true)
-        .visible(circularTraversal::get)
+        .visible(() -> false)
         .build()
     );
 
@@ -547,6 +621,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("direct-message-command")
         .description("The command used to send direct messages between master and slaves.")
         .defaultValue("w")
+        .visible(() -> false)
         .onChanged((value) -> SlaveSystem.directMessageCommand = value)
         .build()
     );
@@ -555,6 +630,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("sender-prefix")
         .description("The text that always comes before the name of sender of every direct message.")
         .defaultValue("")
+        .visible(() -> false)
         .onChanged((value) -> SlaveSystem.senderPrefix = value)
         .build()
     );
@@ -563,6 +639,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("sender-suffix")
         .description("The text that is always between the name of the sender and the actual message.")
         .defaultValue(" whispers: ")
+        .visible(() -> false)
         .onChanged((value) -> SlaveSystem.senderSuffix = value)
         .build()
     );
@@ -573,6 +650,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .defaultValue(50)
         .min(1)
         .sliderRange(1, 100)
+        .visible(() -> false)
         .onChanged((value) -> SlaveSystem.commandDelay = value)
         .build()
     );
@@ -584,6 +662,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .min(0)
         .max(36)
         .sliderRange(0, 10)
+        .visible(() -> false)
         .onChanged((value) -> SlaveSystem.randomLength = value)
         .build()
     );
@@ -847,6 +926,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     InventoryS2CPacket toBeHandledInvPacket;
     HashMap<Integer, Pair<Block, Integer>> blockPaletteDict;      //Maps palette block id to the Minecraft block and amount
     HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialDict; //Maps block to the chest pos and the open position
+    HashMap<Item, ArrayList<Pair<BlockPos, Vec3d>>> materialShulkerDict;
     HashMap<Item, Pair<BlockPos, Vec3d>> usedToolChests;          //Maps a used tool type to its single chest
     HashMap<BlockPos, Set<Item>> usedToolDepositPlan;
     HashMap<BlockPos, Set<Integer>> usedToolDepositSlotPlan;
@@ -1088,6 +1168,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     long[] serverHotbarSwapAckSequences;
     Item[] serverHotbarObservedItems;
     MiningToolIdentity[] serverHotbarObservedTools;
+    InventoryStackIdentity[] serverPlayerInventoryObservedIdentities;
+    long[] serverPlayerInventoryObservedSequences;
     HashMap<BlockPos, ServerBlockObservation> serverBlockObservations;
     HashMap<BlockPos, Long> placementSubmissionBlockSequences;
     HashMap<BlockPos, Long> repairSubmissionBlockSequences;
@@ -1133,9 +1215,157 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int recoveredActiveMiningTargetIndex;
     long lastLocalCycleCheckpointTick;
     boolean startContinueActivationRequested;
+    final BoatFlyAdapter boatFlyAdapter = new BoatFlyAdapter();
+    boolean boatRasterActive;
+    int rasterCursor;
+    int rasterRouteCursor;
+    int rasterSavedRouteCursor;
+    int rasterRouteRejoinCursor;
+    int rasterRouteValidationCursor;
+    int rasterRouteFailureCount;
+    int rasterLastFailedRouteDestination = -1;
+    long rasterPreflightRetryNotBeforeTick = -1L;
+    int rasterConfirmedFrontier;
+    int rasterSelectedBaseY;
+    int rasterRow;
+    int rasterDirection;
+    Vec3d rasterWaypoint;
+    Vec3d rasterDescentWaypoint;
+    Vec3d rasterEmergencyClearanceWaypoint;
+    Vec3d rasterBoatPathTarget;
+    double rasterBoatPathSupportPlaneY = Double.NaN;
+    Vec3d rasterWalkPathTarget;
+    final ArrayDeque<Vec3d> rasterBoatPath = new ArrayDeque<>();
+    final ArrayDeque<Vec3d> rasterWalkPath = new ArrayDeque<>();
+    final ArrayDeque<Vec3d> rasterCompiledSegmentPath = new ArrayDeque<>();
+    final HashMap<Integer, Double> rasterSideLaneOffsets = new HashMap<>();
+    int rasterOutwardLaneShiftBand = -1;
+    int rasterCompiledSegmentDestination = -1;
+    int rasterEnvelopeBoatId = Integer.MIN_VALUE;
+    Box rasterEnvelopeSignature;
+    int rasterLocalRecoveryRetainedDestination = -1;
+    Vec3d rasterBoatPathPreviousPosition;
+    Vec3d rasterRoutePreviousPosition;
+    int rasterRouteTrackedDestination = -1;
+    double rasterRouteBestDistance = Double.POSITIVE_INFINITY;
+    long rasterRouteLastProgressTick = -1000L;
+    final RasterFlightProgressWatchdog<Vec3d>
+        rasterDirectFlightProgress =
+            new RasterFlightProgressWatchdog<>(
+                RASTER_ROUTE_STUCK_TICKS,
+                0.10
+            );
+    boolean rasterDirectStallRecoveryPending;
+    Vec3d rasterBoatPathTrackedWaypoint;
+    double rasterBoatPathBestDistance = Double.POSITIVE_INFINITY;
+    long rasterBoatPathLastProgressTick = -1000L;
+    long rasterBoatPathPlannedTick = -1000L;
+    long rasterWalkPathPlannedTick = -1000L;
+    Vec3d rasterWalkTrackedWaypoint;
+    double rasterWalkBestDistance = Double.POSITIVE_INFINITY;
+    long rasterWalkLastProgressTick = -1000L;
+    int rasterWalkRouteFailures;
+    long rasterWalkRetryNotBeforeTick = -1L;
+    BlockPos rasterWalkRetryOrigin;
+    float rasterLastPlayerHealth = -1.0f;
+    boolean rasterDamageReplanPending;
+    BlockPos rasterLaunchBlock;
+    BlockPos rasterBoatPosition;
+    int rasterBoatDeployAttempts;
+    long rasterBoatDeployLastAttemptTick = -1000L;
+    int rasterBoatMountAttempts;
+    int rasterBoatMountTargetId = Integer.MIN_VALUE;
+    long rasterBoatMountLastAttemptTick = -1000L;
+    long rasterLaunchScaffoldStartedTick = -1L;
+    long rasterLaunchScaffoldLastAttemptTick = -1000L;
+    final LinkedHashSet<BlockPos> rasterRejectedLaunchBlocks = new LinkedHashSet<>();
+    final LinkedHashSet<BlockPos> rasterOwnedTemporaryBlocks = new LinkedHashSet<>();
+    final ArrayDeque<BlockPos> rasterClearanceQueue = new ArrayDeque<>();
+    long rasterPhaseStartedTick;
+    long rasterManualOverrideUntilTick;
+    long rasterLastCorrectionTick = -1L;
+    double rasterLastCorrectionDistance;
+    boolean rasterCorrectionPending;
+    boolean rasterPrintCorridorAcquired;
+    boolean rasterRouteRejoinPending;
+    boolean rasterRouteRejoinSnapshotAccepted;
+    boolean rasterRouteValidated;
+    boolean rasterRestockExteriorAcquired;
+    final StableRecoverySnapshotGate<BlockPos> rasterRecoverySnapshotGate =
+        new StableRecoverySnapshotGate<>(3);
+    Vec3d rasterStrictPlacementDetour;
+    int rasterStrictPlacementDetourTargetIndex = -1;
+    String rasterStatus = "off";
+    String lastRasterHeartbeatStatus;
+    long lastRasterHeartbeatTick = -1000L;
+    Item rasterBoatItem;
+    Pair<BlockPos, Vec3d> rasterBoatSourceChest;
+    RasterRestockPhase rasterRestockPhase = RasterRestockPhase.NONE;
+    Item rasterRestockMaterial;
+    Item rasterRestockShulkerItem;
+    Pair<BlockPos, Vec3d> rasterRestockSource;
+    Vec3d rasterRestockLanding;
+    BlockPos rasterRestockDismountCell;
+    final LinkedHashSet<BlockPos> rasterRejectedRestockLandings =
+        new LinkedHashSet<>();
+    int rasterRestockLandingFailures;
+    int rasterRestockDiscardPendingSlot = -1;
+    Item rasterRestockDiscardPendingItem;
+    int rasterRestockDiscardPendingCount;
+    int rasterRestockDiscardAttempts;
+    int rasterRestockDiscardedStacks;
+    long rasterRestockDiscardSubmittedTick = -1000L;
+    boolean rasterReturningToParkedBoat;
+    int rasterRestockBoatCountBefore;
+    long rasterRestockBoatBreakLastAttemptTick = -1000L;
+    long rasterRestockDismountRequestedTick = -1000L;
+    int rasterRestockResumeRouteIndex = -1;
+    BlockPos rasterStagingBlock;
+    int rasterRestockSyncId = -1;
+    int rasterRestockAttempts;
+    int rasterStagingBreakProgressTicks;
+    long rasterStagingBreakFirstDispatchTick = -1L;
+    long rasterStagingBreakLastDispatchTick = -1000L;
+    int rasterRestockMaterialBefore;
+    int rasterEmptyShellsBefore;
+    int rasterRestockTargetPlayerCount;
+    int rasterRestockTransferBeforePlayerCount;
+    int rasterRestockContainerSlots;
+    int rasterRestockQueuedSourceSlot = -1;
+    int rasterRestockQueuedSyncId = -1;
+    long rasterLastRestockActionTick = -1000L;
+    boolean rasterRestockConfirmationReopen;
+    boolean rasterRestockReturnConfirmationReopen;
+    final HashMap<Integer, Integer> rasterRestockPlayerMaterialSlots = new HashMap<>();
+    final HashMap<Integer, Integer> rasterRestockPlayerShulkerSlots = new HashMap<>();
+    boolean rasterRestockBeforeDeployment;
+    boolean rasterBoatReturnSubmitted;
+    boolean rasterBoatWithdrawalSubmitted;
+    final HashMap<Item, Integer> rasterInventoryBaseline = new HashMap<>();
+    final LinkedHashMap<Item, Integer> rasterMaterialDemand = new LinkedHashMap<>();
+    final HashMap<Item, ArrayList<Integer>> rasterMaterialUseIndices = new HashMap<>();
+    final LinkedHashMap<Item, Integer> rasterInventoryFillPlan = new LinkedHashMap<>();
+    final LinkedHashMap<Item, Integer> rasterInventoryRunKeepCounts =
+        new LinkedHashMap<>();
+    final ArrayList<Integer> rasterManagedHotbarSlots = new ArrayList<>();
+    final HashMap<BlockPos, Integer> rasterTargetIndices = new HashMap<>();
+    final HashMap<Long, BlockPos> rasterTargetsByHorizontalCell = new HashMap<>();
+    RasterFlightPlan.Plan rasterFlightPlan;
+    RasterBuildRoutePlan.Plan<BlockPos> rasterBuildRoutePlan;
+    RasterSurfaceNormalizer.Result rasterSurface;
+    String rasterTraversalName = "unplanned";
+    int rasterLastCorridorCheckedCursor = -1;
+    WLabel rasterPhaseLabel;
+    WLabel rasterProgressLabel;
+    WLabel rasterLogisticsLabel;
+    WLabel rasterCorrectionLabel;
+    WLabel rasterPlanLabel;
+    BoatRasterCheckpointStore rasterCheckpointStore;
+    long lastRasterCheckpointTick = -20L;
+    State rasterResumeAfterMount = State.RasterPrinting;
 
     public StaircasedPrinter() {
-        super(Addon.CATEGORY, "fullblock-printer", "Automatically builds fullblock maps with optional staircasing from nbt files.");
+        super(Addon.CATEGORY, "staircased-printer", "Automatically builds staircased fullblock maps from NBT files.");
     }
 
     @Override
@@ -1163,6 +1393,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
         materialDict = new HashMap<>();
+        materialShulkerDict = new HashMap<>();
         usedToolChests = new HashMap<>();
         usedToolDepositPlan = new HashMap<>();
         usedToolDepositSlotPlan = new HashMap<>();
@@ -1340,6 +1571,120 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildRecoveryNeedsInventory = false;
         buildRecoveryRestockAfterEgress = false;
         buildingActive = false;
+        boatRasterActive = false;
+        rasterCursor = 0;
+        rasterRouteCursor = 0;
+        rasterSavedRouteCursor = 0;
+        rasterRouteRejoinCursor = 0;
+        rasterRouteValidationCursor = 0;
+        rasterRouteFailureCount = 0;
+        rasterLastFailedRouteDestination = -1;
+        rasterPreflightRetryNotBeforeTick = -1L;
+        rasterConfirmedFrontier = 0;
+        rasterSelectedBaseY = Integer.MIN_VALUE;
+        rasterRow = 0;
+        rasterDirection = 1;
+        rasterWaypoint = null;
+        rasterDescentWaypoint = null;
+        rasterEmergencyClearanceWaypoint = null;
+        rasterBoatPathTarget = null;
+        rasterWalkPathTarget = null;
+        rasterBoatPath.clear();
+        rasterWalkPath.clear();
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        rasterLocalRecoveryRetainedDestination = -1;
+        rasterBoatPathPreviousPosition = null;
+        rasterRoutePreviousPosition = null;
+        rasterRouteTrackedDestination = -1;
+        rasterRouteBestDistance = Double.POSITIVE_INFINITY;
+        rasterRouteLastProgressTick = -1000L;
+        rasterDirectFlightProgress.reset();
+        rasterDirectStallRecoveryPending = false;
+        rasterBoatPathTrackedWaypoint = null;
+        rasterBoatPathBestDistance = Double.POSITIVE_INFINITY;
+        rasterBoatPathLastProgressTick = -1000L;
+        rasterBoatPathPlannedTick = -1000L;
+        rasterWalkPathPlannedTick = -1000L;
+        rasterWalkTrackedWaypoint = null;
+        rasterWalkBestDistance = Double.POSITIVE_INFINITY;
+        rasterWalkLastProgressTick = -1000L;
+        rasterWalkRouteFailures = 0;
+        rasterWalkRetryNotBeforeTick = -1L;
+        rasterWalkRetryOrigin = null;
+        rasterLastPlayerHealth = -1.0f;
+        rasterDamageReplanPending = false;
+        rasterLaunchBlock = null;
+        rasterBoatPosition = null;
+        rasterBoatDeployAttempts = 0;
+        rasterBoatDeployLastAttemptTick = -1000L;
+        rasterBoatMountAttempts = 0;
+        rasterBoatMountTargetId = Integer.MIN_VALUE;
+        rasterBoatMountLastAttemptTick = -1000L;
+        resetRasterLaunchScaffoldProgress();
+        rasterRejectedLaunchBlocks.clear();
+        rasterOwnedTemporaryBlocks.clear();
+        rasterClearanceQueue.clear();
+        rasterPhaseStartedTick = 0L;
+        rasterManualOverrideUntilTick = 0L;
+        rasterLastCorrectionTick = -1L;
+        rasterLastCorrectionDistance = 0.0;
+        rasterCorrectionPending = false;
+        rasterPrintCorridorAcquired = false;
+        rasterRouteRejoinPending = false;
+        rasterRouteRejoinSnapshotAccepted = false;
+        rasterRouteValidated = false;
+        rasterRestockExteriorAcquired = false;
+        rasterRecoverySnapshotGate.reset();
+        rasterStrictPlacementDetour = null;
+        rasterStrictPlacementDetourTargetIndex = -1;
+        rasterStatus = "off";
+        rasterBoatItem = null;
+        rasterBoatSourceChest = null;
+        rasterRestockPhase = RasterRestockPhase.NONE;
+        rasterRestockMaterial = null;
+        rasterRestockShulkerItem = null;
+        rasterRestockSource = null;
+        resetRasterRestockLandingState();
+        rasterReturningToParkedBoat = false;
+        rasterRestockBoatCountBefore = 0;
+        rasterRestockBoatBreakLastAttemptTick = -1000L;
+        rasterRestockDismountRequestedTick = -1000L;
+        rasterRestockResumeRouteIndex = -1;
+        rasterStagingBlock = null;
+        rasterRestockSyncId = -1;
+        rasterRestockAttempts = 0;
+        rasterStagingBreakProgressTicks = 0;
+        rasterStagingBreakFirstDispatchTick = -1L;
+        rasterStagingBreakLastDispatchTick = -1000L;
+        rasterRestockMaterialBefore = 0;
+        rasterEmptyShellsBefore = 0;
+        rasterRestockTargetPlayerCount = 0;
+        rasterRestockTransferBeforePlayerCount = 0;
+        rasterRestockContainerSlots = 0;
+        rasterRestockQueuedSourceSlot = -1;
+        rasterRestockQueuedSyncId = -1;
+        rasterLastRestockActionTick = -1000L;
+        rasterRestockConfirmationReopen = false;
+        rasterRestockReturnConfirmationReopen = false;
+        rasterRestockPlayerMaterialSlots.clear();
+        rasterRestockPlayerShulkerSlots.clear();
+        rasterRestockBeforeDeployment = false;
+        rasterBoatReturnSubmitted = false;
+        rasterBoatWithdrawalSubmitted = false;
+        rasterInventoryBaseline.clear();
+        rasterMaterialDemand.clear();
+        rasterMaterialUseIndices.clear();
+        rasterInventoryFillPlan.clear();
+        rasterInventoryRunKeepCounts.clear();
+        rasterTargetIndices.clear();
+        rasterTargetsByHorizontalCell.clear();
+        rasterManagedHotbarSlots.clear();
+        rasterFlightPlan = null;
+        rasterBuildRoutePlan = null;
+        rasterTraversalName = "unplanned";
+        rasterLastCorridorCheckedCursor = -1;
+        rasterResumeAfterMount = State.RasterPrinting;
         circularTraversalForCurrentMap = circularTraversal.get();
         reconnectRecoveryPending = false;
         reconnectPlayerInventorySnapshotBaseline = -1L;
@@ -1394,6 +1739,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             serverHotbarObservedTools,
             miningToolIdentity(ItemStack.EMPTY)
         );
+        serverPlayerInventoryObservedIdentities =
+            new InventoryStackIdentity[36];
+        serverPlayerInventoryObservedSequences = new long[36];
         serverBlockObservations = new HashMap<>();
         placementSubmissionBlockSequences = new HashMap<>();
         repairSubmissionBlockSequences = new HashMap<>();
@@ -1489,6 +1837,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             toggle();
             return;
         }
+        if (!configureRasterCheckpointing()) {
+            toggle();
+            return;
+        }
 
         if (displayMaxRequirements.get() && !SlaveSystem.isFileMode()) {
             HashMap<Block, Integer> materialCountDict = new HashMap<>();
@@ -1519,10 +1871,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         state = State.SelectingMapArea;
-        if (useDefaultConfigFile.get()) {
-            File configFolder = new File(mapFolder, "_configs");
-            if (!loadConfig(new File(configFolder, configFileName.get()))) {
+        File configFolder = new File(mapFolder, "_configs");
+        File configuredPrinter = new File(configFolder, configFileName.get());
+        File boatRasterResumeConfig = new File(
+            configFolder,
+            "boatconfigcreative"
+        );
+        boolean autoResumeBoatRaster = boatRasterResumeConfig.isFile();
+        if (useDefaultConfigFile.get() || autoResumeBoatRaster) {
+            if (!useDefaultConfigFile.get()) {
+                configuredPrinter = boatRasterResumeConfig;
+            }
+            if (!loadConfig(configuredPrinter)) {
                 info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
+            } else if (validateStartRequirements()) {
+                info(
+                    "Boat Raster automatically loaded "
+                        + configuredPrinter.getName()
+                        + "; resuming from the authoritative checkpoint without a Start Block interaction."
+                );
+                startBuilding();
             }
         } else {
             info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
@@ -1560,8 +1928,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     @Override
     public void onDeactivate() {
+        persistRasterCheckpoint("module-deactivate");
+        releaseBoatRasterControl("module disabled");
         freezeForRecoveryClassification();
-        if (mapCyclePhase != null
+        if (!isBoatRasterState()
+            && mapCyclePhase != null
             && mapCyclePhase.isInProgress()
             && !fileMasterRecoveryLoaded
             && !localCycleRecoveryCandidate) {
@@ -1611,10 +1982,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Utils.setForwardPressed(false);
         Utils.setBackwardPressed(false);
         Utils.setJumpPressed(false);
+        Utils.setSprintPressed(false);
+        Utils.setSneakPressed(false);
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
     private void onGameLeft(GameLeftEvent event) {
+        persistRasterCheckpoint("disconnect");
+        releaseBoatRasterControl("disconnect");
+        if (isBoatRasterState()) {
+            receivedPackets.clear();
+            reconnectRecoveryPending = false;
+            buildRecoveryPending = false;
+            buildingActive = false;
+            return;
+        }
         freezeForRecoveryClassification();
         if (mapCyclePhase != null
             && mapCyclePhase.isInProgress()
@@ -1761,16 +2143,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private boolean validateStartRequirements() {
-        if (materialDict.isEmpty()) {
-            warning("No Material Chests selected!");
+        if (materialShulkerDict == null || materialShulkerDict.isEmpty()) {
+            warning("No single-material shulker chests selected!");
             return false;
         }
-        if (toolSet.isEmpty()) {
-            warning("No Tool Chests selected!");
-            return false;
-        }
-        if (mapMaterialChests.isEmpty()) {
-            warning("No Map Chests selected!");
+        if (dumpStation == null) {
+            warning("No excess-material drop point selected!");
             return false;
         }
         return true;
@@ -1790,6 +2168,29 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void handleReceivePacket(Packet<?> receivedPacket) {
         if (state == null) return;
+
+        if (RasterCorrectionPacketPolicy.requiresRouteRejoin(
+            receivedPacket instanceof PlayerPositionLookS2CPacket,
+            receivedPacket instanceof VehicleMoveS2CPacket
+        )) {
+            if (isBoatRasterState()
+                && mc.player != null
+                && mc.player.getVehicle() instanceof AbstractBoatEntity) {
+                rasterLastCorrectionTick = clientActionTick;
+                rasterCorrectionPending = state == State.RasterPrinting
+                    && rasterPrintCorridorAcquired;
+                rasterLastCorrectionDistance = rasterWaypoint == null
+                    || mc.player == null
+                    || mc.player.getVehicle() == null
+                    ? 0.0
+                    : mc.player.getVehicle().getEntityPos().distanceTo(rasterWaypoint);
+                boatFlyAdapter.stop();
+                rasterStatus = rasterCorrectionPending
+                    ? "server correction; rebasing"
+                    : "authoritative vehicle position updated";
+                return;
+            }
+        }
 
         if (receivedPacket instanceof PlayerPositionLookS2CPacket) {
             freezeForRecoveryClassification();
@@ -1838,6 +2239,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             serverInventoryUpdateSequence++;
             recordSlotHotbarObservation(packet);
             recordRestockSlotObservation(packet);
+            if (state == State.RasterRestock) {
+                handleRasterRestockSlotPacket(packet);
+            }
         } else if (receivedPacket
             instanceof SetPlayerInventoryS2CPacket packet) {
             serverInventoryUpdateSequence++;
@@ -1845,6 +2249,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         refreshPendingInventoryMetadataCapture();
         if (!(receivedPacket instanceof InventoryS2CPacket packet)) return;
+
+        if (state == State.RasterAwaitBoatChest) {
+            handleRasterBoatChestPacket(packet);
+            return;
+        }
+        if (state == State.RasterAwaitBoatReturn) {
+            handleRasterBoatReturnPacket(packet);
+            return;
+        }
+        if (state == State.RasterRestock) {
+            handleRasterRestockPacket(packet);
+            return;
+        }
 
         if (state.equals(State.AwaitUsedToolRegistrationResponse)) {
             registerSelectedUsedToolChest(packet);
@@ -1856,9 +2273,36 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             Item foundItem = null;
             ItemStack foundItemStack = null;
             boolean isMixedContent = false;
+            Item shulkerMaterial = null;
+            boolean foundShulker = false;
+            String shulkerFailure = null;
             for (int i = 0; i < packet.contents().size() - 36; i++) {
                 ItemStack stack = packet.contents().get(i);
                 if (!stack.isEmpty()) {
+                    Optional<Item> containedMaterial = singleMaterialShulker(stack);
+                    if (stack.getItem() instanceof BlockItem blockItem
+                        && blockItem.getBlock() instanceof ShulkerBoxBlock) {
+                        foundShulker = true;
+                        if (foundItem != null) {
+                            shulkerFailure = "mixes shulker boxes with loose items";
+                        }
+                        if (containedMaterial.isEmpty()) {
+                            if (!isEmptyShulker(stack)) {
+                                shulkerFailure = "contains a mixed-material shulker";
+                            }
+                            continue;
+                        }
+                        if (shulkerMaterial != null
+                            && shulkerMaterial != containedMaterial.get()) {
+                            shulkerFailure = "contains mismatched material shulkers";
+                        }
+                        shulkerMaterial = containedMaterial.get();
+                        continue;
+                    }
+                    if (foundShulker) {
+                        shulkerFailure = "mixes shulker boxes with loose items";
+                        continue;
+                    }
                     if (foundItem != null && foundItem != stack.getItem().asItem()) {
                         isMixedContent = true;
                     }
@@ -1879,6 +2323,49 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         return;
                     }
                 }
+            }
+            if (foundShulker) {
+                if (shulkerFailure != null || shulkerMaterial == null) {
+                    warning(
+                        "Rejected material chest at "
+                            + tempChestPos.toShortString() + ": "
+                            + (shulkerFailure == null
+                                ? "no usable single-material shulker was found"
+                                : shulkerFailure) + "."
+                    );
+                    state = State.SelectingChests;
+                    return;
+                }
+                materialShulkerDict.computeIfAbsent(
+                    shulkerMaterial,
+                    ignored -> new ArrayList<>()
+                );
+                materialShulkerDict.put(
+                    shulkerMaterial,
+                    Utils.saveAdd(
+                        materialShulkerDict.get(shulkerMaterial),
+                        tempChestPos,
+                        mc.player.getEntityPos()
+                    )
+                );
+                materialDict.computeIfAbsent(
+                    shulkerMaterial,
+                    ignored -> new ArrayList<>()
+                );
+                materialDict.put(
+                    shulkerMaterial,
+                    Utils.saveAdd(
+                        materialDict.get(shulkerMaterial),
+                        tempChestPos,
+                        mc.player.getEntityPos()
+                    )
+                );
+                info(
+                    "Registered single-material shulkers: §a"
+                        + shulkerMaterial.getName().getString()
+                );
+                state = State.SelectingChests;
+                return;
             }
             if (isMixedContent) {
                 warning("Different items found in chest. Please only have one item type in the chest.");
@@ -4828,6 +5315,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ItemStack stack
     ) {
         if (playerSlot < 0 || playerSlot >= 36) return;
+        serverPlayerInventoryObservedIdentities[playerSlot] =
+            inventoryStackIdentity(stack);
+        serverPlayerInventoryObservedSequences[playerSlot] =
+            serverInventoryUpdateSequence;
         PendingInventoryMetadataSwap pendingSwap =
             pendingInventoryMetadataSwap;
         boolean pendingSwapSlot = pendingSwap != null
@@ -4858,6 +5349,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             serverHotbarObservedTools[playerSlot] =
                 miningToolIdentity(stack);
         }
+
+        acknowledgePendingInventoryMetadataSwapFromSlotObservations();
 
         RepairToolShadow shadow = repairToolShadows.get(playerSlot);
         if (shadow != null
@@ -5060,6 +5553,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (localCycleCheckpointStore != null
             && mapCyclePhase != null
             && mapCyclePhase.isInProgress()
+            && !isBoatRasterState()
             && !fileMasterRecoveryLoaded
             && !localCycleRecoveryCandidate
             && clientActionTick - lastLocalCycleCheckpointTick
@@ -5091,6 +5585,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
         if (mc.player == null || mc.player.isDead()) {
+            if (isBoatRasterState()) {
+                releaseBoatRasterControl("player unavailable or dead");
+                error("Boat Raster stopped because the player died or disconnected.");
+                if (isActive()) toggle();
+                return;
+            }
             cancelLogisticsDetour();
             switch (activeRecoveryOwner()) {
                 case BUILD -> beginBuildRecovery(true);
@@ -5101,6 +5601,43 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     );
             }
             stopMovement();
+            return;
+        }
+        if (!buildingActive && rasterPreflightRetryNotBeforeTick >= 0L) {
+            stopMovement();
+            if (clientActionTick < rasterPreflightRetryNotBeforeTick) return;
+            if (!isRasterAreaLoaded()) {
+                rasterPreflightRetryNotBeforeTick = clientActionTick + 20L;
+                rasterStatus = "waiting for map/corridor chunks to load";
+                return;
+            }
+            rasterPreflightRetryNotBeforeTick = -1L;
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster map/corridor chunks are stable; automatically retrying preflight"
+            );
+            startBoatRasterBuilding();
+            return;
+        }
+        if (isBoatRasterState()) {
+            // Boat Raster owns its restart, correction, inventory, and
+            // checkpoint lifecycle. Never let legacy circular recovery
+            // reinterpret a second Start click or stale recovery flag.
+            buildRecoveryPending = false;
+            buildRecoveryNeedsInventory = false;
+            miningRecoveryPending = false;
+            miningRecoveryNeedsTools = false;
+            if (!RasterTickActionGate.allowRasterStateMachine(
+                confirmedBuildHotbarSwap.isPending(),
+                this::handleConfirmedBuildHotbarSwap
+            )) {
+                boatFlyAdapter.stop();
+                rasterStatus = "processing authoritative build hotbar swap";
+                return;
+            }
+            boolean manualRasterInput = Utils.isPhysicalMovementPressed()
+                || clientActionTick <= rasterManualOverrideUntilTick;
+            if (!manualRasterInput && !reconcilePendingBuildPlacements()) return;
+            runBoatRasterTick();
             return;
         }
         if (beginReconnectRecoveryIfPending()) return;
@@ -7313,11 +7850,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private TpsScaledActionBudget createWorkActionBudget() {
         return new TpsScaledActionBudget(
-            maxBlockActionsPerSecond.get(),
+            effectiveMaximumBlockActionsPerSecond(),
             minimumBlockActionTps.get(),
             MINIMUM_STALE_SERVER_TICK_SECONDS,
             WORK_ACTION_BURST_CAP
         );
+    }
+
+    private double effectiveMaximumBlockActionsPerSecond() {
+        return boatRasterActive
+            ? Math.max(45.0, maxBlockActionsPerSecond.get())
+            : maxBlockActionsPerSecond.get();
     }
 
     private void refreshWorkActionBudget() {
@@ -7325,7 +7868,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (workActionBudget == null
             || Double.compare(
                 workActionBudget.maximumActionsPerSecond(),
-                maxBlockActionsPerSecond.get()
+                effectiveMaximumBlockActionsPerSecond()
             ) != 0
             || Double.compare(
                 workActionBudget.minimumTps(),
@@ -7944,7 +8487,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + targetSlot + " nextAttempt="
                     + confirmedMiningHotbarSwap.attempts()
                     + " ackSequence="
-                        + serverHotbarSwapAckSequences[targetSlot]
+                        + serverHotbarUpdateSequences[targetSlot]
             );
             stopForMiningHotbarSwap(swapContext);
             return true;
@@ -8097,7 +8640,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ConfirmedHotbarSwap.Observation observation =
             confirmedBuildHotbarSwap.observe(
                 serverDestinationItem,
-                serverHotbarSwapAckSequences[targetSlot],
+                serverHotbarUpdateSequences[targetSlot],
                 printActionTick,
                 HOTBAR_SWAP_TIMEOUT_TICKS,
                 HOTBAR_SWAP_MAX_ATTEMPTS
@@ -8107,6 +8650,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return false;
         }
         if (observation == ConfirmedHotbarSwap.Observation.CONFIRMED) {
+            PendingInventoryMetadataSwap pending =
+                pendingInventoryMetadataSwap;
+            if (pending != null
+                && pending.targetHotbarSlot() == targetSlot
+                && pending.owner().startsWith("build-material")) {
+                pendingInventoryMetadataSwap = null;
+            }
             debugLog(
                 "HotbarSwap",
                 "build-material controller confirmed targetHotbarSlot="
@@ -8137,17 +8687,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         if (localDestinationItem.equals(expected)) {
-            // The client prediction is already correct. Do not issue a second
-            // SWAP that could reverse a server-accepted first click while its
-            // acknowledgement is delayed.
+            // Never repeat the material SWAP here: if the server accepted the
+            // first click, another SWAP would reverse it. Instead self-swap
+            // the destination hotbar slot. That click cannot change the
+            // inventory, while its deliberately stale revision makes the
+            // server return the authoritative full snapshot needed to confirm
+            // the original exchange.
+            if (!dispatchAuthoritativeHotbarResyncProbe(
+                targetSlot,
+                "build-material confirmation"
+            )) {
+                return failBuildHotbarSwap(expected);
+            }
             confirmedBuildHotbarSwap.markRetried(
-                serverHotbarSwapAckSequences[targetSlot],
+                serverHotbarUpdateSequences[targetSlot],
                 printActionTick
             );
             debugLog(
                 "HotbarSwap",
-                "build-material retry suppressed because client "
-                    + "prediction already matches expected "
+                "build-material authoritative resync requested because "
+                    + "client prediction already matches expected "
                     + "targetHotbarSlot=" + targetSlot
                     + " nextAttempt="
                         + confirmedBuildHotbarSwap.attempts()
@@ -8173,7 +8732,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return failBuildHotbarSwap(expected);
         }
         confirmedBuildHotbarSwap.markRetried(
-            serverHotbarSwapAckSequences[targetSlot],
+            serverHotbarUpdateSequences[targetSlot],
             printActionTick
         );
         debugLog(
@@ -8185,6 +8744,30 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
         if (mandatory) stopBuildForAction();
         return mandatory;
+    }
+
+    private boolean dispatchAuthoritativeHotbarResyncProbe(
+        int targetHotbarSlot,
+        String owner
+    ) {
+        if (mc.player == null
+            || mc.interactionManager == null
+            || mc.player.currentScreenHandler.syncId != 0
+            || targetHotbarSlot < 0
+            || targetHotbarSlot >= 9) {
+            error(
+                "Cannot request the authoritative " + owner
+                    + " snapshot outside the player inventory handler."
+            );
+            return false;
+        }
+        Utils.requestAuthoritativeHotbarSnapshot(targetHotbarSlot);
+        Addon.LOG.info(
+            "[Fullblock Printer] Requested non-mutating authoritative hotbar resync for {} in slot {}",
+            owner,
+            targetHotbarSlot
+        );
+        return true;
     }
 
     private boolean failBuildHotbarSwap(Item expected) {
@@ -10039,11 +10622,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 printActionTick - attempt.lastAttemptTick()
                     >= pendingPlacementLedger.retryAfterTicks();
             if (!isBuildPlacementInReach(world)) {
-                // Movement is intentionally continuous while a fresh packet
-                // awaits its normal acknowledgement. Reach matters only once
-                // a retry is actually due.
-                if (!retryDue) continue;
-                if (optional) {
+                RasterPlacementRetryPolicy.Action recovery =
+                    RasterPlacementRetryPolicy.decideOutOfReach(
+                        retryDue,
+                        optional,
+                        isBoatRasterState()
+                    );
+                if (recovery
+                    == RasterPlacementRetryPolicy.Action.WAIT_FOR_ACKNOWLEDGEMENT) {
+                    // Movement remains continuous while a fresh packet awaits
+                    // its normal acknowledgement.
+                    continue;
+                }
+                if (recovery
+                    == RasterPlacementRetryPolicy.Action.DROP_OPTIONAL) {
                     debugLog(
                         "Placement",
                         "dropping out-of-reach optional retry position="
@@ -10052,6 +10644,31 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     pendingPlacementLedger.remove(world);
                     optionalPendingPlacements.remove(world);
                     placementSubmissionBlockSequences.remove(world);
+                    continue;
+                }
+                if (recovery
+                    == RasterPlacementRetryPolicy.Action.REANCHOR_RASTER_ROUTE) {
+                    // Keeping an unreachable ledger entry made this method
+                    // stop before strict-route traversal could ever move back
+                    // to it. Release the stale acknowledgement and make the
+                    // target authoritative again; the normal one-row route
+                    // will reposition and submit a fresh bounded attempt.
+                    pendingPlacementLedger.remove(world);
+                    placementSubmissionBlockSequences.remove(world);
+                    BlockPos relative = world.subtract(mapCorner);
+                    int targetIndex = orderedBuildTargets.indexOf(relative);
+                    if (targetIndex >= 0) {
+                        rasterCursor = targetIndex;
+                        rasterConfirmedFrontier = Math.min(
+                            rasterConfirmedFrontier,
+                            targetIndex
+                        );
+                    }
+                    Addon.LOG.info(
+                        "[Fullblock Printer] Boat Raster released out-of-reach placement acknowledgement at {} and reanchored strict route to target {}",
+                        world.toShortString(),
+                        targetIndex
+                    );
                     continue;
                 }
                 buildRecoveryPending = true;
@@ -10068,8 +10685,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     continue;
                 }
                 error(
-                    "Required placement retry expired at "
-                        + world.toShortString() + "."
+                    requiredPlacementExpirationMessage(world, attempt)
                 );
                 stopBuildForAction();
                 toggle();
@@ -10148,8 +10764,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     continue;
                 }
                 error(
-                    "Required placement retry expired at "
-                        + world.toShortString() + "."
+                    requiredPlacementExpirationMessage(
+                        world,
+                        reserved.get().attempt()
+                    )
                 );
                 stopBuildForAction();
                 toggle();
@@ -10270,7 +10888,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 50,
                 true,
                 true,
-                false
+                true
             );
         }
         if (mc.player == null
@@ -10284,27 +10902,31 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Vec3d hitPosition = world.toCenterPos();
         Runnable submit = () -> {
             if (mc.player == null
-                || mc.player.networkHandler == null
-                || (mc.player.getInventory().getSelectedSlot()
-                    != hotbarSlot
-                    && !InvUtils.swap(hotbarSlot, false))) {
+                || mc.player.networkHandler == null) {
                 return;
             }
-            mc.player.networkHandler.sendPacket(
-                new PlayerInteractBlockC2SPacket(
-                    Hand.MAIN_HAND,
-                    new BlockHitResult(
-                        hitPosition,
-                        Direction.UP,
-                        world,
-                        false
-                    ),
-                    0
-                )
-            );
-            mc.player.networkHandler.sendPacket(
-                new HandSwingC2SPacket(Hand.MAIN_HAND)
-            );
+            boolean switched =
+                mc.player.getInventory().getSelectedSlot() != hotbarSlot;
+            if (switched && !InvUtils.swap(hotbarSlot, true)) return;
+            try {
+                mc.player.networkHandler.sendPacket(
+                    new PlayerInteractBlockC2SPacket(
+                        Hand.MAIN_HAND,
+                        new BlockHitResult(
+                            hitPosition,
+                            Direction.UP,
+                            world,
+                            false
+                        ),
+                        0
+                    )
+                );
+                mc.player.networkHandler.sendPacket(
+                    new HandSwingC2SPacket(Hand.MAIN_HAND)
+                );
+            } finally {
+                if (switched) InvUtils.swapBack();
+            }
         };
         if (shouldRotate) {
             Rotations.rotate(
@@ -10314,10 +10936,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 submit
             );
         } else {
-            if (mc.player.getInventory().getSelectedSlot() != hotbarSlot
-                && !InvUtils.swap(hotbarSlot, false)) {
-                return false;
-            }
             submit.run();
         }
         return true;
@@ -10325,13 +10943,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private boolean isBuildPlacementInReach(BlockPos world) {
         double range = effectiveBuildInteractionRange();
-        return mc.player.getEyePos().squaredDistanceTo(
-            world.toCenterPos()
-        ) <= range * range;
+        Vec3d eye = mc.player.getEyePos();
+        Vec3d target = world.toCenterPos();
+        return eye.squaredDistanceTo(target) <= range * range
+            && (!boatRasterActive
+                || RasterLateralPlacementPolicy.isBeside(
+                    eye.z,
+                    target.z
+                ));
     }
 
     private double effectiveBuildInteractionRange() {
-        return Math.min(5.0, interactionRange.get());
+        return boatRasterActive
+            ? RASTER_BUILD_INTERACTION_RANGE
+            : Math.min(RASTER_BUILD_INTERACTION_RANGE, interactionRange.get());
+    }
+
+    private double rasterBuildInteractionRange() {
+        return RASTER_BUILD_INTERACTION_RANGE;
     }
 
     private HotbarPreparation prepareBuildHotbarAtPairEntry(
@@ -10593,7 +11222,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         confirmedBuildHotbarSwap.begin(
             targetSlot,
             expected,
-            serverHotbarSwapAckSequences[targetSlot],
+            serverHotbarUpdateSequences[targetSlot],
             printActionTick
         );
         pendingBuildHotbarSwapMandatory = mandatory;
@@ -10952,6 +11581,22 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
 
+        if (boatRasterActive || isBoatRasterState()) {
+            int selected = -1;
+            int farthestNextUse = Integer.MIN_VALUE;
+            for (int slot : materialSlots) {
+                if (excludedSlots.contains(slot)) continue;
+                Item item = mc.player.getInventory().getStack(slot).getItem();
+                int nextUse = nextRasterMaterialUse(item, rasterCursor);
+                if (nextUse < 0) return slot;
+                if (nextUse > farthestNextUse) {
+                    farthestNextUse = nextUse;
+                    selected = slot;
+                }
+            }
+            return selected;
+        }
+
         List<Item> priority = currentBuildItemPriority();
         int selected = -1;
         int farthestNextUse = Integer.MIN_VALUE;
@@ -10970,11 +11615,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private List<Integer> activeBuildMaterialHotbarSlots() {
+        if ((boatRasterActive || isBoatRasterState())
+            && !rasterManagedHotbarSlots.isEmpty()) {
+            return rasterManagedHotbarSlots;
+        }
         if (plannedBuildMaterialHotbarSlots.size()
             == BUILD_MATERIAL_HOTBAR_SLOT_COUNT) {
             return plannedBuildMaterialHotbarSlots;
         }
         return List.of();
+    }
+
+    private int nextRasterMaterialUse(Item item, int fromIndex) {
+        List<Integer> uses = rasterMaterialUseIndices.get(item);
+        if (uses == null || uses.isEmpty()) return -1;
+        int low = 0;
+        int high = uses.size();
+        while (low < high) {
+            int middle = (low + high) >>> 1;
+            if (uses.get(middle) < fromIndex) low = middle + 1;
+            else high = middle;
+        }
+        return low < uses.size() ? uses.get(low) : -1;
     }
 
     private List<Item> currentBuildItemPriority() {
@@ -13567,6 +14229,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Utils.setForwardPressed(false);
         Utils.setBackwardPressed(false);
         Utils.setJumpPressed(false);
+        Utils.setSprintPressed(false);
+        Utils.setSneakPressed(false);
     }
 
     private RecoveryOwnerPolicy.Owner activeRecoveryOwner() {
@@ -18021,7 +18685,7234 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return isMined;
     }
 
+    private boolean isRasterAreaLoaded() {
+        // Includes the 3.5-block exterior loop plus the widened boat/rider
+        // envelope on every side of the 128x129 structural footprint.
+        int minX = (mapCorner.getX() - 6) >> 4;
+        int maxX = (mapCorner.getX() + 133) >> 4;
+        int minZ = (mapCorner.getZ() - 6) >> 4;
+        int maxZ = (mapCorner.getZ() + 133) >> 4;
+        for (int chunkX = minX; chunkX <= maxX; chunkX++) {
+            for (int chunkZ = minZ; chunkZ <= maxZ; chunkZ++) {
+                if (!mc.world.getChunkManager().isChunkLoaded(chunkX, chunkZ)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private String requiredPlacementExpirationMessage(
+        BlockPos world,
+        PendingPlacementLedger.PendingAttempt<BlockPos, Block> attempt
+    ) {
+        ServerBlockObservation observation = serverBlockObservations.get(world);
+        long submittedSequence = placementSubmissionBlockSequences
+            .getOrDefault(world, -1L);
+        String base = "Required placement retry expired at "
+            + world.toShortString()
+            + " expected=" + Registries.BLOCK.getId(attempt.expected())
+            + " observed=" + (observation == null
+                ? "none" : Registries.BLOCK.getId(observation.block()))
+            + " attempts=" + attempt.totalAttempts()
+            + " firstTick=" + attempt.firstSubmittedTick()
+            + " lastTick=" + attempt.lastAttemptTick()
+            + " submittedSequence=" + submittedSequence
+            + " observedSequence=" + (observation == null
+                ? -1L : observation.sequence())
+            + " globalBlockSequence=" + serverBlockUpdateSequence;
+        if (!boatRasterActive || mc.player == null
+            || !(mc.player.getVehicle() instanceof AbstractBoatEntity boat)
+            || mapCorner == null || rasterBuildRoutePlan == null) {
+            return base + ".";
+        }
+        BlockPos relative = world.subtract(mapCorner);
+        Integer index = rasterTargetIndices.get(relative);
+        if (index == null) return base + ".";
+        int deadline = rasterBuildRoutePlan.deadline(relative);
+        Vec3d planned = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(deadline)
+        );
+        Vec3d actual = boat.getEntityPos();
+        return base
+            + " plannedPose=" + planned
+            + " actualPose=" + actual
+            + " axisError=["
+            + String.format(Locale.ROOT, "%.3f", actual.x - planned.x)
+            + ","
+            + String.format(Locale.ROOT, "%.3f", actual.y - planned.y)
+            + ","
+            + String.format(Locale.ROOT, "%.3f", actual.z - planned.z)
+            + "] eyeReach="
+            + String.format(
+                Locale.ROOT,
+                "%.3f/5.900",
+                mc.player.getEyePos().distanceTo(world.toCenterPos())
+            )
+            + " row=" + rasterBuildRoutePlan.points().get(deadline).band()
+            + " side=" + (rasterBuildRoutePlan.lateralDirection() < 0
+                ? "west" : "east")
+            + ".";
+    }
+
+    private void calculateRemainingRasterMaterialDemand() {
+        rasterMaterialDemand.clear();
+        rasterMaterialUseIndices.clear();
+        for (int index = 0; index < orderedBuildTargets.size(); index++) {
+            BlockPos relative = orderedBuildTargets.get(index);
+            Block expected = buildTargets.get(relative);
+            BlockPos world = mapCorner.add(relative);
+            if (mc.world.getBlockState(world).getBlock() == expected) continue;
+            Item material = expected.asItem();
+            rasterMaterialDemand.merge(material, 1, Integer::sum);
+            rasterMaterialUseIndices.computeIfAbsent(
+                material,
+                ignored -> new ArrayList<>()
+            ).add(index);
+        }
+        int total = rasterMaterialDemand.values().stream()
+            .mapToInt(Integer::intValue).sum();
+        info("Boat Raster calculated remaining run demand: " + total
+            + " blocks across " + rasterMaterialDemand.size() + " material types.");
+        for (Map.Entry<Item, Integer> demand : rasterMaterialDemand.entrySet()) {
+            info("  remaining " + demand.getKey().getName().getString()
+                + ": " + demand.getValue());
+        }
+    }
+
+    private void acknowledgePendingInventoryMetadataSwapFromSlotObservations() {
+        PendingInventoryMetadataSwap pending = pendingInventoryMetadataSwap;
+        if (pending == null) return;
+        InventoryStackIdentity source =
+            serverPlayerInventoryObservedIdentities[pending.sourceSlot()];
+        InventoryStackIdentity target =
+            serverPlayerInventoryObservedIdentities[
+                pending.targetHotbarSlot()
+            ];
+        if (source == null || target == null) return;
+        boolean exchanged = target.equals(pending.beforeSource())
+            && source.matchesMonotonicDamage(pending.beforeTarget());
+        long sourceRevision = serverPlayerInventoryObservedSequences[
+            pending.sourceSlot()
+        ];
+        long targetRevision = serverPlayerInventoryObservedSequences[
+            pending.targetHotbarSlot()
+        ];
+        if (!AuthoritativeInventorySwapGate.confirms(
+                pending.submittedAfterSequence(),
+                sourceRevision,
+                targetRevision,
+                exchanged
+            )) {
+            return;
+        }
+        pending.metadata().applyTo(
+            repairToolShadows,
+            plannedRepairToolKeepSlots
+        );
+        long acknowledgedRevision = Math.max(
+            sourceRevision,
+            targetRevision
+        );
+        serverHotbarSwapAckSequences[pending.targetHotbarSlot()] =
+            acknowledgedRevision;
+        pendingInventoryMetadataSwap = null;
+        debugLog(
+            "HotbarSwap",
+            "confirmed owner=" + pending.owner()
+                + " from authoritative slot pair targetHotbarSlot="
+                + pending.targetHotbarSlot()
+                + " ackSequence=" + acknowledgedRevision
+        );
+    }
+
+    private OptionalInt selectRasterBaseY() {
+        int minimumRelativeY = minimumSafeRasterRelativeY();
+        int maximumRelativeY = maximumSafeRasterRelativeY();
+        int bottom = mc.world.getBottomY();
+        int top = mc.world.getTopYInclusive();
+        ArrayList<BuildHeightSelector.Candidate> candidates = new ArrayList<>();
+
+        for (int baseY = bottom + 1 - minimumRelativeY;
+             baseY <= top - maximumRelativeY;
+             baseY++) {
+            candidates.add(scoreRasterBaseY(baseY));
+        }
+        Optional<BuildHeightSelector.Candidate> selected =
+            BuildHeightSelector.select(candidates, mc.player.getBlockY());
+        return selected.isPresent()
+            ? OptionalInt.of(selected.get().baseY())
+            : OptionalInt.empty();
+    }
+
+    private int minimumSafeRasterRelativeY() {
+        int targetMinimum = buildTargets.keySet().stream()
+            .mapToInt(BlockPos::getY).min().orElse(0) - 3;
+        if (rasterFlightPlan == null) return targetMinimum;
+        int flightMinimum = (int) Math.floor(
+            rasterFlightPlan.waypoints().stream()
+                .mapToDouble(RasterFlightPlan.Waypoint::eyeY)
+                .min().orElse(targetMinimum) - 2.0
+        );
+        int routeMinimum = rasterBuildRoutePlan == null
+            ? flightMinimum
+            : (int) Math.floor(
+                rasterBuildRoutePlan.minimumEyeY() - 2.0
+            );
+        return Math.min(targetMinimum, Math.min(flightMinimum, routeMinimum));
+    }
+
+    private int maximumSafeRasterRelativeY() {
+        int corridorMaximum = buildTargets.keySet().stream()
+            .mapToInt(BlockPos::getY).max().orElse(0) + 6;
+        if (rasterFlightPlan == null) return corridorMaximum;
+        int flightMaximum = (int) Math.ceil(
+            rasterFlightPlan.waypoints().stream()
+                .mapToDouble(RasterFlightPlan.Waypoint::eyeY)
+                .max().orElse(corridorMaximum)
+        );
+        int routeMaximum = rasterBuildRoutePlan == null
+            ? flightMaximum
+            : (int) Math.ceil(
+                rasterBuildRoutePlan.points().stream()
+                    .mapToDouble(RasterBuildRoutePlan.Point::eyeY)
+                    .max().orElse(flightMaximum)
+            );
+        return Math.max(
+            corridorMaximum,
+            Math.max(flightMaximum, routeMaximum)
+        );
+    }
+
+    private BuildHeightSelector.Candidate scoreRasterBaseY(int baseY) {
+        int bottom = mc.world.getBottomY();
+        int top = mc.world.getTopYInclusive();
+        boolean insideWorld = baseY + minimumSafeRasterRelativeY() >= bottom + 1
+            && baseY + maximumSafeRasterRelativeY() <= top;
+        if (!insideWorld) {
+            return new BuildHeightSelector.Candidate(
+                baseY, 0, true, false, false
+            );
+        }
+
+        int obstructions = 0;
+        boolean breakable = true;
+        HashSet<BlockPos> counted = new HashSet<>();
+        for (Map.Entry<BlockPos, Block> entry : buildTargets.entrySet()) {
+            BlockPos world = new BlockPos(
+                mapCorner.getX() + entry.getKey().getX(),
+                baseY + entry.getKey().getY(),
+                mapCorner.getZ() + entry.getKey().getZ()
+            );
+            BlockState targetState = mc.world.getBlockState(world);
+            if (!targetState.isAir()
+                && targetState.getBlock() != entry.getValue()
+                && counted.add(world)) {
+                obstructions++;
+                if (!BlockUtils.canBreak(world, targetState)) breakable = false;
+            }
+            for (int clearance = 1; clearance <= 3; clearance++) {
+                for (int lateral = -1; lateral <= 1; lateral++) {
+                    BlockPos corridorRelative = rasterCorridorRelative(
+                        entry.getKey(), clearance, lateral
+                    );
+                    if (buildTargets.containsKey(corridorRelative)) continue;
+                    BlockPos corridor = new BlockPos(
+                        mapCorner.getX() + corridorRelative.getX(),
+                        baseY + corridorRelative.getY(),
+                        mapCorner.getZ() + corridorRelative.getZ()
+                    );
+                    BlockState corridorState = mc.world.getBlockState(corridor);
+                    if (!corridorState.isAir() && counted.add(corridor)) {
+                        obstructions++;
+                        if (!BlockUtils.canBreak(corridor, corridorState)) breakable = false;
+                    }
+                }
+            }
+            if (!breakable) break;
+        }
+        return new BuildHeightSelector.Candidate(
+            baseY,
+            obstructions,
+            true,
+            insideWorld,
+            breakable
+        );
+    }
+
+    private boolean prepareRasterBoatSource() {
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity mountedBoat) {
+            rasterBoatItem = null;
+            rasterBoatSourceChest = null;
+            rasterBoatPosition = mountedBoat.getBlockPos();
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster adopted the currently mounted boat for checkpoint recovery at {}",
+                rasterBoatPosition
+            );
+            return true;
+        }
+        var inventoryBoat = InvUtils.find(stack -> stack.getItem() instanceof BoatItem);
+        if (inventoryBoat.found()) {
+            rasterBoatItem = mc.player.getInventory().getStack(inventoryBoat.slot()).getItem();
+            rasterBoatSourceChest = null;
+            return true;
+        }
+        for (Map.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry
+            : materialDict.entrySet()) {
+            if (!(entry.getKey() instanceof BoatItem) || entry.getValue().isEmpty()) continue;
+            rasterBoatItem = entry.getKey();
+            rasterBoatSourceChest = entry.getValue().getFirst();
+            return true;
+        }
+        AbstractBoatEntity deployedBoat = findLoadedRasterRecoveryBoat();
+        if (deployedBoat != null
+            && isLoadedRasterBoatFootRecoverable(deployedBoat)) {
+            rasterBoatItem = null;
+            rasterBoatSourceChest = null;
+            rasterBoatPosition = deployedBoat.getBlockPos();
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster adopted an already-deployed loaded boat for checkpoint recovery at {}",
+                rasterBoatPosition
+            );
+            return true;
+        }
+        if (deployedBoat != null) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster ignored unreachable loose boat at {}; a supported foot route could not reach it",
+                deployedBoat.getEntityPos()
+            );
+        }
+        error("Boat Raster preflight failed: no reachable boat in inventory, on the supported platform, or in a registered tool/material chest.");
+        rasterStatus = "missing boat";
+        return false;
+    }
+
+    private boolean isLoadedRasterBoatFootRecoverable(
+        AbstractBoatEntity boat
+    ) {
+        if (boat == null || !boat.isAlive() || mc.player == null) return false;
+        if (mc.player.squaredDistanceTo(boat) <= 16.0) return true;
+        if (mc.player.squaredDistanceTo(boat) > 32.0 * 32.0
+            || Math.abs(mc.player.getY() - boat.getY()) > 6.0) {
+            return false;
+        }
+        return !findRasterWalkPath(boat.getEntityPos()).isEmpty();
+    }
+
+    private BlockPos chooseRasterLaunchBlock() {
+        BlockPos playerSupport = mc.player.getBlockPos().down();
+        Direction facing = mc.player.getHorizontalFacing();
+        Set<RasterVoxelPathfinder.Cell> reachableWalkCells =
+            findReachableRasterWalkCells();
+        for (RasterLaunchPointPlan.Offset offset
+            : RasterLaunchPointPlan.candidateOffsets(
+                facing.getOffsetX(),
+                facing.getOffsetZ()
+            )) {
+            BlockPos candidate = playerSupport.add(offset.dx(), 0, offset.dz());
+            if (isUsableRasterLaunchBlock(candidate)
+                && hasReachableRasterLaunchApproach(
+                    candidate,
+                    reachableWalkCells
+                )) {
+                return candidate;
+            }
+        }
+        for (int radius = 2; radius <= 24; radius++) {
+            for (int dy : new int[] {0, 1, -1, 2, -2}) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                        BlockPos candidate = playerSupport.add(dx, dy, dz);
+                        if (isUsableRasterLaunchBlock(candidate)
+                            && hasReachableRasterLaunchApproach(
+                                candidate,
+                                reachableWalkCells
+                            )) {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+        }
+        int x = Math.max(0, Math.min(127, mc.player.getBlockX() - mapCorner.getX()));
+        int y = mapCorner.getY() + compactPlan.targetSurfaceY(x, 0);
+        BlockPos fallback = new BlockPos(
+            mapCorner.getX() + x,
+            y,
+            mapCorner.getZ() - 4
+        );
+        return isUsableRasterLaunchBlock(fallback)
+            && hasReachableRasterLaunchApproach(
+                fallback,
+                reachableWalkCells
+            )
+                ? fallback : null;
+    }
+
+    private Set<RasterVoxelPathfinder.Cell> findReachableRasterWalkCells() {
+        RasterVoxelPathfinder.Cell start = new RasterVoxelPathfinder.Cell(
+            mc.player.getBlockX(),
+            mc.player.getBlockY(),
+            mc.player.getBlockZ()
+        );
+        if (!isRasterWalkCellSafe(start)) return Set.of();
+        return RasterVoxelPathfinder.reachable(
+            start,
+            RasterVoxelPathfinder.Mode.WALK,
+            30,
+            5,
+            20000,
+            this::isRasterWalkCellSafe
+        );
+    }
+
+    private boolean hasReachableRasterLaunchApproach(
+        BlockPos launch,
+        Set<RasterVoxelPathfinder.Cell> reachableWalkCells
+    ) {
+        if (mc.player.getEntityPos().squaredDistanceTo(launch.toCenterPos())
+            <= 9.0) {
+            return reachableWalkCells.contains(
+                new RasterVoxelPathfinder.Cell(
+                    mc.player.getBlockX(),
+                    mc.player.getBlockY(),
+                    mc.player.getBlockZ()
+                )
+            );
+        }
+        Vec3d target = launch.toCenterPos().add(0, 1, 0);
+        for (BlockPos goal : rasterWalkGoals(target)) {
+            RasterVoxelPathfinder.Cell cell = new RasterVoxelPathfinder.Cell(
+                goal.getX(),
+                goal.getY(),
+                goal.getZ()
+            );
+            if (!reachableWalkCells.contains(cell)) continue;
+            Vec3d standing = new Vec3d(
+                cell.x() + 0.5,
+                cell.y(),
+                cell.z() + 0.5
+            );
+            // Keep margin for the walk controller's final-cell tolerance so
+            // ordinary sub-block drift cannot push a valid stance beyond the
+            // deploy state's three-block interaction boundary.
+            if (standing.squaredDistanceTo(launch.toCenterPos()) <= 7.29) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isUsableRasterLaunchBlock(BlockPos candidate) {
+        if (rasterRejectedLaunchBlocks.contains(candidate)) return false;
+        int relativeX = candidate.getX() - mapCorner.getX();
+        int relativeZ = candidate.getZ() - mapCorner.getZ();
+        if (relativeX >= -1 && relativeX <= 128
+            && relativeZ >= -2 && relativeZ <= 128) {
+            return false;
+        }
+        if (candidate.getY() < mc.world.getBottomY()
+            || candidate.getY() + 2 > mc.world.getTopYInclusive()
+            || !mc.world.getChunkManager().isChunkLoaded(
+                candidate.getX() >> 4,
+                candidate.getZ() >> 4
+            )) {
+            return false;
+        }
+        if (!mc.world.getBlockState(candidate.up()).isAir()
+            || !mc.world.getBlockState(candidate.up(2)).isAir()) {
+            return false;
+        }
+        BlockState launchState = mc.world.getBlockState(candidate);
+        if (!launchState.isAir()
+            && launchState.getCollisionShape(mc.world, candidate).isEmpty()) {
+            return false;
+        }
+        if (launchState.isAir()
+            && (!BlockUtils.canPlace(candidate)
+                || !hasRasterLaunchPlacementAnchor(candidate))) {
+            return false;
+        }
+        Box boatSpawnClearance = new Box(
+            candidate.getX() - 0.2,
+            candidate.getY() + 1.0,
+            candidate.getZ() - 0.2,
+            candidate.getX() + 1.2,
+            candidate.getY() + 2.0,
+            candidate.getZ() + 1.2
+        );
+        return !mc.player.getBoundingBox().intersects(boatSpawnClearance)
+            && mc.world.isBlockSpaceEmpty(null, boatSpawnClearance)
+            && hasRasterBoatLaunchExit(candidate);
+    }
+
+    private boolean hasRasterLaunchPlacementAnchor(BlockPos candidate) {
+        for (Direction direction : Direction.values()) {
+            BlockPos anchor = candidate.offset(direction);
+            BlockState state = mc.world.getBlockState(anchor);
+            if (!state.isAir()
+                && !state.getCollisionShape(mc.world, anchor).isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasRasterBoatLaunchExit(BlockPos launch) {
+        double y = launch.getY() + 1.0;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                if (Math.max(Math.abs(dx), Math.abs(dz)) != 2) continue;
+                Box exit = new Box(
+                    launch.getX() + 0.5 + dx - 0.85,
+                    y,
+                    launch.getZ() + 0.5 + dz - 0.85,
+                    launch.getX() + 0.5 + dx + 0.85,
+                    y + 1.75,
+                    launch.getZ() + 0.5 + dz + 0.85
+                );
+                if (mc.world.isBlockSpaceEmpty(null, exit)
+                    && hasClearRasterBoatLaunchSweep(launch, dx, dz)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasClearRasterBoatLaunchSweep(
+        BlockPos launch,
+        int exitDx,
+        int exitDz
+    ) {
+        double y = launch.getY() + 1.0;
+        for (int step = 1; step <= 4; step++) {
+            double fraction = step / 4.0;
+            double x = launch.getX() + 0.5 + exitDx * fraction;
+            double z = launch.getZ() + 0.5 + exitDz * fraction;
+            Box swept = new Box(
+                x - 0.85,
+                y,
+                z - 0.85,
+                x + 0.85,
+                y + 1.75,
+                z + 0.85
+            );
+            if (!mc.world.isBlockSpaceEmpty(null, swept)) return false;
+        }
+        return true;
+    }
+
+    private boolean prepareRasterClearance() {
+        LinkedHashSet<BlockPos> conflicts = new LinkedHashSet<>();
+        LinkedHashSet<String> unbreakable = new LinkedHashSet<>();
+        LinkedHashSet<String> missingTools = new LinkedHashSet<>();
+        for (Map.Entry<BlockPos, Block> entry : buildTargets.entrySet()) {
+            BlockPos world = mapCorner.add(entry.getKey());
+            collectRasterConflict(world, entry.getValue(), conflicts, unbreakable, missingTools);
+            for (int clearance = 1; clearance <= 3; clearance++) {
+                for (int lateral = -1; lateral <= 1; lateral++) {
+                    BlockPos corridorRelative = rasterCorridorRelative(
+                        entry.getKey(), clearance, lateral
+                    );
+                    if (buildTargets.containsKey(corridorRelative)) continue;
+                    collectRasterConflict(
+                        mapCorner.add(corridorRelative),
+                        Blocks.AIR,
+                        conflicts,
+                        unbreakable,
+                        missingTools
+                    );
+                }
+            }
+        }
+        if (!unbreakable.isEmpty()) {
+            error("Boat Raster has unbreakable targets: " + String.join(", ", unbreakable));
+            rasterStatus = "unbreakable clearance";
+            return false;
+        }
+        if (!missingTools.isEmpty()) {
+            error("Boat Raster is missing carried clearing tools: " + String.join(", ", missingTools));
+            rasterStatus = "missing clearing tools";
+            return false;
+        }
+        rasterClearanceQueue.clear();
+        rasterClearanceQueue.addAll(conflicts);
+        return true;
+    }
+
+    private BlockPos rasterCorridorRelative(
+        BlockPos target,
+        int clearance,
+        int lateral
+    ) {
+        boolean columnSweep = rasterTraversalName.startsWith("column");
+        return target.down(clearance).add(
+            columnSweep ? lateral : 0,
+            0,
+            columnSweep ? 0 : lateral
+        );
+    }
+
+    private void collectRasterConflict(
+        BlockPos world,
+        Block expected,
+        Set<BlockPos> conflicts,
+        Set<String> unbreakable,
+        Set<String> missingTools
+    ) {
+        BlockState state = mc.world.getBlockState(world);
+        if (state.isAir() || (expected != Blocks.AIR && state.getBlock() == expected)) return;
+        if (!BlockUtils.canBreak(world, state)) {
+            unbreakable.add(world.toShortString() + "=" + state.getBlock().getName().getString());
+            return;
+        }
+        ItemStack registered = getBestRegisteredTool(state);
+        int carriedSlot = findBestCarriedRasterTool(state);
+        if (carriedSlot < 0) {
+            missingTools.add(
+                (registered == null ? "suitable tool" : registered.getName().getString())
+                    + " for " + state.getBlock().getName().getString()
+            );
+            return;
+        }
+        conflicts.add(new BlockPos(world));
+    }
+
+    private int firstUnfinishedRasterIndex(int start) {
+        for (int i = Math.max(0, start); i < orderedBuildTargets.size(); i++) {
+            BlockPos relative = orderedBuildTargets.get(i);
+            if (latestKnownBuildBlock(mapCorner.add(relative)) != buildTargets.get(relative)) {
+                return i;
+            }
+        }
+        return orderedBuildTargets.size();
+    }
+
+    private void releaseBoatRasterControl(String reason) {
+        boatFlyAdapter.release();
+        Utils.setSprintPressed(false);
+        Utils.setSneakPressed(false);
+        if (boatRasterActive) rasterStatus = "stopped: " + reason;
+        boatRasterActive = false;
+    }
+
+    private boolean isBoatRasterState() {
+        return state == State.RasterAcquireBoat
+            || state == State.RasterAwaitBoatChest
+            || state == State.RasterDeployBoat
+            || state == State.RasterMountBoat
+            || state == State.RasterClearance
+            || state == State.RasterPrinting
+            || state == State.RasterRestock
+            || state == State.RasterVerify
+            || state == State.RasterDisposeExcess
+            || state == State.RasterReturnBoat
+            || state == State.RasterRecoverBoat
+            || state == State.RasterReturnBoatChest
+            || state == State.RasterAwaitBoatReturn
+            || state == State.RasterCleanup;
+    }
+
+    private void enterRasterState(State next, String status) {
+        State previous = state;
+        state = next;
+        rasterPhaseStartedTick = clientActionTick;
+        rasterStatus = status;
+        if (next == State.RasterMountBoat) {
+            rasterBoatMountAttempts = 0;
+            rasterBoatMountTargetId = Integer.MIN_VALUE;
+            rasterBoatMountLastAttemptTick = -1000L;
+        }
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster phase {} -> {}: {} | player={} | waypoint={} | vehicle={}",
+            previous,
+            next,
+            status,
+            mc.player == null ? "unavailable" : mc.player.getEntityPos(),
+            rasterWaypoint,
+            mc.player != null && mc.player.getVehicle() != null
+                ? mc.player.getVehicle().getType().toString()
+                : "none"
+        );
+    }
+
+    private void runBoatRasterTick() {
+        boatFlyAdapter.setSpeeds(
+            boatRasterTravelSpeed.get(),
+            boatRasterBuildSpeed.get()
+        );
+        refreshRasterStatusWidgets();
+        logRasterHeartbeatIfNeeded();
+        if (clientActionTick - lastRasterCheckpointTick >= 20) {
+            persistRasterCheckpoint("runtime-heartbeat");
+            if (!boatRasterActive || !isBoatRasterState()) return;
+        }
+        if (mc.player == null || mc.world == null) return;
+        float currentHealth = mc.player.getHealth();
+        if (rasterLastPlayerHealth >= 0.0f
+            && currentHealth < rasterLastPlayerHealth
+            && mc.player.getVehicle() instanceof AbstractBoatEntity boat) {
+            boolean envelopeUnsafe = !isRasterBoatPositionSafe(
+                boat,
+                boat.getX(),
+                boat.getY(),
+                boat.getZ()
+            );
+            if (!envelopeUnsafe) {
+                // Hunger, mobs, and unrelated damage do not invalidate a
+                // collision-safe route. Treating every health decrease as
+                // suffocation caused needless full-band regression.
+                Addon.LOG.info(
+                    "[Fullblock Printer] Boat Raster observed non-collision damage ({} -> {}) at a safe boat envelope; route retained",
+                    rasterLastPlayerHealth,
+                    currentHealth
+                );
+            } else {
+                Vec3d clearance = selectRasterEmergencyClearancePose(boat);
+                boolean retainLocalRoute = clearance != null
+                    && state == State.RasterPrinting
+                    && rasterPrintCorridorAcquired;
+                if (retainLocalRoute) {
+                    int retainedDestination =
+                        rasterCompiledSegmentDestination >= 0
+                            ? rasterCompiledSegmentDestination
+                            : Math.min(
+                                rasterBuildRoutePlan.points().size() - 1,
+                                rasterRouteCursor + 1
+                            );
+                    boatFlyAdapter.stop();
+                    rasterEmergencyClearanceWaypoint = clearance;
+                    rasterDamageReplanPending = true;
+                    resetRasterCompiledRouteProgress();
+                    rasterLocalRecoveryRetainedDestination =
+                        retainedDestination;
+                    Addon.LOG.warn(
+                        "[Fullblock Printer] Boat Raster detected suffocation damage ({} -> {}); retaining route point {} and moving only to minimum clearance pose {}",
+                        rasterLastPlayerHealth,
+                        currentHealth,
+                        retainedDestination,
+                        clearance
+                    );
+                } else {
+                    rasterBoatPath.clear();
+                    rasterBoatPathTarget = null;
+                    cancelRasterEntryRouteSearch();
+                    resetRasterBoatPathProgress();
+                    rasterDescentWaypoint = null;
+                    rasterDamageReplanPending = true;
+                    beginRasterRouteRejoin(
+                        clearance == null
+                            ? "unsafe damage pose had no local clearance; replaying retained route"
+                            : "damage occurred outside the acquired print corridor; replaying retained route after minimum egress"
+                    );
+                    rasterEmergencyClearanceWaypoint = clearance;
+                    Addon.LOG.warn(
+                        "[Fullblock Printer] Boat Raster detected damage at an unsafe envelope ({} -> {}); {}",
+                        rasterLastPlayerHealth,
+                        currentHealth,
+                        clearance == null
+                            ? "no local clearance pose was available"
+                            : "minimum clearance pose is " + clearance
+                    );
+                }
+            }
+        }
+        rasterLastPlayerHealth = currentHealth;
+        if (Utils.isPhysicalMovementPressed()) {
+            rasterManualOverrideUntilTick = clientActionTick + 20;
+            rasterBoatPath.clear();
+            rasterWalkPath.clear();
+            rasterBoatPathTarget = null;
+            rasterWalkPathTarget = null;
+            rasterWalkTrackedWaypoint = null;
+            rasterWalkBestDistance = Double.POSITIVE_INFINITY;
+            rasterWalkLastProgressTick = clientActionTick;
+            rasterWalkPathPlannedTick = -1000L;
+            rasterWalkRouteFailures = 0;
+            cancelRasterEntryRouteSearch();
+            resetRasterBoatPathProgress();
+            rasterSavedRouteCursor = rasterRouteCursor;
+            rasterRouteRejoinCursor = rasterBuildRoutePlan == null
+                ? Math.max(0, rasterRouteCursor - RASTER_ROUTE_REJOIN_REPLAY_POINTS)
+                : rasterBuildRoutePlan.replayIndex(
+                    rasterRouteCursor,
+                    RASTER_ROUTE_REJOIN_REPLAY_POINTS
+                );
+            rasterRouteRejoinPending = true;
+            rasterRouteRejoinSnapshotAccepted = false;
+            rasterRecoverySnapshotGate.reset();
+            rasterPrintCorridorAcquired = false;
+            resetRasterCompiledRouteProgress();
+            rasterEmergencyClearanceWaypoint = null;
+        }
+        if (clientActionTick <= rasterManualOverrideUntilTick) {
+            boatFlyAdapter.yieldToManualInput();
+            if (mc.player.currentScreenHandler != mc.player.playerScreenHandler) {
+                mc.player.closeHandledScreen();
+            }
+            Utils.restorePhysicalMovementKeys();
+            // Freeze phase timeouts while the user is correcting position.
+            rasterPhaseStartedTick++;
+            if (rasterLaunchScaffoldStartedTick >= 0L) {
+                rasterLaunchScaffoldStartedTick++;
+            }
+            rasterWalkLastProgressTick = clientActionTick;
+            rasterWalkTrackedWaypoint = null;
+            rasterStatus = "manual movement override; automation paused";
+            return;
+        }
+        if (!boatRasterActive) {
+            // Transient keys and module settings are intentionally never
+            // trusted across a restart. Reconstruct from world state.
+            boatRasterActive = true;
+            if (!(mc.player.getVehicle() instanceof AbstractBoatEntity)) {
+                enterRasterState(State.RasterDeployBoat, "recovering boat after restart");
+            }
+        }
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity boat) {
+            if (rasterEmergencyClearanceWaypoint != null) {
+                if (!runRasterEmergencyClearance(boat)) return;
+            }
+        } else {
+            rasterEmergencyClearanceWaypoint = null;
+        }
+        switch (state) {
+            case RasterAcquireBoat -> runRasterAcquireBoat();
+            case RasterAwaitBoatChest -> {
+                stopMovement();
+                if (InvUtils.find(stack -> stack.getItem() instanceof BoatItem).found()) {
+                    mc.player.closeHandledScreen();
+                    enterRasterState(State.RasterDeployBoat, "boat withdrawal confirmed");
+                    return;
+                }
+                if (clientActionTick - rasterPhaseStartedTick > 100) {
+                    failBoatRaster("boat chest did not return an authoritative inventory snapshot");
+                }
+            }
+            case RasterDeployBoat -> runRasterDeployBoat();
+            case RasterMountBoat -> runRasterMountBoat();
+            case RasterClearance -> runRasterClearance();
+            case RasterPrinting -> runRasterPrinting();
+            case RasterRestock -> runRasterRestock();
+            case RasterVerify -> runRasterVerification();
+            case RasterDisposeExcess -> runRasterDisposeExcess();
+            case RasterReturnBoat -> runRasterReturnBoat();
+            case RasterRecoverBoat -> runRasterRecoverBoat();
+            case RasterReturnBoatChest -> runRasterReturnBoatChest();
+            case RasterAwaitBoatReturn -> {
+                stopMovement();
+                if (clientActionTick - rasterPhaseStartedTick > 100) {
+                    failBoatRaster("boat return was not server-confirmed");
+                }
+            }
+            case RasterCleanup -> runRasterCleanup();
+            default -> failBoatRaster("entered an unknown raster state " + state);
+        }
+    }
+
+    private Vec3d selectRasterEmergencyClearancePose(
+        AbstractBoatEntity boat
+    ) {
+        for (double descent = 0.25; descent <= 4.0; descent += 0.25) {
+            double y = boat.getY() - descent;
+            if (isRasterBoatPositionSafe(
+                boat,
+                boat.getX(),
+                y,
+                boat.getZ()
+            )) {
+                return new Vec3d(boat.getX(), y, boat.getZ());
+            }
+        }
+        double[][] offsets = {
+            {0.5, 0.0}, {-0.5, 0.0}, {0.0, 0.5}, {0.0, -0.5},
+            {1.0, 0.0}, {-1.0, 0.0}, {0.0, 1.0}, {0.0, -1.0}
+        };
+        for (double descent = 0.25; descent <= 4.0; descent += 0.25) {
+            double y = boat.getY() - descent;
+            for (double[] offset : offsets) {
+                double x = boat.getX() + offset[0];
+                double z = boat.getZ() + offset[1];
+                if (isRasterBoatPositionSafe(boat, x, y, z)) {
+                    return new Vec3d(x, y, z);
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean runRasterEmergencyClearance(AbstractBoatEntity boat) {
+        Vec3d target = rasterEmergencyClearanceWaypoint;
+        boolean clear = isRasterBoatPositionSafe(
+            boat,
+            boat.getX(),
+            boat.getY(),
+            boat.getZ()
+        );
+        boolean arrived = Math.abs(boat.getX() - target.x) < 0.20
+            && Math.abs(boat.getY() - target.y) < 0.15
+            && Math.abs(boat.getZ() - target.z) < 0.20;
+        if (clear && arrived) {
+            boatFlyAdapter.stop();
+            rasterEmergencyClearanceWaypoint = null;
+            rasterDamageReplanPending = true;
+            rasterStatus = "rider clearance restored; replanning";
+            return true;
+        }
+        boatFlyAdapter.drive(
+            boat,
+            target,
+            BoatFlyAdapter.DriveMode.TRAVEL
+        );
+        rasterWaypoint = target;
+        rasterStatus = "minimal emergency egress to prevent suffocation";
+        // Emergency movement is not state-machine progress. Keep container,
+        // placement, and mounting timeouts from expiring during the egress.
+        rasterPhaseStartedTick++;
+        return false;
+    }
+
+    private void refreshRasterStatusWidgets() {
+        if (rasterPhaseLabel != null) {
+            rasterPhaseLabel.set("Phase: " + rasterStatus);
+        }
+        if (rasterProgressLabel != null) {
+            rasterProgressLabel.set(
+                "Y " + (rasterSelectedBaseY == Integer.MIN_VALUE ? "-" : rasterSelectedBaseY)
+                    + " | line " + rasterRow
+                    + " | " + rasterDirectionLabel()
+                    + " | frontier " + rasterConfirmedFrontier + "/"
+                    + (orderedBuildTargets == null ? 0 : orderedBuildTargets.size())
+            );
+        }
+        if (rasterLogisticsLabel != null) {
+            int pending = pendingPlacementLedger == null
+                ? 0
+                : pendingPlacementLedger.pendingAttempts().size();
+            rasterLogisticsLabel.set(
+                "BoatFly: "
+                    + String.format(Locale.ROOT, "%.1f", boatRasterTravelSpeed.get())
+                    + " travel / "
+                    + String.format(Locale.ROOT, "%.1f", boatRasterBuildSpeed.get())
+                    + " strict build blocks/s | confirmations: "
+                    + pending
+                    + " | boat: "
+                    + (mc.player != null && mc.player.getVehicle() instanceof AbstractBoatEntity
+                        ? "mounted" : "not mounted")
+                    + " | demand: "
+                    + (rasterRestockMaterial == null
+                        ? "none" : rasterRestockMaterial.getName().getString())
+            );
+        }
+        if (rasterCorrectionLabel != null) {
+            rasterCorrectionLabel.set(
+                "Last server correction: "
+                    + (rasterLastCorrectionTick < 0
+                        ? "none"
+                        : String.format(Locale.ROOT, "%.2f blocks", rasterLastCorrectionDistance))
+            );
+        }
+        if (rasterPlanLabel != null) {
+            int routePoints = rasterBuildRoutePlan == null
+                ? 0 : rasterBuildRoutePlan.points().size();
+            int materials = rasterMaterialDemand.values().stream()
+                .mapToInt(Integer::intValue).sum();
+            rasterPlanLabel.set(
+                "Precomputed " + rasterTraversalName + ": "
+                    + rasterRouteCursor + "/" + routePoints
+                    + " adjacent route points | "
+                    + materials + " blocks | "
+                    + rasterMaterialDemand.size() + " materials"
+            );
+        }
+    }
+
+    private void logRasterHeartbeatIfNeeded() {
+        String statusKey = rasterStatus != null
+            && rasterStatus.startsWith("row ")
+                ? "row-progress"
+                : rasterStatus;
+        boolean changed = !Objects.equals(
+            lastRasterHeartbeatStatus,
+            statusKey
+        );
+        boolean periodic = clientActionTick - lastRasterHeartbeatTick >= 100L;
+        if (!changed && !periodic) return;
+
+        lastRasterHeartbeatStatus = statusKey;
+        lastRasterHeartbeatTick = clientActionTick;
+        Entity vehicle = mc.player == null ? null : mc.player.getVehicle();
+        String laneOffset = "n/a";
+        String mountedEnvelope = "n/a";
+        String placementGate = "n/a";
+        if (vehicle instanceof AbstractBoatEntity boat) {
+            double minimum = RasterSideLanePlanner.minimumOffset(
+                rasterBoatHalfWidth(boat)
+            );
+            double selected = rasterSideLaneOffsets.getOrDefault(
+                rasterRow,
+                minimum
+            );
+            laneOffset = String.format(
+                Locale.ROOT,
+                "row=%d side=%s selected=%.2f minimum=%.2f",
+                rasterRow,
+                rasterBuildRoutePlan != null
+                    && rasterBuildRoutePlan.lateralDirection() < 0
+                    ? "west" : "east",
+                selected,
+                minimum
+            );
+            mountedEnvelope = rasterEnvelopeDimensions(boat);
+        }
+        if (mc.player != null && mapCorner != null
+            && !orderedBuildTargets.isEmpty()) {
+            int targetIndex = Math.clamp(
+                rasterCursor,
+                0,
+                orderedBuildTargets.size() - 1
+            );
+            BlockPos relative = orderedBuildTargets.get(targetIndex);
+            BlockPos world = mapCorner.add(relative);
+            Block expected = buildTargets.get(relative);
+            Item required = expected == null ? Items.AIR : expected.asItem();
+            placementGate = String.format(
+                Locale.ROOT,
+                "target=%s eyeDistance=%.3f longitudinalDelta=%.3f lateralOnly=%s inReach=%s observed=%s expected=%s inventory=%d pending=%s selectedSlot=%d",
+                world.toShortString(),
+                mc.player.getEyePos().distanceTo(world.toCenterPos()),
+                Math.abs(world.toCenterPos().z - mc.player.getEyePos().z),
+                RasterLateralPlacementPolicy.isBeside(
+                    mc.player.getEyePos().z,
+                    world.toCenterPos().z
+                ),
+                isBuildPlacementInReach(world),
+                Registries.BLOCK.getId(latestKnownBuildBlock(world)),
+                expected == null ? "missing-plan" : Registries.BLOCK.getId(expected),
+                usableInventoryCounts().getOrDefault(required, 0),
+                pendingPlacementLedger != null
+                    && pendingPlacementLedger.isPending(world),
+                mc.player.getInventory().getSelectedSlot()
+            );
+        }
+        Addon.LOG.info(
+            "[Fullblock Printer] Staircased Printer heartbeat: state={} status={} player={} vehicle={} waypoint={} frontier={} cursor={} route={} corridor={} rejoin={} snapshot={}/3 correction={} hotbarSwap={} pendingPlacements={} budgetPause={} physicalInput={} sideLane={} mountedEnvelopeDimensions={} reach=5.90 placementGate={}",
+            state,
+            rasterStatus,
+            mc.player == null ? "unavailable" : mc.player.getEntityPos(),
+            vehicle == null ? "none" : vehicle.getEntityPos(),
+            rasterWaypoint,
+            rasterConfirmedFrontier,
+            rasterCursor,
+            rasterRouteCursor,
+            rasterPrintCorridorAcquired,
+            rasterRouteRejoinPending,
+            rasterRecoverySnapshotGate.observations(),
+            rasterCorrectionPending,
+            confirmedBuildHotbarSwap != null
+                && confirmedBuildHotbarSwap.isPending(),
+            pendingPlacementLedger == null
+                ? 0 : pendingPlacementLedger.pendingAttempts().size(),
+            workActionBudget == null
+                ? "unavailable" : workActionBudget.pauseReason(),
+            Utils.isPhysicalMovementPressed(),
+            laneOffset,
+            mountedEnvelope,
+            placementGate
+        );
+    }
+
+    private void runRasterAcquireBoat() {
+        if (InvUtils.find(stack -> stack.getItem() instanceof BoatItem).found()) {
+            enterRasterState(State.RasterDeployBoat, "deploying boat");
+            return;
+        }
+        if (rasterBoatSourceChest == null) {
+            failBoatRaster("the reserved boat disappeared from inventory");
+            return;
+        }
+        Vec3d approach = rasterBoatSourceChest.getRight();
+        if (mc.player.getEntityPos().distanceTo(approach) > 0.7) {
+            drivePlayerToward(approach);
+            return;
+        }
+        stopMovement();
+        rasterBoatWithdrawalSubmitted = false;
+        BlockPos chest = rasterBoatSourceChest.getLeft();
+        mc.interactionManager.interactBlock(
+            mc.player,
+            Hand.MAIN_HAND,
+            new BlockHitResult(chest.toCenterPos(), Direction.UP, chest, false)
+        );
+        enterRasterState(State.RasterAwaitBoatChest, "withdrawing boat");
+    }
+
+    private void resetRasterLaunchScaffoldProgress() {
+        rasterLaunchScaffoldStartedTick = -1L;
+        rasterLaunchScaffoldLastAttemptTick = -1000L;
+    }
+
+    private void runRasterDeployBoat() {
+        if (!prepareRasterMaterialHotbarLoadout()) return;
+        if (rasterBoatSourceChest != null
+            && !InvUtils.find(stack -> stack.getItem() instanceof BoatItem).found()) {
+            enterRasterState(State.RasterAcquireBoat, "travelling to boat chest");
+            return;
+        }
+        if (rasterLaunchBlock == null) {
+            rasterLaunchBlock = chooseRasterLaunchBlock();
+            if (rasterLaunchBlock == null) {
+                failBoatRaster("autonomous pathfinder found no reachable open boat launch area");
+                return;
+            }
+            resetRasterLaunchScaffoldProgress();
+            rasterWalkPath.clear();
+            rasterWalkPathTarget = null;
+        }
+        if (mc.player.getEntityPos().squaredDistanceTo(rasterLaunchBlock.toCenterPos()) > 9.0) {
+            BlockPos rejected = new BlockPos(rasterLaunchBlock);
+            if (!drivePlayerToward(rasterLaunchBlock.toCenterPos().add(0, 1, 0))) {
+                rasterRejectedLaunchBlocks.add(rejected);
+                rasterLaunchBlock = null;
+                resetRasterLaunchScaffoldProgress();
+                rasterWalkPath.clear();
+                rasterWalkPathTarget = null;
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Boat Raster rejected unreachable launch cell {}; scanning for a supported route that stays on the platform",
+                    rejected
+                );
+            }
+            return;
+        }
+        stopMovement();
+        AbstractBoatEntity existing = findRasterBoat();
+        if (existing != null) {
+            rasterBoatPosition = existing.getBlockPos();
+            enterRasterState(State.RasterMountBoat, "mounting boat");
+            return;
+        }
+
+        BlockState launchState = mc.world.getBlockState(rasterLaunchBlock);
+        if (launchState.isAir()) {
+            if (rasterLaunchScaffoldStartedTick < 0L) {
+                rasterLaunchScaffoldStartedTick = clientActionTick;
+                rasterLaunchScaffoldLastAttemptTick = -1000L;
+            }
+            if (clientActionTick - rasterLaunchScaffoldStartedTick
+                >= RASTER_LAUNCH_SCAFFOLD_TIMEOUT_TICKS) {
+                BlockPos rejected = new BlockPos(rasterLaunchBlock);
+                rasterRejectedLaunchBlocks.add(rejected);
+                rasterLaunchBlock = null;
+                resetRasterLaunchScaffoldProgress();
+                rasterWalkPath.clear();
+                rasterWalkPathTarget = null;
+                rasterStatus = "scanning after rejected launch scaffold";
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Boat Raster rejected launch cell {} after its scaffold was not confirmed within {} ticks; scanning for another reachable launch",
+                    rejected,
+                    RASTER_LAUNCH_SCAFFOLD_TIMEOUT_TICKS
+                );
+                return;
+            }
+            int scaffoldSlot = ensureRasterHotbarItem(Blocks.COBBLESTONE.asItem());
+            if (scaffoldSlot == HOTBAR_SLOT_PENDING) {
+                rasterStatus = "waiting for bounded launch scaffold hotbar transfer";
+                return;
+            }
+            if (scaffoldSlot == HOTBAR_ITEM_UNAVAILABLE) {
+                failBoatRaster("one cobblestone is required for the temporary launch point");
+                return;
+            }
+            if (clientActionTick - rasterLaunchScaffoldLastAttemptTick
+                < RASTER_LAUNCH_SCAFFOLD_RETRY_TICKS) {
+                rasterStatus = "waiting for launch scaffold confirmation";
+                return;
+            }
+            rasterLaunchScaffoldLastAttemptTick = clientActionTick;
+            if (submitPlacement(
+                rasterLaunchBlock,
+                scaffoldSlot,
+                BuildPlacementPolicy.Mode.ADJACENT,
+                Blocks.COBBLESTONE
+            )) {
+                rasterStatus = "waiting for launch scaffold confirmation";
+            }
+            return;
+        }
+
+        if (rasterLaunchScaffoldStartedTick >= 0L) {
+            if (launchState.isOf(Blocks.COBBLESTONE)) {
+                // Ownership becomes authoritative only after the world confirms
+                // the block submitted for this launch attempt.
+                rasterOwnedTemporaryBlocks.add(new BlockPos(rasterLaunchBlock));
+            }
+            resetRasterLaunchScaffoldProgress();
+        }
+
+        if (!submitRasterBoatDeploymentAttempt()) return;
+        enterRasterState(State.RasterMountBoat, "waiting for boat deployment");
+    }
+
+    private boolean submitRasterBoatDeploymentAttempt() {
+        int boatSlot = ensureRasterHotbarBoat();
+        if (boatSlot == HOTBAR_SLOT_PENDING) return false;
+        if (boatSlot == HOTBAR_ITEM_UNAVAILABLE) {
+            failBoatRaster("the reserved boat could not be moved to the hotbar");
+            return false;
+        }
+        if (clientActionTick - rasterBoatDeployLastAttemptTick < 8L) {
+            rasterStatus = "waiting for authoritative boat deployment confirmation";
+            return false;
+        }
+        rasterBoatDeployLastAttemptTick = clientActionTick;
+        Vec3d aim = rasterLaunchBlock.toCenterPos().add(0, 0.9, 0);
+        int attempt = ++rasterBoatDeployAttempts;
+        Rotations.rotate(
+            Rotations.getYaw(aim),
+            Rotations.getPitch(aim),
+            100,
+            () -> {
+                if ((state != State.RasterDeployBoat
+                    && state != State.RasterMountBoat)
+                    || mc.player == null
+                    || mc.player.getVehicle() != null
+                    || findRasterBoat() != null) {
+                    return;
+                }
+                var result = mc.interactionManager.interactItem(
+                    mc.player,
+                    Hand.MAIN_HAND
+                );
+                mc.player.swingHand(Hand.MAIN_HAND);
+                Addon.LOG.info(
+                    "[Fullblock Printer] Staircased Printer autonomous boat deployment attempt {} result={} launch={} player={}",
+                    attempt,
+                    result,
+                    rasterLaunchBlock,
+                    mc.player.getEntityPos()
+                );
+            }
+        );
+        rasterBoatPosition = null;
+        return true;
+    }
+
+    /** Loads one stack of every remaining material before construction moves. */
+    private boolean prepareRasterMaterialHotbarLoadout() {
+        for (Map.Entry<Item, Integer> demand : rasterMaterialDemand.entrySet()) {
+            Item material = demand.getKey();
+            if (demand.getValue() <= 0 || findBestHotbarSlot(material) >= 0) {
+                continue;
+            }
+            if (confirmedBuildHotbarSwap.isPending()) {
+                rasterStatus = "preloading complete material hotbar before flight";
+                return false;
+            }
+            int sourceSlot = findBestMainInventorySlot(material, -1);
+            if (sourceSlot < 0) {
+                failBoatRaster(
+                    "required material is not available for the preflight hotbar loadout: "
+                        + material.getName().getString()
+                );
+                return false;
+            }
+            int targetSlot = rasterPreloadHotbarDestination();
+            if (targetSlot < 0) {
+                failBoatRaster(
+                    "the managed hotbar cannot hold one stack of every remaining material"
+                );
+                return false;
+            }
+            if (!beginConfirmedBuildHotbarSwap(
+                    sourceSlot,
+                    targetSlot,
+                    material,
+                    "build-material-preflight",
+                    true
+                )) {
+                return false;
+            }
+            rasterStatus = "preloading " + material.getName().getString()
+                + " before continuous flight";
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer preloading {} into managed hotbar slot {} before flight",
+                Registries.ITEM.getId(material),
+                targetSlot
+            );
+            return false;
+        }
+        return true;
+    }
+
+    private int rasterPreloadHotbarDestination() {
+        for (int slot : rasterManagedHotbarSlots) {
+            if (mc.player.getInventory().getStack(slot).isEmpty()) return slot;
+        }
+        for (int slot : rasterManagedHotbarSlots) {
+            Item present = mc.player.getInventory().getStack(slot).getItem();
+            if (!rasterMaterialDemand.containsKey(present)) return slot;
+        }
+        HashSet<Item> seen = new HashSet<>();
+        for (int slot : rasterManagedHotbarSlots) {
+            Item present = mc.player.getInventory().getStack(slot).getItem();
+            if (!seen.add(present)) return slot;
+        }
+        return -1;
+    }
+
+    private void runRasterMountBoat() {
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity boat) {
+            rasterReturningToParkedBoat = false;
+            rasterBoatDeployAttempts = 0;
+            rasterBoatDeployLastAttemptTick = -1000L;
+            rasterBoatMountAttempts = 0;
+            rasterBoatMountTargetId = boat.getId();
+            resetRasterLaunchScaffoldProgress();
+            rasterRejectedLaunchBlocks.clear();
+            rasterBoatPosition = boat.getBlockPos();
+            if (!boatFlyAdapter.acquire()) {
+                failBoatRaster(boatFlyAdapter.failureReason());
+                return;
+            }
+            if (!boatFlyAdapter.include(boat)) {
+                failBoatRaster("Entity Control rejected the mounted boat entity type");
+                return;
+            }
+            if (rasterResumeAfterMount == State.RasterRestock
+                && rasterRestockMaterial != null
+                && rasterRestockSource != null) {
+                if (rasterRestockPhase == RasterRestockPhase.WALK_SOURCE) {
+                    rasterWalkPath.clear();
+                    rasterWalkPathTarget = null;
+                    rasterRestockLanding = null;
+                    rasterRestockDismountCell = null;
+                    rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
+                }
+                enterRasterState(State.RasterRestock, "resuming shulker logistics checkpoint");
+            } else if (rasterResumeAfterMount == State.RasterDisposeExcess) {
+                enterRasterState(State.RasterDisposeExcess, "resuming excess-material disposal");
+            } else if (rasterClearanceQueue.isEmpty()) {
+                if (!rasterRouteValidated) {
+                    rasterPrintCorridorAcquired = false;
+                    rasterDescentWaypoint = null;
+                    rasterCorrectionPending = false;
+                    rasterRouteValidationCursor = 0;
+                    enterRasterState(
+                        State.RasterClearance,
+                        "prevalidating complete compiled BoatFly route"
+                    );
+                } else {
+                    enterRasterState(
+                        State.RasterPrinting,
+                        rasterRouteRejoinPending
+                            ? "remounted; replaying retained compiled route"
+                            : "printing raster"
+                    );
+                }
+            } else {
+                enterRasterState(State.RasterClearance, "clearing flight corridor");
+            }
+            return;
+        }
+        AbstractBoatEntity boat = rasterReturningToParkedBoat
+            ? findRasterBoatNear(rasterBoatPosition)
+            : findRasterBoat();
+        if (boat == null) {
+            if (rasterReturningToParkedBoat) {
+                stopMovement();
+                if (clientActionTick - rasterPhaseStartedTick > 60) {
+                    failBoatRaster(
+                        "parked restock boat was not found at its verified landing"
+                    );
+                }
+                return;
+            }
+            if (InvUtils.find(stack -> stack.getItem() instanceof BoatItem).found()
+                && rasterLaunchBlock != null
+                && clientActionTick - rasterBoatDeployLastAttemptTick >= 8L
+                && rasterBoatDeployAttempts < 4) {
+                rasterStatus = "retrying autonomous boat deployment at verified launch";
+                submitRasterBoatDeploymentAttempt();
+                return;
+            }
+            if (clientActionTick - rasterPhaseStartedTick > 40) {
+                rasterRejectedLaunchBlocks.add(new BlockPos(rasterLaunchBlock));
+                if (rasterBoatDeployAttempts >= 4) {
+                    failBoatRaster("boat placement was rejected after four autonomous interactions");
+                    return;
+                }
+                rasterLaunchBlock = chooseRasterLaunchBlock();
+                resetRasterLaunchScaffoldProgress();
+                rasterWalkPath.clear();
+                rasterWalkPathTarget = null;
+                enterRasterState(
+                    State.RasterDeployBoat,
+                    "pathfinding to a different launch cell after rejected boat placement"
+                );
+            }
+            return;
+        }
+        if (rasterBoatMountTargetId != boat.getId()) {
+            rasterBoatMountTargetId = boat.getId();
+            rasterBoatMountAttempts = 0;
+            rasterBoatMountLastAttemptTick = -1000L;
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer selected boat {} for mandatory mount; player={} boat={}",
+                boat.getId(),
+                mc.player.getEntityPos(),
+                boat.getEntityPos()
+            );
+        }
+        // Get close enough that the server-side entity interaction cannot be
+        // rejected merely because the walk controller stopped at its old
+        // four-block threshold.
+        if (mc.player.squaredDistanceTo(boat) > 2.25 * 2.25) {
+            rasterStatus = "approaching selected boat before mandatory mount";
+            drivePlayerToward(boat.getEntityPos());
+            return;
+        }
+        stopMovement();
+        boatFlyAdapter.stop();
+        if (clientActionTick - rasterBoatMountLastAttemptTick < 5L) {
+            rasterStatus = "waiting for authoritative boat mount confirmation";
+            return;
+        }
+        if (rasterBoatMountAttempts >= 20) {
+            failBoatRaster(
+                "selected boat did not confirm the player as a passenger after 20 close-range interactions"
+            );
+            return;
+        }
+        rasterBoatMountLastAttemptTick = clientActionTick;
+        int attempt = ++rasterBoatMountAttempts;
+        Vec3d aim = boat.getBoundingBox().getCenter();
+        rasterStatus = "interacting with selected boat; mount confirmation required";
+        Rotations.rotate(
+            Rotations.getYaw(aim),
+            Rotations.getPitch(aim),
+            100,
+            () -> {
+                if (state != State.RasterMountBoat
+                    || mc.player == null
+                    || mc.player.getVehicle() != null
+                    || !boat.isAlive()
+                    || mc.player.squaredDistanceTo(boat) > 2.25 * 2.25) {
+                    return;
+                }
+                var result = mc.interactionManager.interactEntity(
+                    mc.player, boat, Hand.MAIN_HAND
+                );
+                Addon.LOG.info(
+                    "[Fullblock Printer] Staircased Printer mandatory boat-mount interaction attempt {}/20 result={} player={} boat={} distance={}",
+                    attempt,
+                    result,
+                    mc.player.getEntityPos(),
+                    boat.getEntityPos(),
+                    String.format(
+                        Locale.ROOT,
+                        "%.3f",
+                        Math.sqrt(mc.player.squaredDistanceTo(boat))
+                    )
+                );
+            }
+        );
+    }
+
+    private void runRasterClearance() {
+        if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            rasterResumeAfterMount = State.RasterClearance;
+            enterRasterState(State.RasterMountBoat, "boat dismounted during clearance");
+            return;
+        }
+        if (workActionBudget.paused()) {
+            boatFlyAdapter.stop();
+            rasterStatus = "clearance paused by TPS guard";
+            return;
+        }
+        while (!rasterClearanceQueue.isEmpty()
+            && mc.world.getBlockState(rasterClearanceQueue.getFirst()).isAir()) {
+            rasterClearanceQueue.removeFirst();
+        }
+        if (rasterClearanceQueue.isEmpty()) {
+            boatFlyAdapter.stop();
+            if (!validateRasterCompiledRouteBatch(boat)) return;
+            rasterLastCorridorCheckedCursor = -1;
+            enterRasterState(State.RasterPrinting, "printing raster");
+            return;
+        }
+        BlockPos obstruction = rasterClearanceQueue.getFirst();
+        BlockPos relative = obstruction.subtract(mapCorner);
+        if (!buildTargets.containsKey(relative)
+            || rasterBuildRoutePlan == null) {
+            failBoatRaster(
+                "clearance target has no corresponding lateral route pose at "
+                    + obstruction.toShortString()
+            );
+            return;
+        }
+        int deadline = rasterBuildRoutePlan.deadline(relative);
+        int band = rasterBuildRoutePlan.points().get(deadline).band();
+        if (!ensureRasterSideLaneOffset(boat, band)) {
+            failBoatRaster(
+                "no collision-safe lateral repair lane remains for row " + band
+            );
+            return;
+        }
+        Vec3d waypoint = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(deadline)
+        );
+        rasterWaypoint = waypoint;
+        if (!RasterSideLanePlanner.arrived(
+                boat.getX(), boat.getY(), boat.getZ(),
+                waypoint.x, waypoint.y, waypoint.z
+            )) {
+            if (!rasterPrintCorridorAcquired) {
+                if (driveDeterministicRasterEntryRoute(boat, deadline)) {
+                    rasterPrintCorridorAcquired = true;
+                    rasterRouteCursor = deadline;
+                }
+                return;
+            }
+            List<Vec3d> lateralRepairRoute = rasterCompiledRouteBetween(
+                boat,
+                rasterRouteCursor,
+                deadline
+            );
+            RasterSetPathStatus routeStatus = driveRasterFixedSetPath(
+                boat,
+                waypoint,
+                lateralRepairRoute,
+                BoatFlyAdapter.DriveMode.BUILD,
+                "replaying the corresponding lateral side-lane repair pose",
+                true
+            );
+            if (routeStatus == RasterSetPathStatus.ARRIVED) {
+                rasterRouteCursor = deadline;
+                rasterSavedRouteCursor = deadline;
+            }
+            return;
+        }
+        if (!isBuildPlacementInReach(obstruction)) {
+            failBoatRaster(
+                "lateral repair pose is outside 5.90-block reach of "
+                    + obstruction.toShortString()
+            );
+            return;
+        }
+        boatFlyAdapter.stop();
+        BlockState state = mc.world.getBlockState(obstruction);
+        int slot = findBestCarriedRasterTool(state);
+        if (slot < 0) {
+            failBoatRaster("carried clearing tool disappeared for "
+                + state.getBlock().getName().getString() + " at "
+                + obstruction.toShortString());
+            return;
+        }
+        if (slot > 8) {
+            markRasterSwapSourceManaged(slot);
+            InvUtils.move().from(slot).toHotbar(rasterHotbarStagingSlot());
+            return;
+        }
+        InvUtils.swap(slot, false);
+        if (workActionBudget.tryConsume()) {
+            BlockUtils.breakBlock(obstruction, true);
+        }
+    }
+
+    private List<Vec3d> rasterCompiledRouteBetween(
+        AbstractBoatEntity boat,
+        int fromIndex,
+        int toIndex
+    ) {
+        int from = Math.clamp(fromIndex, 0,
+            rasterBuildRoutePlan.points().size() - 1);
+        int to = Math.clamp(toIndex, 0,
+            rasterBuildRoutePlan.points().size() - 1);
+        ArrayList<Vec3d> route = new ArrayList<>();
+        int step = from <= to ? 1 : -1;
+        for (int index = from + step;
+             step > 0 ? index <= to : index >= to;
+             index += step) {
+            RasterBuildRoutePlan.Point<BlockPos> point =
+                rasterBuildRoutePlan.points().get(index);
+            if (!ensureRasterSideLaneOffset(boat, point.band())) {
+                return List.of();
+            }
+            route.add(rasterRouteVehiclePose(boat, point));
+        }
+        return List.copyOf(route);
+    }
+
+    /**
+     * Accepts the immutable route topology before the first build movement.
+     *
+     * <p>Collision-checking the complete route here produced false startup
+     * failures for distant transitions whose live approach can differ from the
+     * nominal previous route pose. The immediate segment planner and swept
+     * envelope checks remain authoritative when the boat actually reaches each
+     * point.</p>
+     */
+    private boolean validateRasterCompiledRouteBatch(
+        AbstractBoatEntity boat
+    ) {
+        if (rasterRouteValidated) return true;
+        if (rasterBuildRoutePlan == null
+            || rasterBuildRoutePlan.points().isEmpty()) {
+            failBoatRaster("compiled BoatFly construction route is missing");
+            return false;
+        }
+        int size = rasterBuildRoutePlan.points().size();
+        rasterRouteValidationCursor = size;
+        rasterRouteValidated = true;
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster accepted {} compiled route points; collision validation is deferred to live segment planning",
+            size
+        );
+        return true;
+    }
+
+    private int findBestCarriedRasterTool(BlockState target) {
+        int bestSlot = -1;
+        double bestScore = 1.0;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty() || !ToolUtils.isTool(stack)) continue;
+            double score = stack.getMiningSpeedMultiplier(target);
+            if (stack.isSuitableFor(target)) score += 1000.0;
+            if (score > bestScore) {
+                bestScore = score;
+                bestSlot = slot;
+            }
+        }
+        return bestSlot;
+    }
+
+    private void runRasterPrinting() {
+        if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            beginRasterRouteRejoin("boat dismounted during construction");
+            rasterResumeAfterMount = State.RasterPrinting;
+            enterRasterState(State.RasterMountBoat, "boat dismounted during printing");
+            return;
+        }
+        refreshRasterMountedEnvelope(boat);
+        rasterBoatPosition = boat.getBlockPos();
+        if (workActionBudget.paused()) {
+            boatFlyAdapter.stop();
+            rasterStatus = "printing paused by TPS guard";
+            return;
+        }
+        RasterProgress.Snapshot progress = RasterProgress.reconcile(
+            orderedBuildTargets,
+            rasterCursor,
+            rasterConfirmedFrontier,
+            this::isRasterTargetAuthoritativelyConfirmed
+        );
+        rasterConfirmedFrontier = progress.confirmedFrontier();
+        int firstUnfinished = progress.firstUnfinished();
+        if (firstUnfinished >= orderedBuildTargets.size()) {
+            boatFlyAdapter.stop();
+            enterRasterState(State.RasterVerify, "verifying authoritative map state");
+            return;
+        }
+        BlockPos firstRelative = orderedBuildTargets.get(firstUnfinished);
+        BlockPos firstWorld = mapCorner.add(firstRelative);
+        Block firstObserved = latestKnownBuildBlock(firstWorld);
+        if (firstObserved != Blocks.AIR
+            && firstObserved != buildTargets.get(firstRelative)) {
+            rasterClearanceQueue.add(firstWorld);
+            boatFlyAdapter.stop();
+            enterRasterState(State.RasterClearance, "clearing wrong confirmed target");
+            return;
+        }
+
+        if (!rasterPrintCorridorAcquired) {
+            if (rasterRouteRejoinPending
+                && !rasterRouteRejoinSnapshotAccepted) {
+                if (!rasterRecoverySnapshotGate.observe(
+                        boat.getBlockPos(),
+                        RasterRouteRejoinSnapshotPolicy.mayObserve(
+                            true,
+                            rasterEmergencyClearanceWaypoint != null
+                        )
+                    )) {
+                    boatFlyAdapter.stop();
+                    rasterStatus = "waiting for stable route-rejoin snapshot ("
+                        + rasterRecoverySnapshotGate.observations() + "/3)";
+                    return;
+                }
+                // The snapshot protects the start of one rejoin attempt. Keep
+                // it latched while the boat follows that ingress; re-running
+                // the three-sample gate every movement tick creates a
+                // stop-for-three / move-for-one stutter cycle.
+                rasterRouteRejoinSnapshotAccepted = true;
+                rasterRecoverySnapshotGate.reset();
+            }
+            int entryRouteIndex = rasterRouteRejoinPending
+                ? rasterRouteRejoinCursor
+                : rasterBuildRoutePlan.replayIndexFor(
+                    firstRelative,
+                    RASTER_ROUTE_REJOIN_REPLAY_POINTS
+                );
+            if (rasterRouteRejoinPending
+                && canResumeRasterCheckpointLocally(
+                    boat,
+                    entryRouteIndex
+                )) {
+                rasterRouteCursor = entryRouteIndex;
+                rasterRouteRejoinCursor = entryRouteIndex;
+                rasterRouteRejoinPending = false;
+                rasterRouteRejoinSnapshotAccepted = false;
+                rasterPrintCorridorAcquired = true;
+                rasterDescentWaypoint = null;
+                resetRasterCompiledRouteProgress();
+                rasterStatus = "local checkpoint handoff acquired at point "
+                    + entryRouteIndex;
+                Addon.LOG.info(
+                    "[Fullblock Printer] Staircased Printer resumed locally at frontier {} because the checkpoint boat is already near its lateral lane waypoint",
+                    rasterConfirmedFrontier
+                );
+            } else if (driveDeterministicRasterEntryRoute(
+                    boat,
+                    entryRouteIndex
+                )) {
+                // Recovery ingress is paired with the retained checkpoint
+                // itself. Rewinding to the previous band connector can replay
+                // hundreds of completed build points whose newly placed blocks
+                // now obstruct that historical approach.
+                int acquiredRouteIndex = entryRouteIndex;
+                rasterRouteCursor = acquiredRouteIndex;
+                rasterRouteRejoinCursor = acquiredRouteIndex;
+                rasterRouteRejoinPending = false;
+                rasterRouteRejoinSnapshotAccepted = false;
+                rasterPrintCorridorAcquired = true;
+                rasterDescentWaypoint = null;
+                resetRasterCompiledRouteProgress();
+                rasterStatus = "Nerv route handoff acquired at point "
+                    + acquiredRouteIndex;
+            }
+            if (!rasterPrintCorridorAcquired) return;
+        } else if (rasterCorrectionPending) {
+            if (!rebaseRasterAfterCorrection(boat)) return;
+            return;
+        }
+
+        List<BlockPos> placementBand = rasterPlacementBandTargets(
+            boat,
+            firstUnfinished
+        );
+
+        Optional<Item> rowShortage = firstRasterRowMaterialShortage(
+            firstUnfinished
+        );
+        if (rowShortage.isPresent()) {
+            boatFlyAdapter.stop();
+            Item missing = rowShortage.orElseThrow();
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer deferring row {} before material exhaustion; restocking {} from a forward exterior egress",
+                rasterBuildRoutePlan.points().get(
+                    rasterBuildRoutePlan.deadline(firstRelative)
+                ).band(),
+                Registries.ITEM.getId(missing)
+            );
+            scheduleRasterRestock(missing);
+            return;
+        }
+
+        ArrayList<PrioritizedPlacementPlanner.Target<BlockPos, Item>> targets = new ArrayList<>();
+        for (BlockPos relative : placementBand) {
+            BlockPos world = mapCorner.add(relative);
+            if (isBuildPlacementInReach(world)
+                && latestKnownBuildBlock(world) == Blocks.AIR) {
+                targets.add(new PrioritizedPlacementPlanner.Target<>(
+                    world,
+                    buildTargets.get(relative).asItem()
+                ));
+            }
+        }
+        HashSet<BlockPos> primary = targets.stream()
+            .map(PrioritizedPlacementPlanner.Target::key)
+            .collect(Collectors.toCollection(HashSet::new));
+        if (!dispatchDuePlacementRetries(primary, Map.of(), false)) return;
+        if (confirmedBuildHotbarSwap.isPending()) {
+            boatFlyAdapter.stop();
+            rasterStatus = "waiting for authoritative build hotbar swap";
+            return;
+        }
+        PrioritizedPlacementPlanner.Plan<BlockPos, Item> placement =
+            PrioritizedPlacementPlanner.plan(
+                targets,
+                List.of(),
+                workActionBudget.remainingThisTick(),
+                usableInventoryCounts(),
+                Map.of(),
+                target -> isBuildPlacementEligible(target.key(), true),
+                pendingPlacementLedger::isPending
+            );
+        if (!executePlacementPlan(placement)) {
+            boatFlyAdapter.stop();
+            rasterStatus = confirmedBuildHotbarSwap.isPending()
+                ? "waiting for authoritative build hotbar swap"
+                : "placement submission deferred";
+            return;
+        }
+        boolean activelyPlacing = !placement.decisions().isEmpty()
+            || targets.stream().anyMatch(target ->
+                pendingPlacementLedger.isPending(target.key()));
+
+        if (usesStrictSingleLaneRoute()) {
+            runStrictRasterCompiledRoute(
+                boat,
+                firstUnfinished,
+                firstRelative,
+                firstWorld,
+                activelyPlacing
+            );
+            return;
+        }
+        failBoatRaster("non-strict construction routing is disabled");
+    }
+
+    /** Returns the first material that cannot finish the active X row. */
+    private Optional<Item> firstRasterRowMaterialShortage(
+        int firstUnfinished
+    ) {
+        if (rasterBuildRoutePlan == null
+            || firstUnfinished < 0
+            || firstUnfinished >= orderedBuildTargets.size()) {
+            return Optional.empty();
+        }
+        BlockPos first = orderedBuildTargets.get(firstUnfinished);
+        int band = rasterBuildRoutePlan.points().get(
+            rasterBuildRoutePlan.deadline(first)
+        ).band();
+        ArrayList<Item> needed = new ArrayList<>();
+        for (int index = firstUnfinished;
+             index < orderedBuildTargets.size();
+             index++) {
+            BlockPos relative = orderedBuildTargets.get(index);
+            int targetBand = rasterBuildRoutePlan.points().get(
+                rasterBuildRoutePlan.deadline(relative)
+            ).band();
+            if (targetBand != band) break;
+            BlockPos world = mapCorner.add(relative);
+            if (isRasterTargetAuthoritativelyConfirmed(relative)
+                || pendingPlacementLedger.isPending(world)) {
+                continue;
+            }
+            needed.add(buildTargets.get(relative).asItem());
+        }
+        return RasterRowMaterialBudget.firstShortage(
+            needed,
+            usableInventoryCounts()
+        );
+    }
+
+    private boolean usesStrictSingleLaneRoute() {
+        return RASTER_PRINT_BAND_ROWS == 1;
+    }
+
+    /**
+     * Follows the immutable adjacent-point construction route. The first
+     * unfinished target may be placed early when it enters 5.90-block reach.
+     * A submitted placement does not brake the boat while its authoritative
+     * confirmation is in flight; failed confirmations are handled by the
+     * existing lateral-lane repair pass. This keeps every build leg continuous
+     * and beside the active row, never beneath or above printable blocks.
+     */
+    private void runStrictRasterCompiledRoute(
+        AbstractBoatEntity boat,
+        int firstUnfinished,
+        BlockPos firstRelative,
+        BlockPos firstWorld,
+        boolean activelyPlacing
+    ) {
+        if (rasterBuildRoutePlan == null
+            || rasterBuildRoutePlan.points().isEmpty()
+            || rasterRouteCursor < 0
+            || rasterRouteCursor >= rasterBuildRoutePlan.points().size()) {
+            failBoatRaster("strict single-line route lost its compiled cursor");
+            return;
+        }
+
+        rasterCursor = firstUnfinished;
+        int currentBand = rasterBuildRoutePlan.points()
+            .get(rasterRouteCursor).band();
+        int nextBand = rasterRouteCursor + 1 < rasterBuildRoutePlan.points().size()
+            ? rasterBuildRoutePlan.points().get(rasterRouteCursor + 1).band()
+            : currentBand;
+        if (!ensureRasterSideLaneOffset(boat, currentBand)
+            || !ensureRasterSideLaneOffset(boat, nextBand)) {
+            failBoatRaster(
+                "no complete collision-safe lateral side lane remains within "
+                    + "the absolute 5.90-block reach for row " + nextBand
+            );
+            return;
+        }
+        if (rasterStrictPlacementDetourTargetIndex != firstUnfinished) {
+            if (rasterStrictPlacementDetourTargetIndex >= 0) {
+                rasterBoatPath.clear();
+                rasterBoatPathTarget = null;
+                resetRasterBoatPathProgress();
+            }
+            rasterStrictPlacementDetour = null;
+            rasterStrictPlacementDetourTargetIndex = firstUnfinished;
+        }
+        advanceRasterCompiledRouteCursor(boat);
+
+        int nominalDeadline = rasterBuildRoutePlan.deadline(firstRelative);
+        int deadline = strictReachableRasterDeadline(
+            boat,
+            firstWorld,
+            nominalDeadline
+        );
+        if (deadline != nominalDeadline
+            && rasterRouteCursor <= nominalDeadline) {
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer deferred target {} deadline {} -> {} until its lateral side-lane pose is within 5.90-block reach",
+                firstWorld.toShortString(),
+                nominalDeadline,
+                deadline
+            );
+        }
+        boolean confirmed = isRasterTargetAuthoritativelyConfirmed(
+            firstRelative
+        );
+        boolean pending = pendingPlacementLedger.isPending(firstWorld);
+        boolean inReach = isBuildPlacementInReach(firstWorld);
+        RasterRouteDeadlinePolicy.Decision decision =
+            RasterRouteDeadlinePolicy.decide(
+                rasterRouteCursor,
+                deadline,
+                confirmed,
+                pending,
+                inReach
+            );
+
+        RasterBuildRoutePlan.Point<BlockPos> retainedPoint =
+            rasterBuildRoutePlan.points().get(rasterRouteCursor);
+        rasterRow = retainedPoint.band();
+        rasterDirection = retainedPoint.direction();
+
+        switch (decision) {
+            case PLACE_AND_HOLD -> {
+                boatFlyAdapter.stop();
+                rasterWaypoint = rasterRouteVehiclePose(
+                    boat,
+                    retainedPoint
+                );
+                rasterStatus = "holding strict north/south route point "
+                    + rasterRouteCursor + " for placement at 15.0 blocks/s"
+                    + ", frontier " + rasterConfirmedFrontier + "/"
+                    + orderedBuildTargets.size();
+                return;
+            }
+            case REPOSITION_SIDE_LANE -> {
+                boolean retainedPoseInReach =
+                    isRasterTargetReachableFromRoutePose(
+                        boat,
+                        firstWorld,
+                        retainedPoint
+                    );
+                if (RasterRouteDeadlinePolicy.requiresExactPlacementPose(
+                        rasterRouteCursor,
+                        deadline,
+                        inReach,
+                        retainedPoseInReach
+                    )) {
+                    Vec3d exactPose = rasterRouteVehiclePose(
+                        boat,
+                        retainedPoint
+                    );
+                    rasterWaypoint = exactPose;
+                    if (boat.getEntityPos().distanceTo(exactPose) <= 0.08) {
+                        boatFlyAdapter.stop();
+                        rasterStatus = "holding exact lateral side-lane placement pose at deadline "
+                            + deadline;
+                        return;
+                    }
+                    if (!isRasterBoatFullSegmentClear(
+                            boat,
+                            boat.getEntityPos(),
+                            exactPose
+                        )) {
+                        beginRasterRouteRejoin(
+                            "exact placement-deadline pose became obstructed"
+                        );
+                        return;
+                    }
+                    boatFlyAdapter.drive(
+                        boat,
+                        exactPose,
+                        BoatFlyAdapter.DriveMode.BUILD
+                    );
+                    rasterStatus = "centering on exact lateral side-lane placement pose at 15.0 blocks/s, deadline "
+                        + deadline;
+                    return;
+                }
+                if (rasterStrictPlacementDetour == null) {
+                    rasterStrictPlacementDetour =
+                        selectStrictRasterPlacementDetour(
+                            boat,
+                            firstWorld
+                        );
+                }
+                if (rasterStrictPlacementDetour != null) {
+                    List<Vec3d> detour = safeRasterCompiledSegmentPath(
+                        boat,
+                        boat.getEntityPos(),
+                        rasterStrictPlacementDetour
+                    );
+                    if (detour.isEmpty()) {
+                        rasterStrictPlacementDetour = null;
+                        beginRasterRouteRejoin(
+                            "latched lateral placement pose became obstructed"
+                        );
+                        return;
+                    }
+                    RasterSetPathStatus detourStatus =
+                        driveRasterFixedSetPath(
+                            boat,
+                            rasterStrictPlacementDetour,
+                            detour,
+                            BoatFlyAdapter.DriveMode.BUILD,
+                            "moving outward to a legal lateral placement pose at 15.0 blocks/s"
+                        );
+                    if (detourStatus == RasterSetPathStatus.ARRIVED) {
+                        boatFlyAdapter.stop();
+                        rasterStatus = "holding strict lateral placement pose for confirmation";
+                    }
+                    return;
+                }
+                failBoatRaster(
+                    "no collision-safe lateral side-lane pose is within the absolute 5.90-block reach of "
+                        + firstWorld.toShortString()
+                );
+                return;
+            }
+            case ADVANCE -> {
+                if (rasterRouteCursor
+                    >= rasterBuildRoutePlan.points().size() - 1) {
+                    failBoatRaster(
+                        "strict route ended before unfinished target "
+                            + firstWorld.toShortString()
+                    );
+                    return;
+                }
+            }
+        }
+
+        int destinationIndex = continuousRasterDestinationIndex(boat);
+        RasterBuildRoutePlan.Point<BlockPos> destinationPoint =
+            rasterBuildRoutePlan.points().get(destinationIndex);
+        // The cursor can cross into the next row after the offsets at the top
+        // of this tick were checked. Latch that destination row before deriving
+        // its pose so a nominal lane can never enter the compiled-path cache.
+        if (!ensureRasterSideLaneOffset(boat, destinationPoint.band())) {
+            failBoatRaster(
+                "no complete collision-safe lateral side lane remains within "
+                    + "the absolute 5.90-block reach for row "
+                    + destinationPoint.band()
+            );
+            return;
+        }
+        Vec3d destination = rasterRouteVehiclePose(
+            boat,
+            destinationPoint
+        );
+        BoatFlyAdapter.DriveMode mode =
+            RasterConstructionMotionPolicy.driveMode(activelyPlacing);
+
+        if (!driveRasterCompiledSegment(
+                boat,
+                destinationIndex,
+                destination,
+                mode
+            )) {
+            return;
+        }
+
+        rasterRow = destinationPoint.band();
+        rasterDirection = destinationPoint.direction();
+        rasterStatus = "strict line " + rasterRow + " moving "
+            + rasterDirectionLabel() + " through adjacent route point "
+            + destinationIndex + "/"
+            + (rasterBuildRoutePlan.points().size() - 1)
+            + ", building at "
+            + String.format(Locale.ROOT, "%.1f", boatRasterBuildSpeed.get())
+            + " blocks/s, frontier " + rasterConfirmedFrontier + "/"
+            + orderedBuildTargets.size();
+    }
+
+    /**
+     * Looks ahead along one straight compiled leg so BoatFly does not brake at
+     * every one-block placement deadline. Turns, height changes, and side-lane
+     * changes remain explicit route boundaries.
+     */
+    private int continuousRasterDestinationIndex(AbstractBoatEntity boat) {
+        int firstIndex = Math.min(
+            rasterRouteCursor + 1,
+            rasterBuildRoutePlan.points().size() - 1
+        );
+        Vec3d retained = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(rasterRouteCursor)
+        );
+        Vec3d first = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(firstIndex)
+        );
+        Vec3d leg = first.subtract(retained);
+        double legLength = leg.length();
+        if (legLength <= 1.0e-6) return firstIndex;
+        Vec3d direction = leg.multiply(1.0 / legLength);
+        Vec3d actual = boat.getEntityPos();
+        if (first.subtract(actual).dotProduct(direction) <= 0.0) {
+            return firstIndex;
+        }
+        int band = rasterBuildRoutePlan.points().get(firstIndex).band();
+        int selected = firstIndex;
+        for (int index = firstIndex + 1;
+             index < rasterBuildRoutePlan.points().size();
+             index++) {
+            RasterBuildRoutePlan.Point<BlockPos> point =
+                rasterBuildRoutePlan.points().get(index);
+            if (point.band() != band) break;
+            Vec3d candidate = rasterRouteVehiclePose(boat, point);
+            Vec3d delta = candidate.subtract(actual);
+            double forward = delta.dotProduct(direction);
+            if (forward <= 0.0
+                || forward > RasterBuildRoutePlan.MAXIMUM_TRANSIT_SEGMENT
+                    + 1.0e-6) {
+                break;
+            }
+            Vec3d offAxis = candidate.subtract(retained)
+                .subtract(direction.multiply(
+                    candidate.subtract(retained).dotProduct(direction)
+                ));
+            if (offAxis.lengthSquared() > 1.0e-8) break;
+            selected = index;
+        }
+        return selected;
+    }
+
+    private int strictReachableRasterDeadline(
+        AbstractBoatEntity boat,
+        BlockPos target,
+        int nominalDeadline
+    ) {
+        RasterBuildRoutePlan.Point<BlockPos> nominal =
+            rasterBuildRoutePlan.points().get(nominalDeadline);
+        int maximum = Math.min(
+            rasterBuildRoutePlan.points().size() - 1,
+            nominalDeadline + (int) Math.ceil(
+                effectiveBuildInteractionRange()
+            ) + 3
+        );
+        while (maximum > nominalDeadline) {
+            RasterBuildRoutePlan.Point<BlockPos> point =
+                rasterBuildRoutePlan.points().get(maximum);
+            if (point.band() == nominal.band()
+                && point.pass() == nominal.pass()) {
+                break;
+            }
+            maximum--;
+        }
+        return RasterRouteDeadlinePolicy.firstReachableDeadline(
+            nominalDeadline,
+            maximum,
+            index -> isRasterTargetReachableFromRoutePose(
+                boat,
+                target,
+                rasterBuildRoutePlan.points().get(index)
+            )
+        );
+    }
+
+    private boolean isRasterTargetReachableFromRoutePose(
+        AbstractBoatEntity boat,
+        BlockPos target,
+        RasterBuildRoutePlan.Point<BlockPos> routePoint
+    ) {
+        double eyeOffset = mc.player.getEyeY() - boat.getY();
+        double reach = Math.max(
+            0.0,
+            effectiveBuildInteractionRange() - 0.15
+        );
+        Vec3d pose = rasterRouteVehiclePose(boat, routePoint);
+        Vec3d eye = pose.add(0.0, eyeOffset, 0.0);
+        Vec3d targetCenter = target.toCenterPos();
+        return eye.squaredDistanceTo(targetCenter) <= reach * reach
+            && RasterLateralPlacementPolicy.isBeside(
+                eye.z,
+                targetCenter.z
+            );
+    }
+
+    private Vec3d selectStrictRasterPlacementDetour(
+        AbstractBoatEntity boat,
+        BlockPos target
+    ) {
+        double eyeOffset = mc.player.getEyeY() - boat.getY();
+        Vec3d targetCenter = target.toCenterPos();
+        BlockPos relative = target.subtract(mapCorner);
+        RasterBuildRoutePlan.Point<BlockPos> deadlinePoint =
+            rasterBuildRoutePlan.points().get(
+                rasterBuildRoutePlan.deadline(relative)
+            );
+        Vec3d base = rasterRouteVehiclePose(boat, deadlinePoint);
+        base = new Vec3d(
+            base.x,
+            targetCenter.y - eyeOffset,
+            targetCenter.z
+        );
+        int direction = rasterBuildRoutePlan.lateralDirection();
+        for (double outward = RasterSideLanePlanner.OUTWARD_SCAN_STEP;
+             outward <= RasterSideLanePlanner.ABSOLUTE_REACH;
+             outward += RasterSideLanePlanner.OUTWARD_SCAN_STEP) {
+            Vec3d candidate = base.add(direction * outward, 0.0, 0.0);
+            Vec3d eye = candidate.add(0.0, eyeOffset, 0.0);
+            if (!RasterSideLanePlanner.withinAbsoluteReach(
+                    eye.x,
+                    eye.y,
+                    eye.z,
+                    targetCenter.x,
+                    targetCenter.y,
+                    targetCenter.z
+                )) {
+                break;
+            }
+            if (!isRasterBoatPositionSafe(
+                    boat,
+                    candidate.x,
+                    candidate.y,
+                    candidate.z
+                )) {
+                continue;
+            }
+            if (!isRasterBoatFullSegmentClear(
+                    boat,
+                    boat.getEntityPos(),
+                    candidate
+                )) {
+                continue;
+            }
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer selected outward lateral pose {} for target {}; eye distance remains within 5.90 blocks",
+                candidate,
+                target.toShortString()
+            );
+            return candidate;
+        }
+        Addon.LOG.warn(
+            "[Fullblock Printer] Staircased Printer found no loaded collision-safe lateral pose within 5.90-block reach of {}",
+            target.toShortString()
+        );
+        return null;
+    }
+
+    /** Selects and latches the nearest complete row lane before entering it. */
+    private boolean ensureRasterSideLaneOffset(
+        AbstractBoatEntity boat,
+        int band
+    ) {
+        if (rasterSideLaneOffsets.containsKey(band)) return true;
+        double theoreticalMinimum = RasterSideLanePlanner.minimumOffset(
+            rasterBoatHalfWidth(boat)
+        );
+        double minimum = hasAdjacentRasterBand(band)
+            ? RasterSideLanePlanner.minimumAdjacentRowOffset(
+                rasterBoatHalfWidth(boat)
+            )
+            : theoreticalMinimum;
+        OptionalDouble selected = RasterSideLanePlanner.nearestOutwardOffset(
+            minimum,
+            offset -> isCompleteRasterBandLaneSafe(boat, band, offset)
+        );
+        if (selected.isEmpty()) return false;
+        double offset = selected.orElseThrow();
+        rasterSideLaneOffsets.put(band, offset);
+        // A route point may already have been compiled with the nominal lane
+        // during the tick that crossed the row boundary. The new latch changes
+        // the physical destination, so invalidate all segment progress now.
+        resetRasterCompiledRouteProgress();
+        Addon.LOG.info(
+            "[Fullblock Printer] Staircased Printer latched row {} {} side-lane offset {} (theoretical minimum {}, adjacent-row baseline {}, mounted envelope {})",
+            band,
+            rasterBuildRoutePlan.lateralDirection() > 0 ? "east" : "west",
+            String.format(Locale.ROOT, "%.2f", offset),
+            String.format(Locale.ROOT, "%.2f", theoreticalMinimum),
+            String.format(Locale.ROOT, "%.2f", minimum),
+            rasterEnvelopeDimensions(boat)
+        );
+        return true;
+    }
+
+    private boolean hasAdjacentRasterBand(int band) {
+        if (rasterBuildRoutePlan == null) return false;
+        for (RasterBuildRoutePlan.Point<BlockPos> point
+            : rasterBuildRoutePlan.points()) {
+            if (Math.abs(point.band() - band) == 1) return true;
+        }
+        return false;
+    }
+
+    /** Move only outward when a changed physical block obstructs a live lane. */
+    private boolean relatchRasterSideLaneOutward(
+        AbstractBoatEntity boat,
+        int band
+    ) {
+        double current = rasterSideLaneOffsets.getOrDefault(
+            band,
+            RasterSideLanePlanner.minimumOffset(rasterBoatHalfWidth(boat))
+        );
+        double next = current + RasterSideLanePlanner.OUTWARD_SCAN_STEP;
+        OptionalDouble selected = RasterSideLanePlanner.nearestOutwardOffset(
+            next,
+            offset -> isCompleteRasterBandLaneSafe(boat, band, offset)
+        );
+        if (selected.isEmpty()) return false;
+        double offset = selected.orElseThrow();
+        rasterSideLaneOffsets.put(band, offset);
+        rasterOutwardLaneShiftBand = band;
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        resetRasterCompiledRouteProgress();
+        Addon.LOG.warn(
+            "[Fullblock Printer] Staircased Printer physical obstruction moved row {} {} side lane outward {} -> {} (mounted envelope {})",
+            band,
+            rasterBuildRoutePlan.lateralDirection() > 0 ? "east" : "west",
+            String.format(Locale.ROOT, "%.2f", current),
+            String.format(Locale.ROOT, "%.2f", offset),
+            rasterEnvelopeDimensions(boat)
+        );
+        return true;
+    }
+
+    private boolean isCompleteRasterBandLaneSafe(
+        AbstractBoatEntity boat,
+        int band,
+        double offset
+    ) {
+        Vec3d previous = null;
+        for (RasterBuildRoutePlan.Point<BlockPos> point
+            : rasterBuildRoutePlan.points()) {
+            if (point.band() != band) continue;
+            Vec3d pose = rasterRouteVehiclePose(boat, point, offset);
+            double eyeOffset = mc.player.getEyeY() - boat.getY();
+            if (!rasterRoutePointPlacementsReachable(
+                    point,
+                    pose.x,
+                    pose.y + eyeOffset,
+                    pose.z
+                )
+                || !isRasterBoatPositionSafe(
+                    boat, pose.x, pose.y, pose.z
+                )) {
+                return false;
+            }
+            if (previous != null
+                && previous.distanceTo(pose) > 1.0e-7
+                && !isRasterBoatFullSegmentClear(boat, previous, pose)) {
+                return false;
+            }
+            previous = pose;
+        }
+        return previous != null;
+    }
+
+    private boolean canResumeRasterCheckpointLocally(
+        AbstractBoatEntity boat,
+        int entryRouteIndex
+    ) {
+        if (rasterBuildRoutePlan == null
+            || entryRouteIndex < 0
+            || entryRouteIndex >= rasterBuildRoutePlan.points().size()) {
+            return false;
+        }
+        Vec3d target = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(entryRouteIndex)
+        );
+        return RasterLocalCheckpointResumePolicy.canResume(
+            boat.getX(),
+            boat.getY(),
+            boat.getZ(),
+            target.x,
+            target.y,
+            target.z,
+            mapCorner.getX() - 0.5,
+            mapCorner.getX() + 128.5,
+            mapCorner.getZ() - 0.5,
+            mapCorner.getZ() + 128.5,
+            RASTER_ROUTE_MAX_SEGMENT_CELLS + 0.5,
+            RASTER_LOCAL_RESUME_VERTICAL_TOLERANCE
+        );
+    }
+
+    private boolean driveDeterministicRasterEntryRoute(
+        AbstractBoatEntity boat,
+        int entryRouteIndex
+    ) {
+        if (rasterBuildRoutePlan == null
+            || entryRouteIndex < 0
+            || entryRouteIndex >= rasterBuildRoutePlan.points().size()) {
+            failBoatRaster("deterministic entry lost its compiled route point");
+            return false;
+        }
+        int entryBand = rasterBuildRoutePlan.points().get(entryRouteIndex).band();
+        if (!ensureRasterSideLaneOffset(boat, entryBand)) {
+            failBoatRaster(
+                "no collision-safe lateral entry lane remains within 5.90-block reach for row "
+                    + entryBand
+            );
+            return false;
+        }
+        RasterBuildRoutePlan.Point<BlockPos> accessPoint =
+            rasterBuildRoutePlan.previousExteriorAccess(entryRouteIndex);
+        RasterBuildRoutePlan.Point<BlockPos> retainedPoint =
+            rasterBuildRoutePlan.points().get(entryRouteIndex);
+        Vec3d retained = rasterRouteVehiclePose(boat, retainedPoint);
+        Vec3d rawAccess = rasterRouteVehiclePose(boat, accessPoint);
+        Vec3d access = new Vec3d(retained.x, rawAccess.y, rawAccess.z);
+        int accessIndex = entryRouteIndex;
+        boolean retainedIngress = rasterBoatPathTarget != null
+            && rasterBoatPathTarget.squaredDistanceTo(retained) <= 0.02
+            && !rasterBoatPath.isEmpty();
+        List<Vec3d> route = retainedIngress
+            ? List.of()
+            : createRasterDeterministicEntryPath(boat, entryRouteIndex);
+        if (!retainedIngress
+            && route.isEmpty()
+            && boat.getEntityPos().distanceTo(retained) > 0.90) {
+            failBoatRaster(
+                "no verified support-aware flat exterior route reaches the north/south entry column"
+            );
+            return false;
+        }
+        RasterSetPathStatus status = driveRasterSupportedFixedSetPath(
+            boat,
+            retained,
+            route,
+            BoatFlyAdapter.DriveMode.TRAVEL,
+            "flying outside the footprint and entering the fixed lateral side lane",
+            true,
+            Math.min(boat.getY(), retained.y)
+        );
+        if (status != RasterSetPathStatus.ARRIVED) return false;
+        Addon.LOG.info(
+            "[Fullblock Printer] Staircased Printer lateral side lane acquired at {} through exterior access {}; handing movement to adjacent compiled points at frontier {}",
+            retained,
+            access,
+            rasterConfirmedFrontier
+        );
+        rasterRouteCursor = accessIndex;
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        rasterLocalRecoveryRetainedDestination = -1;
+        return true;
+    }
+
+    private List<Vec3d> createRasterDeterministicEntryPath(
+        AbstractBoatEntity boat,
+        int entryRouteIndex
+    ) {
+        Vec3d start = boat.getEntityPos();
+        Vec3d retained = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(entryRouteIndex)
+        );
+
+        // The route may be invalidated while the boat is already travelling
+        // through the retained row's lateral lane. In that case the simplest
+        // safe recovery is to continue along that same lane. The fixed-route
+        // driver performs the authoritative swept-envelope validation.
+        if (RasterSideLanePlanner.canContinueAlongLane(
+                start.x,
+                retained.x,
+                rasterBuildRoutePlan.lateralDirection(),
+                0.25
+            )) {
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer retained lateral lane after route invalidation; continuing directly from {} to {}",
+                start,
+                retained
+            );
+            return start.distanceTo(retained) > 0.10
+                ? List.of(retained)
+                : List.of();
+        }
+        ArrayList<Vec3d> route = new ArrayList<>();
+        route.add(start);
+
+        // Resume through the exact exterior access paired with the retained
+        // route cursor. Choosing the geometrically nearest exterior anchor
+        // can select the opposite side of the map; entryAlongRoute() would
+        // then begin with a low cross-map leg and repeatedly collide.
+        RasterBuildRoutePlan.Point<BlockPos> accessPoint =
+            rasterBuildRoutePlan.previousExteriorAccess(entryRouteIndex);
+        Vec3d rawAccess = rasterRouteVehiclePose(boat, accessPoint);
+        Vec3d access = new Vec3d(retained.x, rawAccess.y, rawAccess.z);
+        List<Vec3d> exteriorIngress = createRasterExteriorIngressPath(
+            boat,
+            start,
+            access
+        );
+        if (exteriorIngress.isEmpty()) return List.of();
+        // Exterior travel is deliberately staged as long BoatFly legs. Do not
+        // split these into construction-sized one-block waypoints: BoatFly must
+        // hold travel speed until the vertical, north, east or descent endpoint.
+        exteriorIngress.forEach(waypoint -> {
+            Vec3d previous = route.getLast();
+            if (previous.distanceTo(waypoint) > 0.10) route.add(waypoint);
+        });
+        for (RasterBuildRoutePlan.Point<BlockPos> point
+            : rasterBuildRoutePlan.entryAlongRoute(entryRouteIndex)) {
+            Vec3d rawWaypoint = rasterRouteVehiclePose(boat, point);
+            Vec3d waypoint = new Vec3d(
+                retained.x,
+                rawWaypoint.y,
+                rawWaypoint.z
+            );
+            Vec3d previous = route.getLast();
+            List<RasterExteriorIngressPlan.Point> handoff =
+                RasterExteriorIngressPlan.safeVerticalDogleg(
+                    new RasterExteriorIngressPlan.Point(
+                        previous.x, previous.y, previous.z
+                    ),
+                    new RasterExteriorIngressPlan.Point(
+                        waypoint.x, waypoint.y, waypoint.z
+                    )
+                );
+            for (RasterExteriorIngressPlan.Point staged : handoff) {
+                Vec3d stagedWaypoint = new Vec3d(
+                    staged.x(), staged.y(), staged.z()
+                );
+                if (route.getLast().distanceTo(stagedWaypoint) > 0.10) {
+                    route.add(stagedWaypoint);
+                }
+            }
+        }
+        return List.copyOf(route.subList(1, route.size()));
+    }
+
+    /**
+     * Launch ingress only: rise in place, move outside west/east, traverse the
+     * exterior corridor, descend at the north/south access row, then hand off
+     * to the immutable construction route. No build point is rewritten here.
+     */
+    private List<Vec3d> createRasterExteriorIngressPath(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d access
+    ) {
+        RasterExteriorIngressPlan.Bounds worldBounds =
+            new RasterExteriorIngressPlan.Bounds(
+                mapCorner.getX() + rasterBuildRoutePlan.minimumX(),
+                mapCorner.getX() + rasterBuildRoutePlan.maximumX() + 1.0,
+                mapCorner.getZ() + rasterBuildRoutePlan.minimumZ(),
+                mapCorner.getZ() + rasterBuildRoutePlan.maximumZ() + 1.0
+            );
+        RasterExteriorIngressPlan.Candidate candidate =
+            RasterExteriorIngressPlan.flatWestExterior(
+                new RasterExteriorIngressPlan.Point(
+                    start.x, start.y, start.z
+                ),
+                new RasterExteriorIngressPlan.Point(
+                    access.x, access.y, access.z
+                ),
+                worldBounds,
+                rasterBuildRoutePlan.exteriorMargin()
+            );
+        List<Vec3d> waypoints = candidate.waypoints().stream()
+            .map(point -> new Vec3d(point.x(), point.y(), point.z()))
+            .toList();
+        double supportPlaneY = Math.min(start.y, access.y);
+        if (!isRasterBoatFixedRouteClearToLanding(
+                boat, start, waypoints, supportPlaneY
+            )) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Staircased Printer flat exterior ingress rejected: {}",
+                rasterBoatFixedRouteFailure(boat, start, waypoints)
+            );
+            return List.of();
+        }
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster selected flat west-exterior ingress with {} axis-aligned waypoints at Y={} and one final endpoint height handoff",
+            waypoints.size(),
+            String.format(Locale.ROOT, "%.2f", start.y)
+        );
+        return List.copyOf(waypoints);
+    }
+
+    private String rasterBoatFixedRouteFailure(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        List<Vec3d> route
+    ) {
+        Vec3d previous = start;
+        for (int index = 0; index < route.size(); index++) {
+            Vec3d waypoint = route.get(index);
+            if (previous.distanceTo(waypoint) > 0.10
+                && !isRasterBoatFullSegmentClear(boat, previous, waypoint)
+                && !(index == 0
+                    && isRasterBoatExteriorSeparatingLiftClear(
+                        boat, previous, waypoint
+                    ))) {
+                return "route_leg=" + index + " start=" + previous
+                    + " target=" + waypoint
+                    + " reason=" + rasterBoatSegmentFailure(
+                        boat, previous, waypoint
+                    );
+            }
+            previous = waypoint;
+        }
+        return "fixed route rejected without a reproducible unsafe leg";
+    }
+
+    private List<Vec3d> createRasterExteriorEgressPath(
+        AbstractBoatEntity boat,
+        Vec3d northAccess,
+        Vec3d southwestLanding
+    ) {
+        RasterExteriorIngressPlan.Bounds worldBounds =
+            new RasterExteriorIngressPlan.Bounds(
+                mapCorner.getX() + rasterBuildRoutePlan.minimumX(),
+                mapCorner.getX() + rasterBuildRoutePlan.maximumX() + 1.0,
+                mapCorner.getZ() + rasterBuildRoutePlan.minimumZ(),
+                mapCorner.getZ() + rasterBuildRoutePlan.maximumZ() + 1.0
+            );
+        RasterExteriorIngressPlan.Candidate candidate =
+            RasterExteriorIngressPlan.flatWestExterior(
+                new RasterExteriorIngressPlan.Point(
+                    northAccess.x, northAccess.y, northAccess.z
+                ),
+                new RasterExteriorIngressPlan.Point(
+                    southwestLanding.x,
+                    southwestLanding.y,
+                    southwestLanding.z
+                ),
+                worldBounds,
+                rasterBuildRoutePlan.exteriorMargin()
+            );
+        List<Vec3d> route = candidate.waypoints().stream()
+            .map(point -> new Vec3d(point.x(), point.y(), point.z()))
+            .toList();
+        if (!isRasterBoatFixedRouteClearToLanding(
+                boat, northAccess, route, southwestLanding.y
+            )) {
+            return List.of();
+        }
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster selected flat west-exterior logistics route at Y={} with one final docking-height handoff",
+            String.format(Locale.ROOT, "%.2f", northAccess.y)
+        );
+        return List.copyOf(route);
+    }
+
+    private RasterLogisticsRouteStatus driveRasterExteriorLogisticsRoute(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        boolean returningToMap
+    ) {
+        boolean retainedRoute = rasterBoatPathTarget != null
+            && rasterBoatPathTarget.squaredDistanceTo(target) <= 0.02
+            && !rasterBoatPath.isEmpty();
+        List<Vec3d> route = retainedRoute
+            ? List.of()
+            : returningToMap
+                ? createRasterExteriorIngressPath(
+                    boat,
+                    boat.getEntityPos(),
+                    target
+                )
+                : createRasterExteriorEgressPath(
+                    boat,
+                    boat.getEntityPos(),
+                    target
+                );
+        if (!retainedRoute
+            && route.isEmpty()
+            && boat.getEntityPos().distanceTo(target) > 0.90) {
+            return RasterLogisticsRouteStatus.REJECTED;
+        }
+        RasterSetPathStatus status = driveRasterSupportedFixedSetPath(
+            boat,
+            target,
+            route,
+            BoatFlyAdapter.DriveMode.TRAVEL,
+            returningToMap
+                ? "following flat west-exterior lines back to the retained Nerv route at 20.0 blocks/s"
+                : "following flat west-exterior lines to logistics at 20.0 blocks/s",
+            true,
+            Math.min(boat.getY(), target.y)
+        );
+        return switch (status) {
+            case ARRIVED -> RasterLogisticsRouteStatus.ARRIVED;
+            case MOVING -> RasterLogisticsRouteStatus.SEARCHING;
+            case FAILED -> RasterLogisticsRouteStatus.REJECTED;
+        };
+    }
+
+    private boolean isRasterBoatFixedRouteClear(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        List<Vec3d> route
+    ) {
+        Vec3d previous = start;
+        int index = 0;
+        for (Vec3d waypoint : route) {
+            if (previous.distanceTo(waypoint) > 0.10
+                && !isRasterBoatFullSegmentClear(boat, previous, waypoint)
+                && !(index == 0
+                    && isRasterBoatExteriorSeparatingLiftClear(
+                        boat, previous, waypoint
+                    ))) {
+                return false;
+            }
+            previous = waypoint;
+            index++;
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatFixedRouteClearToLanding(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        List<Vec3d> route,
+        double supportPlaneY
+    ) {
+        Vec3d previous = start;
+        for (Vec3d waypoint : route) {
+            if (previous.distanceTo(waypoint) > 0.10
+                && !isRasterBoatLandingSegmentClear(
+                    boat, previous, waypoint, supportPlaneY
+                )) {
+                return false;
+            }
+            previous = waypoint;
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatLandingSegmentClear(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target,
+        double supportPlaneY
+    ) {
+        double distance = start.distanceTo(target);
+        int samples = Math.max(1, (int) Math.ceil(
+            distance / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d delta = target.subtract(start);
+        for (int sample = 0; sample <= samples; sample++) {
+            Vec3d candidate = start.add(
+                delta.multiply((double) sample / samples)
+            );
+            if (!isRasterBoatLandingPositionClear(
+                    boat,
+                    candidate.x,
+                    candidate.y,
+                    candidate.z,
+                    supportPlaneY
+                )) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatImmediateSupportTravelClear(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        BoatFlyAdapter.DriveMode mode,
+        double supportPlaneY
+    ) {
+        Vec3d start = boat.getEntityPos();
+        double distance = start.distanceTo(target);
+        if (distance < 1.0e-6) {
+            return isRasterBoatLandingPositionClear(
+                boat,
+                target.x,
+                target.y,
+                target.z,
+                supportPlaneY
+            );
+        }
+        double requestedLookahead = mode == BoatFlyAdapter.DriveMode.TRAVEL
+            ? Math.max(
+                RASTER_ROUTE_CLEARANCE_LOOKAHEAD,
+                boatRasterTravelSpeed.get() * 0.5
+            )
+            : RASTER_ROUTE_CLEARANCE_LOOKAHEAD;
+        double lookahead = Math.min(distance, requestedLookahead);
+        int samples = Math.max(1, (int) Math.ceil(
+            lookahead / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d delta = target.subtract(start).multiply(
+            lookahead / distance
+        );
+        for (int sample = 0; sample <= samples; sample++) {
+            Vec3d candidate = start.add(
+                delta.multiply((double) sample / samples)
+            );
+            if (!isRasterBoatLandingPositionClear(
+                    boat,
+                    candidate.x,
+                    candidate.y,
+                    candidate.z,
+                    supportPlaneY
+                )) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void appendRasterWorldWaypoint(
+        List<Vec3d> route,
+        Vec3d waypoint
+    ) {
+        Vec3d previous = route.isEmpty() ? null : route.getLast();
+        if (previous == null) {
+            route.add(waypoint);
+            return;
+        }
+        double distance = previous.distanceTo(waypoint);
+        if (distance <= 0.10) return;
+        int pieces = Math.max(
+            1,
+            (int) Math.ceil(
+                distance / RasterBuildRoutePlan.MAXIMUM_TRANSIT_SEGMENT
+            )
+        );
+        Vec3d delta = waypoint.subtract(previous);
+        for (int piece = 1; piece <= pieces; piece++) {
+            route.add(previous.add(delta.multiply((double) piece / pieces)));
+        }
+    }
+
+    private RasterSetPathStatus followRasterSetPath(
+        AbstractBoatEntity boat,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus
+    ) {
+        return followRasterSetPath(boat, mode, movingStatus, false);
+    }
+
+    private RasterSetPathStatus followRasterSetPath(
+        AbstractBoatEntity boat,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus,
+        boolean retryOnStall
+    ) {
+        if (advanceRasterBoatPath(
+            boat,
+            retryOnStall
+                ? RASTER_EXTERIOR_WAYPOINT_TOLERANCE
+                : RASTER_ROUTE_WAYPOINT_TOLERANCE,
+            !retryOnStall
+        )) {
+            if (retryOnStall) {
+                Vec3d stalledWaypoint = rasterBoatPath.isEmpty()
+                    ? rasterBoatPathTarget
+                    : rasterBoatPath.getFirst();
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Boat Raster exterior ingress made no progress for {} ticks at {}; rebuilding the remaining ingress toward {}",
+                    RASTER_ROUTE_STUCK_TICKS,
+                    boat.getEntityPos(),
+                    stalledWaypoint
+                );
+                boatFlyAdapter.stop();
+                rasterBoatPath.clear();
+                rasterBoatPathTarget = null;
+                resetRasterBoatPathProgress();
+                rasterStatus = "exterior ingress stalled; retrying without proximity-triggered egress";
+                return RasterSetPathStatus.MOVING;
+            }
+            failBoatRaster(
+                "deterministic BoatFly path made no progress for "
+                    + RASTER_ROUTE_STUCK_TICKS + " ticks at "
+                    + boat.getBlockPos().toShortString()
+            );
+            return RasterSetPathStatus.FAILED;
+        }
+        if (rasterBoatPath.isEmpty()) {
+            double arrivalTolerance = retryOnStall
+                ? RASTER_EXTERIOR_WAYPOINT_TOLERANCE
+                : RASTER_ROUTE_WAYPOINT_TOLERANCE;
+            boolean arrived = rasterBoatPathTarget != null && (
+                retryOnStall
+                    ? RasterSideLanePlanner.arrived(
+                        boat.getX(),
+                        boat.getY(),
+                        boat.getZ(),
+                        rasterBoatPathTarget.x,
+                        rasterBoatPathTarget.y,
+                        rasterBoatPathTarget.z
+                    )
+                    : Math.abs(boat.getX() - rasterBoatPathTarget.x)
+                        <= arrivalTolerance
+                        && Math.abs(boat.getY() - rasterBoatPathTarget.y)
+                        <= arrivalTolerance
+                        && Math.abs(boat.getZ() - rasterBoatPathTarget.z)
+                        <= arrivalTolerance
+            );
+            if (arrived) {
+                boatFlyAdapter.stop();
+                rasterBoatPathSupportPlaneY = Double.NaN;
+                resetRasterBoatPathProgress();
+                return RasterSetPathStatus.ARRIVED;
+            }
+            failBoatRaster("deterministic BoatFly path ended before its target");
+            return RasterSetPathStatus.FAILED;
+        }
+        Vec3d next = rasterBoatPath.getFirst();
+        rasterWaypoint = next;
+        boolean supportAware = Double.isFinite(
+            rasterBoatPathSupportPlaneY
+        );
+        boolean separatingExteriorLift = retryOnStall
+            && isRasterBoatExteriorSeparatingLiftClear(
+                boat, boat.getEntityPos(), next
+            );
+        boolean travelClear = supportAware
+            ? isRasterBoatImmediateSupportTravelClear(
+                boat,
+                next,
+                mode,
+                rasterBoatPathSupportPlaneY
+            )
+            : isRasterBoatImmediateTravelClear(boat, next, mode);
+        if (travelClear || separatingExteriorLift) {
+            boatFlyAdapter.drive(boat, next, mode);
+        } else {
+            boatFlyAdapter.stop();
+            if (retryOnStall) {
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Boat Raster found a blocked exterior segment before {}; recovering from {} and replanning",
+                    next,
+                    boat.getEntityPos()
+                );
+                rasterBoatPath.clear();
+                rasterBoatPathTarget = null;
+                resetRasterBoatPathProgress();
+                rasterStatus = "exterior obstruction detected; replanning without proximity-triggered egress";
+                return RasterSetPathStatus.MOVING;
+            }
+            failBoatRaster(
+                "fixed BoatFly path is obstructed or lacks full boat/rider clearance before "
+                    + BlockPos.ofFloored(next).toShortString()
+            );
+            return RasterSetPathStatus.FAILED;
+        }
+        rasterStatus = movingStatus;
+        return RasterSetPathStatus.MOVING;
+    }
+
+    private void driveBoatWithPath(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        BoatFlyAdapter.DriveMode mode,
+        String planningStatus
+    ) {
+        if (rasterBoatPathTarget == null
+            || rasterBoatPathTarget.squaredDistanceTo(target) > 0.50) {
+            rasterBoatPath.clear();
+            rasterBoatPathTarget = target;
+            cancelRasterEntryRouteSearch();
+            resetRasterBoatPathProgress();
+        }
+        if (advanceRasterBoatPath(boat)) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster route made no progress for {} ticks; replanning from {}",
+                RASTER_ROUTE_STUCK_TICKS,
+                boat.getEntityPos()
+            );
+            rasterBoatPath.clear();
+            resetRasterBoatPathProgress();
+        }
+        if (rasterBoatPath.isEmpty()
+            && boat.getEntityPos().distanceTo(target) > 0.60
+            && clientActionTick - rasterBoatPathPlannedTick >= 8) {
+            rasterBoatPathPlannedTick = clientActionTick;
+            planRasterBoatPath(boat, target);
+        }
+        if (rasterBoatPath.isEmpty()) {
+            if (boat.getEntityPos().distanceTo(target) <= 0.60) {
+                boatFlyAdapter.stop();
+                return;
+            }
+            boatFlyAdapter.stop();
+            rasterStatus = planningStatus;
+            return;
+        }
+        Vec3d next = rasterBoatPath.getFirst();
+        rasterWaypoint = next;
+        if (!driveRasterBoatIfClear(boat, next, mode)) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster stopped before blocked/too-narrow route segment from {} toward {}; replanning",
+                boat.getEntityPos(),
+                next
+            );
+            rasterBoatPath.clear();
+            resetRasterBoatPathProgress();
+            boatFlyAdapter.stop();
+            rasterStatus = "route obstruction or insufficient boat/rider clearance detected; replanning";
+        }
+    }
+
+    private void cancelRasterEntryRouteSearch() {
+        // Retained as a common path-reset hook; scanned ingress was removed.
+    }
+
+    private boolean advanceRasterBoatPath(AbstractBoatEntity boat) {
+        return advanceRasterBoatPath(
+            boat,
+            RASTER_ROUTE_WAYPOINT_TOLERANCE,
+            true
+        );
+    }
+
+    private boolean advanceRasterBoatPath(
+        AbstractBoatEntity boat,
+        double waypointTolerance,
+        boolean allowCrossedWaypoint
+    ) {
+        Vec3d current = boat.getEntityPos();
+        while (!rasterBoatPath.isEmpty()) {
+            Vec3d waypoint = rasterBoatPath.getFirst();
+            boolean reached = allowCrossedWaypoint
+                ? RasterRouteProgress.reachedOrPassed(
+                    rasterRoutePoint(rasterBoatPathPreviousPosition),
+                    rasterRoutePoint(current),
+                    rasterRoutePoint(waypoint),
+                    waypointTolerance
+                )
+                : RasterRouteProgress.reached(
+                    rasterRoutePoint(current),
+                    rasterRoutePoint(waypoint),
+                    waypointTolerance,
+                    RASTER_EXTERIOR_VERTICAL_WAYPOINT_TOLERANCE
+                );
+            if (!reached) break;
+            rasterBoatPath.removeFirst();
+            rasterBoatPathTrackedWaypoint = null;
+            rasterBoatPathBestDistance = Double.POSITIVE_INFINITY;
+            rasterBoatPathLastProgressTick = clientActionTick;
+        }
+        boolean stuck = false;
+        if (!rasterBoatPath.isEmpty()) {
+            Vec3d waypoint = rasterBoatPath.getFirst();
+            double distance = current.distanceTo(waypoint);
+            if (rasterBoatPathTrackedWaypoint == null
+                || rasterBoatPathTrackedWaypoint.squaredDistanceTo(waypoint) > 0.01) {
+                rasterBoatPathTrackedWaypoint = waypoint;
+                rasterBoatPathBestDistance = distance;
+                rasterBoatPathLastProgressTick = clientActionTick;
+            } else if (distance + 0.05 < rasterBoatPathBestDistance) {
+                rasterBoatPathBestDistance = distance;
+                rasterBoatPathLastProgressTick = clientActionTick;
+            } else if (clientActionTick - rasterBoatPathLastProgressTick
+                >= RASTER_ROUTE_STUCK_TICKS) {
+                stuck = true;
+            }
+        }
+        rasterBoatPathPreviousPosition = current;
+        return stuck;
+    }
+
+    private RasterRouteProgress.Point rasterRoutePoint(Vec3d point) {
+        return point == null ? null : new RasterRouteProgress.Point(
+            point.x, point.y, point.z
+        );
+    }
+
+    private void resetRasterBoatPathProgress() {
+        rasterBoatPathPreviousPosition = null;
+        rasterBoatPathTrackedWaypoint = null;
+        rasterBoatPathBestDistance = Double.POSITIVE_INFINITY;
+        rasterBoatPathLastProgressTick = clientActionTick;
+    }
+
+    private void planRasterBoatPath(AbstractBoatEntity boat, Vec3d target) {
+        List<Vec3d> route = computeRasterBoatPath(
+            boat,
+            target,
+            24,
+            10,
+            40000
+        );
+        rasterBoatPath.clear();
+        rasterBoatPath.addAll(route);
+        resetRasterBoatPathProgress();
+        if (!route.isEmpty()) {
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster planned autonomous BoatFly route with {} waypoints from {} to {}",
+                rasterBoatPath.size(),
+                boat.getEntityPos(),
+                target
+            );
+        } else {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster could not yet find a loaded collision-free BoatFly route from {} to {}",
+                boat.getEntityPos(),
+                target
+            );
+        }
+    }
+
+    private List<Vec3d> computeRasterBoatPath(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        int horizontalPadding,
+        int verticalPadding,
+        int maximumVisited
+    ) {
+        RasterVoxelPathfinder.Cell start = new RasterVoxelPathfinder.Cell(
+            boat.getBlockX(),
+            (int) Math.floor(boat.getY()),
+            boat.getBlockZ()
+        );
+        RasterVoxelPathfinder.Cell goal = new RasterVoxelPathfinder.Cell(
+            (int) Math.floor(target.x),
+            (int) Math.floor(target.y),
+            (int) Math.floor(target.z)
+        );
+        double verticalFraction = target.y - Math.floor(target.y);
+        List<RasterVoxelPathfinder.Cell> path = RasterVoxelPathfinder.find(
+            start,
+            goal,
+            RasterVoxelPathfinder.Mode.FLY,
+            horizontalPadding,
+            verticalPadding,
+            maximumVisited,
+            cell -> isRasterBoatCellSafe(boat, cell, verticalFraction)
+        );
+        return rasterBoatWaypoints(path, verticalFraction);
+    }
+
+    private List<Vec3d> rasterBoatWaypoints(
+        List<RasterVoxelPathfinder.Cell> path,
+        double verticalFraction
+    ) {
+        List<RasterVoxelPathfinder.Cell> compressed =
+            RasterVoxelPathfinder.compressStraightSegments(
+                path,
+                RASTER_ROUTE_MAX_SEGMENT_CELLS
+            );
+        ArrayList<Vec3d> result = new ArrayList<>();
+        if (compressed.size() == 1) {
+            RasterVoxelPathfinder.Cell cell = compressed.getFirst();
+            return List.of(new Vec3d(
+                cell.x() + 0.5,
+                cell.y() + verticalFraction,
+                cell.z() + 0.5
+            ));
+        }
+        for (int index = 1; index < compressed.size(); index++) {
+            RasterVoxelPathfinder.Cell cell = compressed.get(index);
+            result.add(new Vec3d(
+                cell.x() + 0.5,
+                cell.y() + verticalFraction,
+                cell.z() + 0.5
+            ));
+        }
+        return List.copyOf(result);
+    }
+
+    private boolean isRasterBoatCellSafe(
+        AbstractBoatEntity boat,
+        RasterVoxelPathfinder.Cell cell,
+        double verticalFraction
+    ) {
+        double y = cell.y() + verticalFraction;
+        return isRasterBoatPositionSafe(
+            boat,
+            cell.x() + 0.5,
+            y,
+            cell.z() + 0.5
+        );
+    }
+
+    private boolean isRasterBoatPositionSafe(
+        AbstractBoatEntity boat,
+        double x,
+        double y,
+        double z
+    ) {
+        double halfWidth = rasterBoatHalfWidth(boat);
+        int minChunkX = ((int) Math.floor(x - halfWidth)) >> 4;
+        int maxChunkX = ((int) Math.floor(x + halfWidth)) >> 4;
+        int minChunkZ = ((int) Math.floor(z - halfWidth)) >> 4;
+        int maxChunkZ = ((int) Math.floor(z + halfWidth)) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (!mc.world.isChunkLoaded(chunkX, chunkZ)) return false;
+            }
+        }
+        Box clearance = rasterMountedClearanceBox(boat, x, y, z);
+        return clearance.minY >= mc.world.getBottomY()
+            && clearance.maxY <= mc.world.getTopYInclusive() + 1
+            && !rasterActiveRowVirtualCollision(clearance)
+            && mc.world.isBlockSpaceEmpty(boat, clearance);
+    }
+
+    /**
+     * Launch docks may touch the expanded 0.15 lower safety margin at the
+     * authoritative actual pose. Permit only a straight upward motion that
+     * monotonically sheds those already-present support contacts. New side or
+     * overhead obstacles remain exact swept-volume failures.
+     */
+    private boolean isRasterBoatExteriorSeparatingLiftClear(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target
+    ) {
+        if (Math.abs(start.x - target.x) > 1.0e-7
+            || Math.abs(start.z - target.z) > 1.0e-7
+            || target.y <= start.y + 1.0e-7
+            || !isRasterEnvelopeDomainSafe(boat, start)
+            || !isRasterEnvelopeDomainSafe(boat, target)) {
+            return false;
+        }
+        Box startBox = rasterMountedClearanceBox(
+            boat, start.x, start.y, start.z
+        );
+        Set<BlockPos> initialContacts = rasterPhysicalCollisionPositions(
+            startBox
+        );
+        if (initialContacts.isEmpty()) {
+            return isRasterBoatFullSegmentClear(boat, start, target);
+        }
+        if (!rasterContactsAreLaunchSupports(
+                startBox, start.y, initialContacts
+            )) {
+            return false;
+        }
+        int samples = Math.max(1, (int) Math.ceil(
+            (target.y - start.y) / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d previous = start;
+        for (int sample = 1; sample <= samples; sample++) {
+            Vec3d candidate = start.lerp(target, (double) sample / samples);
+            if (!isRasterEnvelopeDomainSafe(boat, candidate)) return false;
+            Set<BlockPos> contacts = rasterPhysicalCollisionPositions(
+                rasterMountedClearanceBox(
+                    boat, candidate.x, candidate.y, candidate.z
+                )
+            );
+            if (!RasterSeparatingLiftPolicy.shedsOnly(
+                    initialContacts, contacts
+                )
+                || !isRasterBoatSweptIntervalClearExcept(
+                    boat, previous, candidate, initialContacts
+                )) {
+                return false;
+            }
+            if (contacts.isEmpty()) {
+                return candidate.distanceTo(target) <= 1.0e-7
+                    || isRasterBoatFullSegmentClear(
+                        boat, candidate, target
+                    );
+            }
+            previous = candidate;
+        }
+        return false;
+    }
+
+    private boolean isRasterEnvelopeDomainSafe(
+        AbstractBoatEntity boat,
+        Vec3d position
+    ) {
+        Box clearance = rasterMountedClearanceBox(
+            boat, position.x, position.y, position.z
+        );
+        int minChunkX = ((int) Math.floor(clearance.minX)) >> 4;
+        int maxChunkX = ((int) Math.floor(clearance.maxX)) >> 4;
+        int minChunkZ = ((int) Math.floor(clearance.minZ)) >> 4;
+        int maxChunkZ = ((int) Math.floor(clearance.maxZ)) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (!mc.world.isChunkLoaded(chunkX, chunkZ)) return false;
+            }
+        }
+        return clearance.minY >= mc.world.getBottomY()
+            && clearance.maxY <= mc.world.getTopYInclusive() + 1
+            && !rasterActiveRowVirtualCollision(clearance);
+    }
+
+    private Set<BlockPos> rasterPhysicalCollisionPositions(Box clearance) {
+        LinkedHashSet<BlockPos> collisions = new LinkedHashSet<>();
+        for (int x = (int) Math.floor(clearance.minX + 1.0e-7);
+             x <= (int) Math.floor(clearance.maxX - 1.0e-7); x++) {
+            for (int y = (int) Math.floor(clearance.minY + 1.0e-7);
+                 y <= (int) Math.floor(clearance.maxY - 1.0e-7); y++) {
+                for (int z = (int) Math.floor(clearance.minZ + 1.0e-7);
+                     z <= (int) Math.floor(clearance.maxZ - 1.0e-7); z++) {
+                    BlockPos position = new BlockPos(x, y, z);
+                    BlockState state = mc.world.getBlockState(position);
+                    for (Box shape : state.getCollisionShape(
+                            mc.world, position
+                        ).getBoundingBoxes()) {
+                        if (clearance.intersects(shape.offset(x, y, z))) {
+                            collisions.add(position);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        return Set.copyOf(collisions);
+    }
+
+    private boolean rasterContactsAreLaunchSupports(
+        Box startBox,
+        double vehicleY,
+        Set<BlockPos> contacts
+    ) {
+        for (BlockPos position : contacts) {
+            BlockState state = mc.world.getBlockState(position);
+            boolean matched = false;
+            for (Box shape : state.getCollisionShape(
+                    mc.world, position
+                ).getBoundingBoxes()) {
+                Box worldShape = shape.offset(position);
+                if (!startBox.intersects(worldShape)) continue;
+                matched = true;
+                if (worldShape.maxY > vehicleY + 1.0e-7) return false;
+            }
+            if (!matched) return false;
+        }
+        return true;
+    }
+
+    private Box rasterMountedClearanceBox(
+        AbstractBoatEntity boat,
+        double x,
+        double y,
+        double z
+    ) {
+        Box raw = rawRasterMountedClearanceBox(boat, x, y, z);
+        if (rasterEnvelopeBoatId != boat.getId()
+            || rasterEnvelopeSignature == null) {
+            return raw;
+        }
+        return new Box(
+            Math.min(raw.minX, x + rasterEnvelopeSignature.minX),
+            Math.min(raw.minY, y + rasterEnvelopeSignature.minY),
+            Math.min(raw.minZ, z + rasterEnvelopeSignature.minZ),
+            Math.max(raw.maxX, x + rasterEnvelopeSignature.maxX),
+            Math.max(raw.maxY, y + rasterEnvelopeSignature.maxY),
+            Math.max(raw.maxZ, z + rasterEnvelopeSignature.maxZ)
+        );
+    }
+
+    private Box rawRasterMountedClearanceBox(
+        AbstractBoatEntity boat,
+        double x,
+        double y,
+        double z
+    ) {
+        Box boatBox = boat.getBoundingBox();
+        Box riderBox = mc.player != null && mc.player.getVehicle() == boat
+            ? mc.player.getBoundingBox()
+            : boatBox;
+        double minX = Math.min(boatBox.minX, riderBox.minX) - boat.getX()
+            - RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN;
+        double maxX = Math.max(boatBox.maxX, riderBox.maxX) - boat.getX()
+            + RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN;
+        double minY = Math.min(boatBox.minY, riderBox.minY) - boat.getY()
+            - 0.15;
+        double maxY = Math.max(boatBox.maxY, riderBox.maxY) - boat.getY()
+            + 0.15;
+        double minZ = Math.min(boatBox.minZ, riderBox.minZ) - boat.getZ()
+            - RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN;
+        double maxZ = Math.max(boatBox.maxZ, riderBox.maxZ) - boat.getZ()
+            + RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN;
+        return new Box(
+            x + minX,
+            y + minY,
+            z + minZ,
+            x + maxX,
+            y + maxY,
+            z + maxZ
+        );
+    }
+
+    private boolean rasterActiveRowVirtualCollision(Box clearance) {
+        if (mapCorner == null || rasterBuildRoutePlan == null
+            || orderedBuildTargets.isEmpty()
+            || rasterTargetsByHorizontalCell.isEmpty()) {
+            return false;
+        }
+        int targetIndex = Math.clamp(
+            rasterCursor,
+            0,
+            orderedBuildTargets.size() - 1
+        );
+        BlockPos activeTarget = orderedBuildTargets.get(targetIndex);
+        int placementBand = rasterBuildRoutePlan.points().get(
+            rasterBuildRoutePlan.deadline(activeTarget)
+        ).band();
+        boolean routeAvailable = rasterRouteCursor >= 0
+            && rasterRouteCursor < rasterBuildRoutePlan.points().size();
+        int routeBand = routeAvailable
+            ? rasterBuildRoutePlan.points().get(rasterRouteCursor).band()
+            : placementBand;
+        int activeBand = RasterVirtualTargetPolicy.movementOwnedBand(
+            placementBand,
+            routeBand,
+            routeAvailable
+        );
+        int minX = (int) Math.floor(clearance.minX + 1.0e-7);
+        int maxX = (int) Math.floor(clearance.maxX - 1.0e-7);
+        int minY = (int) Math.floor(clearance.minY + 1.0e-7);
+        int maxY = (int) Math.floor(clearance.maxY - 1.0e-7);
+        int minZ = (int) Math.floor(clearance.minZ + 1.0e-7);
+        int maxZ = (int) Math.floor(clearance.maxZ - 1.0e-7);
+        for (int worldX = minX; worldX <= maxX; worldX++) {
+            for (int worldZ = minZ; worldZ <= maxZ; worldZ++) {
+                BlockPos relative = rasterTargetsByHorizontalCell.get(
+                    rasterHorizontalKey(
+                        worldX - mapCorner.getX(),
+                        worldZ - mapCorner.getZ()
+                    )
+                );
+                if (relative == null) continue;
+                int band = rasterBuildRoutePlan.points().get(
+                    rasterBuildRoutePlan.deadline(relative)
+                ).band();
+                if (!RasterVirtualTargetPolicy.isActiveRowVirtualSolid(
+                        band,
+                        activeBand
+                    )) {
+                    continue;
+                }
+                int worldY = mapCorner.getY() + relative.getY();
+                if (worldY < minY || worldY > maxY) continue;
+                if (clearance.intersects(new Box(new BlockPos(
+                        worldX,
+                        worldY,
+                        worldZ
+                    )))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private String rasterBoatPositionFailure(
+        AbstractBoatEntity boat,
+        double x,
+        double y,
+        double z
+    ) {
+        Box clearance = rasterMountedClearanceBox(boat, x, y, z);
+        int minChunkX = ((int) Math.floor(clearance.minX)) >> 4;
+        int maxChunkX = ((int) Math.floor(clearance.maxX)) >> 4;
+        int minChunkZ = ((int) Math.floor(clearance.minZ)) >> 4;
+        int maxChunkZ = ((int) Math.floor(clearance.maxZ)) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (!mc.world.isChunkLoaded(chunkX, chunkZ)) {
+                    return "unloaded_chunk=" + chunkX + "," + chunkZ;
+                }
+            }
+        }
+        if (clearance.minY < mc.world.getBottomY()
+            || clearance.maxY > mc.world.getTopYInclusive() + 1) {
+            return "world_bounds envelopeY="
+                + String.format(
+                    Locale.ROOT,
+                    "%.2f..%.2f",
+                    clearance.minY,
+                    clearance.maxY
+                );
+        }
+        if (rasterActiveRowVirtualCollision(clearance)) {
+            return "active_row_virtual_solid envelope=" + clearance;
+        }
+        int minX = (int) Math.floor(clearance.minX + 1.0e-7);
+        int maxX = (int) Math.floor(clearance.maxX - 1.0e-7);
+        int minY = (int) Math.floor(clearance.minY + 1.0e-7);
+        int maxY = (int) Math.floor(clearance.maxY - 1.0e-7);
+        int minZ = (int) Math.floor(clearance.minZ + 1.0e-7);
+        int maxZ = (int) Math.floor(clearance.maxZ - 1.0e-7);
+        for (int blockX = minX; blockX <= maxX; blockX++) {
+            for (int blockY = minY; blockY <= maxY; blockY++) {
+                for (int blockZ = minZ; blockZ <= maxZ; blockZ++) {
+                    BlockPos position = new BlockPos(blockX, blockY, blockZ);
+                    BlockState state = mc.world.getBlockState(position);
+                    for (Box shape : state.getCollisionShape(
+                            mc.world,
+                            position
+                        ).getBoundingBoxes()) {
+                        Box worldShape = shape.offset(
+                            blockX,
+                            blockY,
+                            blockZ
+                        );
+                        if (clearance.intersects(worldShape)) {
+                            return "physical_block="
+                                + position.toShortString()
+                                + " state=" + Registries.BLOCK.getId(
+                                    state.getBlock()
+                                )
+                                + " shape=" + worldShape
+                                + " envelope=" + clearance;
+                        }
+                    }
+                }
+            }
+        }
+        return mc.world.isBlockSpaceEmpty(boat, clearance)
+            ? "unknown_invariant"
+            : "block_space_rejected envelope=" + clearance;
+    }
+
+    private String rasterBoatSegmentFailure(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target
+    ) {
+        if (!isRasterBoatPositionSafe(
+                boat,
+                start.x,
+                start.y,
+                start.z
+            )) {
+            return "sample=0/start position=" + start
+                + " reason=" + rasterBoatPositionFailure(
+                    boat,
+                    start.x,
+                    start.y,
+                    start.z
+                )
+                + " target=" + target;
+        }
+        double distance = start.distanceTo(target);
+        int samples = Math.max(1, (int) Math.ceil(
+            distance / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d delta = target.subtract(start);
+        Vec3d previous = start;
+        for (int sample = 1; sample <= samples; sample++) {
+            Vec3d candidate = start.add(
+                delta.multiply((double) sample / samples)
+            );
+            if (!isRasterBoatPositionSafe(
+                    boat,
+                    candidate.x,
+                    candidate.y,
+                    candidate.z
+                )) {
+                return "sample=" + sample + "/" + samples
+                    + " position=" + candidate
+                    + " reason=" + rasterBoatPositionFailure(
+                        boat,
+                        candidate.x,
+                        candidate.y,
+                        candidate.z
+                    )
+                    + " start=" + start + " target=" + target;
+            }
+            if (!isRasterBoatSweptIntervalClear(
+                    boat,
+                    previous,
+                    candidate
+                )) {
+                return "swept_interval=" + (sample - 1) + "->" + sample
+                    + "/" + samples + " from=" + previous
+                    + " to=" + candidate
+                    + " reason=collision_between_samples"
+                    + " start=" + start + " target=" + target;
+            }
+            previous = candidate;
+        }
+        return "no_reproducible_unsafe_sample start=" + start
+            + " target=" + target;
+    }
+
+    /**
+     * Revalidates the immediate swept volume before every normal BoatFly move.
+     * This catches blocks placed after planning and rejects one-block gaps: each
+     * sample uses the full widened boat footprint and the rider's headroom.
+     */
+    private boolean isRasterBoatImmediateTravelClear(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        BoatFlyAdapter.DriveMode mode
+    ) {
+        Vec3d start = boat.getEntityPos();
+        double distance = start.distanceTo(target);
+        if (distance < 1.0e-6) {
+            return isRasterBoatPositionSafe(
+                boat,
+                target.x,
+                target.y,
+                target.z
+            );
+        }
+        double requestedLookahead = mode == BoatFlyAdapter.DriveMode.TRAVEL
+            ? Math.max(
+                RASTER_ROUTE_CLEARANCE_LOOKAHEAD,
+                boatRasterTravelSpeed.get() * 0.5
+            )
+            : RASTER_ROUTE_CLEARANCE_LOOKAHEAD;
+        double lookahead = Math.min(distance, requestedLookahead);
+        int samples = Math.max(1, (int) Math.ceil(
+            lookahead / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d delta = target.subtract(start);
+        Vec3d previous = start;
+        for (int sample = 1; sample <= samples; sample++) {
+            double travel = lookahead * sample / samples;
+            double fraction = travel / distance;
+            Vec3d candidate = start.add(delta.multiply(fraction));
+            if (!isRasterBoatPositionSafe(
+                boat,
+                candidate.x,
+                candidate.y,
+                candidate.z
+            )) {
+                return false;
+            }
+            if (!isRasterBoatSweptIntervalClear(boat, previous, candidate)) {
+                return false;
+            }
+            previous = candidate;
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatFullSegmentClear(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target
+    ) {
+        if (!isRasterBoatPositionSafe(
+                boat,
+                start.x,
+                start.y,
+                start.z
+            )) {
+            return false;
+        }
+        double distance = start.distanceTo(target);
+        int samples = Math.max(1, (int) Math.ceil(
+            distance / RASTER_ROUTE_CLEARANCE_SAMPLE_STEP
+        ));
+        Vec3d delta = target.subtract(start);
+        Vec3d previous = start;
+        for (int sample = 1; sample <= samples; sample++) {
+            Vec3d candidate = start.add(delta.multiply((double) sample / samples));
+            if (!isRasterBoatPositionSafe(
+                boat,
+                candidate.x,
+                candidate.y,
+                candidate.z
+                )) {
+                return false;
+            }
+            if (!isRasterBoatSweptIntervalClear(
+                    boat,
+                    previous,
+                    candidate
+                )) {
+                return false;
+            }
+            previous = candidate;
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatSweptIntervalClear(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target
+    ) {
+        Box startBox = rasterMountedClearanceBox(
+            boat,
+            start.x,
+            start.y,
+            start.z
+        );
+        Box targetBox = rasterMountedClearanceBox(
+            boat,
+            target.x,
+            target.y,
+            target.z
+        );
+        RasterSweptEnvelope.Bounds offsets =
+            new RasterSweptEnvelope.Bounds(
+                startBox.minX - start.x,
+                startBox.minY - start.y,
+                startBox.minZ - start.z,
+                startBox.maxX - start.x,
+                startBox.maxY - start.y,
+                startBox.maxZ - start.z
+            );
+        RasterSweptEnvelope.Point from = new RasterSweptEnvelope.Point(
+            start.x,
+            start.y,
+            start.z
+        );
+        RasterSweptEnvelope.Point to = new RasterSweptEnvelope.Point(
+            target.x,
+            target.y,
+            target.z
+        );
+        double minX = Math.min(startBox.minX, targetBox.minX);
+        double minY = Math.min(startBox.minY, targetBox.minY);
+        double minZ = Math.min(startBox.minZ, targetBox.minZ);
+        double maxX = Math.max(startBox.maxX, targetBox.maxX);
+        double maxY = Math.max(startBox.maxY, targetBox.maxY);
+        double maxZ = Math.max(startBox.maxZ, targetBox.maxZ);
+        for (int blockX = (int) Math.floor(minX + 1.0e-7);
+             blockX <= (int) Math.floor(maxX - 1.0e-7);
+             blockX++) {
+            for (int blockY = (int) Math.floor(minY + 1.0e-7);
+                 blockY <= (int) Math.floor(maxY - 1.0e-7);
+                 blockY++) {
+                for (int blockZ = (int) Math.floor(minZ + 1.0e-7);
+                     blockZ <= (int) Math.floor(maxZ - 1.0e-7);
+                     blockZ++) {
+                    BlockPos position = new BlockPos(blockX, blockY, blockZ);
+                    if (rasterActiveRowVirtualCollision(new Box(position))
+                        && rasterSweptEnvelopeIntersects(
+                            from,
+                            to,
+                            offsets,
+                            new Box(position)
+                        )) {
+                        return false;
+                    }
+                    BlockState state = mc.world.getBlockState(position);
+                    for (Box shape : state.getCollisionShape(
+                            mc.world,
+                            position
+                        ).getBoundingBoxes()) {
+                        if (rasterSweptEnvelopeIntersects(
+                                from,
+                                to,
+                                offsets,
+                                shape.offset(blockX, blockY, blockZ)
+                            )) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean isRasterBoatSweptIntervalClearExcept(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target,
+        Set<BlockPos> allowedStartContacts
+    ) {
+        Box startBox = rasterMountedClearanceBox(
+            boat, start.x, start.y, start.z
+        );
+        Box targetBox = rasterMountedClearanceBox(
+            boat, target.x, target.y, target.z
+        );
+        RasterSweptEnvelope.Bounds offsets =
+            new RasterSweptEnvelope.Bounds(
+                startBox.minX - start.x,
+                startBox.minY - start.y,
+                startBox.minZ - start.z,
+                startBox.maxX - start.x,
+                startBox.maxY - start.y,
+                startBox.maxZ - start.z
+            );
+        RasterSweptEnvelope.Point from = new RasterSweptEnvelope.Point(
+            start.x, start.y, start.z
+        );
+        RasterSweptEnvelope.Point to = new RasterSweptEnvelope.Point(
+            target.x, target.y, target.z
+        );
+        for (int blockX = (int) Math.floor(
+                Math.min(startBox.minX, targetBox.minX) + 1.0e-7
+            );
+             blockX <= (int) Math.floor(
+                Math.max(startBox.maxX, targetBox.maxX) - 1.0e-7
+             ); blockX++) {
+            for (int blockY = (int) Math.floor(
+                    Math.min(startBox.minY, targetBox.minY) + 1.0e-7
+                );
+                 blockY <= (int) Math.floor(
+                    Math.max(startBox.maxY, targetBox.maxY) - 1.0e-7
+                 ); blockY++) {
+                for (int blockZ = (int) Math.floor(
+                        Math.min(startBox.minZ, targetBox.minZ) + 1.0e-7
+                    );
+                     blockZ <= (int) Math.floor(
+                        Math.max(startBox.maxZ, targetBox.maxZ) - 1.0e-7
+                     ); blockZ++) {
+                    BlockPos position = new BlockPos(
+                        blockX, blockY, blockZ
+                    );
+                    Box cell = new Box(position);
+                    if (rasterActiveRowVirtualCollision(cell)
+                        && rasterSweptEnvelopeIntersects(
+                            from, to, offsets, cell
+                        )) {
+                        return false;
+                    }
+                    if (allowedStartContacts.contains(position)) continue;
+                    BlockState state = mc.world.getBlockState(position);
+                    for (Box shape : state.getCollisionShape(
+                            mc.world, position
+                        ).getBoundingBoxes()) {
+                        if (rasterSweptEnvelopeIntersects(
+                                from,
+                                to,
+                                offsets,
+                                shape.offset(blockX, blockY, blockZ)
+                            )) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean rasterSweptEnvelopeIntersects(
+        RasterSweptEnvelope.Point start,
+        RasterSweptEnvelope.Point target,
+        RasterSweptEnvelope.Bounds offsets,
+        Box obstacle
+    ) {
+        return RasterSweptEnvelope.intersects(
+            start,
+            target,
+            offsets,
+            new RasterSweptEnvelope.Bounds(
+                obstacle.minX,
+                obstacle.minY,
+                obstacle.minZ,
+                obstacle.maxX,
+                obstacle.maxY,
+                obstacle.maxZ
+            )
+        );
+    }
+
+    private List<Vec3d> safeRasterCompiledSegmentPath(
+        AbstractBoatEntity boat,
+        Vec3d start,
+        Vec3d target
+    ) {
+        return isRasterBoatFullSegmentClear(boat, start, target)
+            ? List.of(target)
+            : List.of();
+    }
+
+    private boolean driveRasterCompiledSegment(
+        AbstractBoatEntity boat,
+        int destinationIndex,
+        Vec3d finalTarget,
+        BoatFlyAdapter.DriveMode mode
+    ) {
+        RasterBuildRoutePlan.Point<BlockPos> destinationPoint =
+            rasterBuildRoutePlan.points().get(destinationIndex);
+        if (rasterOutwardLaneShiftBand == destinationPoint.band()) {
+            Vec3d shiftedPose = rasterRouteVehiclePose(boat, destinationPoint);
+            Vec3d outward = new Vec3d(
+                shiftedPose.x,
+                boat.getY(),
+                boat.getZ()
+            );
+            rasterWaypoint = outward;
+            if (RasterSideLanePlanner.arrived(
+                    boat.getX(), boat.getY(), boat.getZ(),
+                    outward.x, outward.y, outward.z
+                )) {
+                boatFlyAdapter.stop();
+                rasterOutwardLaneShiftBand = -1;
+                resetRasterCompiledRouteProgress();
+                return false;
+            }
+            if (!isRasterBoatFullSegmentClear(
+                    boat, boat.getEntityPos(), outward
+                )) {
+                if (!relatchRasterSideLaneOutward(
+                        boat, destinationPoint.band()
+                    )) {
+                    rejectRasterCompiledRouteSegment(
+                        destinationIndex,
+                        "outward side-lane shift is physically obstructed: "
+                            + rasterBoatSegmentFailure(
+                                boat, boat.getEntityPos(), outward
+                            )
+                    );
+                }
+                return false;
+            }
+            boatFlyAdapter.drive(boat, outward, mode);
+            rasterStatus = "shifting outward into relatched row "
+                + destinationPoint.band() + " side lane";
+            return false;
+        }
+        boolean strictlyAtFinalTarget = RasterSideLanePlanner.arrived(
+            boat.getX(), boat.getY(), boat.getZ(),
+            finalTarget.x, finalTarget.y, finalTarget.z
+        );
+        boolean cachedTargetChanged =
+            rasterCompiledSegmentDestination == destinationIndex
+                && !rasterCompiledSegmentPath.isEmpty()
+                && rasterCompiledSegmentPath.getLast()
+                    .squaredDistanceTo(finalTarget) > 1.0e-8;
+        if (rasterCompiledSegmentDestination == destinationIndex
+            && (cachedTargetChanged
+                || (rasterCompiledSegmentPath.isEmpty()
+                    && !strictlyAtFinalTarget))) {
+            // Never interpret an exhausted path to an old lane pose as arrival
+            // at the newly latched row. Recompile directly from actual vehicle
+            // position in this same tick.
+            rasterCompiledSegmentPath.clear();
+            rasterCompiledSegmentDestination = -1;
+            rasterRouteTrackedDestination = -1;
+        }
+        if (rasterCompiledSegmentDestination != destinationIndex) {
+            List<Vec3d> safePath = safeRasterCompiledSegmentPath(
+                boat,
+                boat.getEntityPos(),
+                finalTarget
+            );
+            if (safePath.isEmpty()) {
+                String failure = rasterBoatSegmentFailure(
+                    boat,
+                    boat.getEntityPos(),
+                    finalTarget
+                );
+                if (failure.contains("physical_block=")
+                    && relatchRasterSideLaneOutward(
+                        boat, destinationPoint.band()
+                    )) {
+                    return false;
+                }
+                rejectRasterCompiledRouteSegment(
+                    destinationIndex,
+                    "next compiled segment has no safe direct lateral path before "
+                        + BlockPos.ofFloored(finalTarget).toShortString()
+                        + ": " + failure
+                );
+                return false;
+            }
+            rasterCompiledSegmentPath.clear();
+            rasterCompiledSegmentPath.addAll(safePath);
+            rasterCompiledSegmentDestination = destinationIndex;
+            rasterRouteTrackedDestination = -1;
+        }
+        while (!rasterCompiledSegmentPath.isEmpty()
+            && boat.getEntityPos().distanceTo(
+                rasterCompiledSegmentPath.getFirst()
+            ) <= RASTER_ROUTE_WAYPOINT_TOLERANCE
+            && (rasterCompiledSegmentPath.size() > 1
+                || RasterSideLanePlanner.arrived(
+                    boat.getX(), boat.getY(), boat.getZ(),
+                    finalTarget.x, finalTarget.y, finalTarget.z
+                ))) {
+            rasterCompiledSegmentPath.removeFirst();
+            rasterRouteTrackedDestination = -1;
+        }
+        if (rasterCompiledSegmentPath.isEmpty()) {
+            boatFlyAdapter.stop();
+            rasterWaypoint = finalTarget;
+            if (rasterLocalRecoveryRetainedDestination == destinationIndex) {
+                rasterLocalRecoveryRetainedDestination = -1;
+            }
+            return true;
+        }
+        rasterWaypoint = rasterCompiledSegmentPath.getFirst();
+        // Cached acceptance never overrides live world/envelope state. Check
+        // the exact immediate swept interval on every BUILD tick.
+        if (!isRasterBoatImmediateTravelClear(boat, rasterWaypoint, mode)) {
+            String failure = rasterBoatSegmentFailure(
+                boat,
+                boat.getEntityPos(),
+                rasterWaypoint
+            );
+            if (failure.contains("physical_block=")
+                && relatchRasterSideLaneOutward(
+                    boat, destinationPoint.band()
+                )) {
+                return false;
+            }
+            rejectRasterCompiledRouteSegment(
+                destinationIndex,
+                "live swept lookahead rejected the latched lateral lane before "
+                    + BlockPos.ofFloored(rasterWaypoint).toShortString()
+                    + ": " + failure
+            );
+            return false;
+        }
+        boatFlyAdapter.drive(boat, rasterWaypoint, mode);
+        return trackRasterCompiledRouteMovement(boat, rasterWaypoint);
+    }
+
+    private boolean driveRasterBoatIfClear(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        BoatFlyAdapter.DriveMode mode
+    ) {
+        if (!isRasterBoatImmediateTravelClear(boat, target, mode)) {
+            boatFlyAdapter.stop();
+            return false;
+        }
+        boatFlyAdapter.drive(boat, target, mode);
+        return true;
+    }
+
+    private double rasterBoatHalfWidth(AbstractBoatEntity boat) {
+        Box boatBox = boat.getBoundingBox();
+        Box riderBox = mc.player != null && mc.player.getVehicle() == boat
+            ? mc.player.getBoundingBox()
+            : boatBox;
+        double unionHalfWidth = Math.max(
+            Math.max(
+                Math.abs(Math.min(boatBox.minX, riderBox.minX) - boat.getX()),
+                Math.abs(Math.max(boatBox.maxX, riderBox.maxX) - boat.getX())
+            ),
+            Math.max(
+                Math.abs(Math.min(boatBox.minZ, riderBox.minZ) - boat.getZ()),
+                Math.abs(Math.max(boatBox.maxZ, riderBox.maxZ) - boat.getZ())
+            )
+        );
+        return unionHalfWidth + RASTER_BOAT_HORIZONTAL_SAFETY_MARGIN;
+    }
+
+    private void refreshRasterMountedEnvelope(AbstractBoatEntity boat) {
+        Box raw = rawRasterMountedClearanceBox(boat, 0.0, 0.0, 0.0);
+        Box signature = rasterEnvelopeBoatId == boat.getId()
+            && rasterEnvelopeSignature != null
+            ? new Box(
+                Math.min(raw.minX, rasterEnvelopeSignature.minX),
+                Math.min(raw.minY, rasterEnvelopeSignature.minY),
+                Math.min(raw.minZ, rasterEnvelopeSignature.minZ),
+                Math.max(raw.maxX, rasterEnvelopeSignature.maxX),
+                Math.max(raw.maxY, rasterEnvelopeSignature.maxY),
+                Math.max(raw.maxZ, rasterEnvelopeSignature.maxZ)
+            )
+            : raw;
+        boolean changed = rasterEnvelopeBoatId != boat.getId()
+            || rasterEnvelopeSignature == null
+            || !RasterMountedEnvelopePolicy.sameExtents(
+                rasterEnvelopeSignature.minX,
+                rasterEnvelopeSignature.minY,
+                rasterEnvelopeSignature.minZ,
+                rasterEnvelopeSignature.maxX,
+                rasterEnvelopeSignature.maxY,
+                rasterEnvelopeSignature.maxZ,
+                signature.minX,
+                signature.minY,
+                signature.minZ,
+                signature.maxX,
+                signature.maxY,
+                signature.maxZ
+            );
+        if (!changed) return;
+        rasterEnvelopeBoatId = boat.getId();
+        rasterEnvelopeSignature = signature;
+        rasterSideLaneOffsets.clear();
+        rasterOutwardLaneShiftBand = -1;
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        rasterBoatPath.clear();
+        rasterBoatPathTarget = null;
+        rasterWalkPath.clear();
+        rasterWalkPathTarget = null;
+        rasterStrictPlacementDetour = null;
+        rasterStrictPlacementDetourTargetIndex = -1;
+        cancelRasterEntryRouteSearch();
+        resetRasterBoatPathProgress();
+        resetRasterCompiledRouteProgress();
+        Addon.LOG.info(
+            "[Fullblock Printer] Staircased Printer invalidated physical route caches for mounted envelope {}",
+            signature
+        );
+    }
+
+    private double rasterBoatRiderHeight(AbstractBoatEntity boat) {
+        return Math.max(
+            boat.getHeight() + 0.25,
+            Math.max(
+                mc.player.getEyeY() - boat.getY() + 0.30,
+                mc.player.getBoundingBox().maxY - boat.getY() + 0.15
+            )
+        );
+    }
+
+    private Vec3d rasterRouteVehiclePose(
+        AbstractBoatEntity boat,
+        RasterBuildRoutePlan.Point<BlockPos> point
+    ) {
+        double minimumOffset = RasterSideLanePlanner.minimumOffset(
+            rasterBoatHalfWidth(boat)
+        );
+        double selectedOffset = rasterSideLaneOffsets.getOrDefault(
+            point.band(),
+            minimumOffset
+        );
+        return rasterRouteVehiclePose(boat, point, selectedOffset);
+    }
+
+    private Vec3d rasterRouteVehiclePose(
+        AbstractBoatEntity boat,
+        RasterBuildRoutePlan.Point<BlockPos> point,
+        double selectedOffset
+    ) {
+        double eyeOffset = mc.player.getEyeY() - boat.getY();
+        double targetCenterX = mapCorner.getX() + point.x();
+        double worldX = RasterSideLanePlanner.laneX(
+            targetCenterX,
+            rasterBuildRoutePlan.lateralDirection(),
+            selectedOffset
+        );
+        double worldZ = mapCorner.getZ() + point.z();
+        double nominalVehicleY = mapCorner.getY() + point.eyeY()
+            - eyeOffset;
+        return new Vec3d(worldX, nominalVehicleY, worldZ);
+    }
+
+    private String rasterEnvelopeDimensions(AbstractBoatEntity boat) {
+        Box box = rasterMountedClearanceBox(boat, 0.0, 0.0, 0.0);
+        return String.format(
+            Locale.ROOT,
+            "%.2fx%.2fx%.2f",
+            box.getLengthX(),
+            box.getLengthY(),
+            box.getLengthZ()
+        );
+    }
+
+    private boolean rasterRoutePointPlacementsReachable(
+        RasterBuildRoutePlan.Point<BlockPos> point,
+        double eyeX,
+        double eyeY,
+        double eyeZ
+    ) {
+        double usableReach = effectiveBuildInteractionRange();
+        double reachSquared = usableReach * usableReach;
+        for (BlockPos relative : point.placementDeadlines()) {
+            Vec3d target = mapCorner.add(relative).toCenterPos();
+            double dx = target.x - eyeX;
+            double dy = target.y - eyeY;
+            double dz = target.z - eyeZ;
+            if (dx * dx + dy * dy + dz * dz > reachSquared) return false;
+        }
+        return true;
+    }
+
+    private List<BlockPos> rasterPlacementBandTargets(
+        AbstractBoatEntity boat,
+        int firstUnfinished
+    ) {
+        if (rasterFlightPlan == null
+            || firstUnfinished < 0
+            || firstUnfinished >= orderedBuildTargets.size()) {
+            return List.of();
+        }
+        int activeBand = rasterFlightPlan.waypoints()
+            .get(firstUnfinished)
+            .row();
+        int radius = (int) Math.ceil(effectiveBuildInteractionRange()) + 1;
+        int centerX = (int) Math.floor(boat.getX()) - mapCorner.getX();
+        int centerZ = (int) Math.floor(boat.getZ()) - mapCorner.getZ();
+        LinkedHashSet<BlockPos> selected = new LinkedHashSet<>();
+        selected.add(orderedBuildTargets.get(firstUnfinished));
+        for (int dz = -radius; dz <= radius; dz++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                BlockPos relative = rasterTargetsByHorizontalCell.get(
+                    rasterHorizontalKey(centerX + dx, centerZ + dz)
+                );
+                if (relative == null) continue;
+                Integer index = rasterTargetIndices.get(relative);
+                if (index == null || index < firstUnfinished) continue;
+                int row = rasterFlightPlan.waypoints().get(index).row();
+                if (row != activeBand) {
+                    continue;
+                }
+                if (!isRasterTargetAuthoritativelyConfirmed(relative)) {
+                    selected.add(relative);
+                }
+            }
+        }
+        ArrayList<BlockPos> ordered = new ArrayList<>(selected);
+        ordered.sort(Comparator.comparingInt(relative ->
+            rasterTargetIndices.getOrDefault(relative, Integer.MAX_VALUE)));
+        return List.copyOf(ordered);
+    }
+
+    private static long rasterHorizontalKey(int x, int z) {
+        return ((long) x << 32) ^ (z & 0xffffffffL);
+    }
+
+    private String rasterDirectionLabel() {
+        if (rasterTraversalName.contains("column band")) {
+            return rasterDirection >= 0 ? "south" : "north";
+        }
+        return rasterDirection >= 0 ? "east" : "west";
+    }
+
+    private boolean isRasterTargetAuthoritativelyConfirmed(BlockPos relative) {
+        BlockPos world = mapCorner.add(relative);
+        return !pendingPlacementLedger.isPending(world)
+            && latestKnownBuildBlock(world) == buildTargets.get(relative);
+    }
+
+    private boolean rebaseRasterAfterCorrection(AbstractBoatEntity boat) {
+        if (rasterBuildRoutePlan == null
+            || rasterRouteCursor < 0
+            || rasterRouteCursor >= rasterBuildRoutePlan.points().size()) {
+            failBoatRaster("server correction lost the retained compiled route cursor");
+            return false;
+        }
+        BlockPos snapshot = boat.getBlockPos();
+        boolean eligible = isRasterBoatPositionSafe(
+            boat,
+            boat.getX(),
+            boat.getY(),
+            boat.getZ()
+        );
+        if (!eligible) {
+            rasterCorrectionPending = false;
+            beginRasterRouteRejoin(
+                "server correction invalidated the current segment; proximity-triggered egress is disabled"
+            );
+            return false;
+        }
+        if (!rasterRecoverySnapshotGate.observe(snapshot, eligible)) {
+            boatFlyAdapter.stop();
+            rasterStatus = "waiting for stable corrected boat position ("
+                + rasterRecoverySnapshotGate.observations() + "/3)";
+            return false;
+        }
+        Vec3d retainedPose = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(rasterRouteCursor)
+        );
+        rasterLastCorrectionDistance = boat.getEntityPos().distanceTo(
+            retainedPose
+        );
+        rasterCorrectionPending = false;
+        rasterRecoverySnapshotGate.reset();
+        beginRasterRouteRejoin(
+            "stable server correction "
+                + String.format(
+                    Locale.ROOT,
+                    "%.2f",
+                    rasterLastCorrectionDistance
+                )
+                + " blocks from retained route point"
+        );
+        return true;
+    }
+
+    private boolean advanceRasterCompiledRouteCursor(
+        AbstractBoatEntity boat
+    ) {
+        if (rasterBuildRoutePlan == null
+            || rasterRouteCursor >= rasterBuildRoutePlan.points().size() - 1) {
+            rasterRoutePreviousPosition = boat.getEntityPos();
+            return true;
+        }
+        Vec3d current = boat.getEntityPos();
+        while (rasterRouteCursor
+            < rasterBuildRoutePlan.points().size() - 1) {
+            Vec3d retained = rasterRouteVehiclePose(
+                boat,
+                rasterBuildRoutePlan.points().get(rasterRouteCursor)
+            );
+            Vec3d next = rasterRouteVehiclePose(
+                boat,
+                rasterBuildRoutePlan.points().get(rasterRouteCursor + 1)
+            );
+            boolean exteriorLaneShift = Math.abs(next.x - retained.x)
+                > 1.0e-7
+                && Math.abs(next.z - retained.z) <= 1.0e-7;
+            boolean normallyReached = RasterRouteProgress.reachedOrPassed(
+                    rasterRoutePoint(rasterRoutePreviousPosition),
+                    rasterRoutePoint(current),
+                    rasterRoutePoint(next),
+                    RASTER_ROUTE_WAYPOINT_TOLERANCE
+                ) || RasterRouteProgress.passedOnSegment(
+                    rasterRoutePoint(retained),
+                    rasterRoutePoint(current),
+                    rasterRoutePoint(next),
+                    RASTER_ROUTE_WAYPOINT_TOLERANCE
+                );
+            boolean reached = exteriorLaneShift
+                ? RasterSideLanePlanner.canAdvanceExteriorLaneShift(
+                    normallyReached,
+                    current.x,
+                    next.x,
+                    rasterBuildRoutePlan.lateralDirection()
+                )
+                : normallyReached;
+            if (!reached) break;
+            rasterRouteCursor++;
+            rasterCompiledSegmentPath.clear();
+            rasterCompiledSegmentDestination = -1;
+            rasterSavedRouteCursor = rasterRouteCursor;
+            rasterDamageReplanPending = false;
+            rasterLocalRecoveryRetainedDestination = -1;
+            rasterRouteTrackedDestination = -1;
+            rasterRouteBestDistance = Double.POSITIVE_INFINITY;
+            rasterRouteLastProgressTick = clientActionTick;
+            if (rasterLastFailedRouteDestination >= 0
+                && rasterRouteCursor >= rasterLastFailedRouteDestination) {
+                rasterRouteFailureCount = 0;
+                rasterLastFailedRouteDestination = -1;
+            }
+        }
+        rasterRoutePreviousPosition = current;
+        return true;
+    }
+
+    private boolean trackRasterCompiledRouteMovement(
+        AbstractBoatEntity boat,
+        Vec3d destination
+    ) {
+        int destinationIndex = rasterRouteCursor + 1;
+        double distance = boat.getEntityPos().distanceTo(destination);
+        if (rasterRouteTrackedDestination != destinationIndex) {
+            rasterRouteTrackedDestination = destinationIndex;
+            rasterRouteBestDistance = distance;
+            rasterRouteLastProgressTick = clientActionTick;
+            return true;
+        }
+        if (distance + 0.05 < rasterRouteBestDistance) {
+            rasterRouteBestDistance = distance;
+            rasterRouteLastProgressTick = clientActionTick;
+            return true;
+        }
+        if (clientActionTick - rasterRouteLastProgressTick
+            < RASTER_ROUTE_STUCK_TICKS) {
+            return true;
+        }
+        rejectRasterCompiledRouteSegment(
+            destinationIndex,
+            "compiled route made no progress for "
+                + RASTER_ROUTE_STUCK_TICKS + " ticks before point "
+                + destinationIndex
+        );
+        return false;
+    }
+
+    private void rejectRasterCompiledRouteSegment(
+        int destinationIndex,
+        String reason
+    ) {
+        if (rasterLastFailedRouteDestination == destinationIndex) {
+            rasterRouteFailureCount++;
+        } else {
+            rasterLastFailedRouteDestination = destinationIndex;
+            rasterRouteFailureCount = 1;
+        }
+        if (rasterRouteFailureCount >= 2) {
+            failBoatRaster(
+                reason
+                    + " repeated after one deterministic retained-route replay; refusing an infinite recovery loop"
+            );
+            return;
+        }
+        beginRasterRouteRejoin(
+            reason + " (single deterministic replay)"
+        );
+    }
+
+    private void resetRasterCompiledRouteProgress() {
+        rasterRoutePreviousPosition = null;
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        rasterRouteTrackedDestination = -1;
+        rasterRouteBestDistance = Double.POSITIVE_INFINITY;
+        rasterRouteLastProgressTick = clientActionTick;
+    }
+
+    private void beginRasterRouteRejoin(String reason) {
+        boatFlyAdapter.stop();
+        rasterLocalRecoveryRetainedDestination = -1;
+        rasterDirectStallRecoveryPending = false;
+        rasterDirectFlightProgress.reset();
+        // A failed ingress may temporarily set the physical cursor just before
+        // its retained target. Never let that transient cursor erode the
+        // authoritative checkpoint on repeated rejoin attempts.
+        rasterSavedRouteCursor = Math.max(
+            rasterSavedRouteCursor,
+            Math.max(0, rasterRouteCursor)
+        );
+        rasterRouteRejoinCursor = rasterBuildRoutePlan == null
+            ? Math.max(
+                0,
+                rasterSavedRouteCursor - RASTER_ROUTE_REJOIN_REPLAY_POINTS
+            )
+            : rasterBuildRoutePlan.replayIndex(
+                rasterSavedRouteCursor,
+                RASTER_ROUTE_REJOIN_REPLAY_POINTS
+            );
+        rasterRouteRejoinPending = true;
+        rasterRouteRejoinSnapshotAccepted = false;
+        rasterPrintCorridorAcquired = false;
+        rasterBoatPath.clear();
+        rasterBoatPathTarget = null;
+        cancelRasterEntryRouteSearch();
+        resetRasterBoatPathProgress();
+        resetRasterCompiledRouteProgress();
+        rasterRecoverySnapshotGate.reset();
+        Addon.LOG.warn(
+            "[Fullblock Printer] Boat Raster retained route point {} and will replay from {}: {}",
+            rasterSavedRouteCursor,
+            rasterRouteRejoinCursor,
+            reason
+        );
+        rasterStatus = "rejoining confirmed compiled route: " + reason;
+    }
+
+    private RasterSetPathStatus driveRasterFixedSetPath(
+        AbstractBoatEntity boat,
+        Vec3d finalTarget,
+        List<Vec3d> fixedRoute,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus
+    ) {
+        return driveRasterFixedSetPath(
+            boat,
+            finalTarget,
+            fixedRoute,
+            mode,
+            movingStatus,
+            false,
+            Double.NaN
+        );
+    }
+
+    private RasterSetPathStatus driveRasterFixedSetPath(
+        AbstractBoatEntity boat,
+        Vec3d finalTarget,
+        List<Vec3d> fixedRoute,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus,
+        boolean retryOnStall
+    ) {
+        return driveRasterFixedSetPath(
+            boat,
+            finalTarget,
+            fixedRoute,
+            mode,
+            movingStatus,
+            retryOnStall,
+            Double.NaN
+        );
+    }
+
+    private RasterSetPathStatus driveRasterSupportedFixedSetPath(
+        AbstractBoatEntity boat,
+        Vec3d finalTarget,
+        List<Vec3d> fixedRoute,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus,
+        boolean retryOnStall,
+        double supportPlaneY
+    ) {
+        return driveRasterFixedSetPath(
+            boat,
+            finalTarget,
+            fixedRoute,
+            mode,
+            movingStatus,
+            retryOnStall,
+            supportPlaneY
+        );
+    }
+
+    private RasterSetPathStatus driveRasterFixedSetPath(
+        AbstractBoatEntity boat,
+        Vec3d finalTarget,
+        List<Vec3d> fixedRoute,
+        BoatFlyAdapter.DriveMode mode,
+        String movingStatus,
+        boolean retryOnStall,
+        double supportPlaneY
+    ) {
+        boolean targetChanged = rasterBoatPathTarget == null
+            || rasterBoatPathTarget.squaredDistanceTo(finalTarget) > 0.02;
+        boolean routeMissing = !targetChanged
+            && rasterBoatPath.isEmpty()
+            && boat.getEntityPos().distanceTo(finalTarget) > 0.75;
+        if (targetChanged || routeMissing) {
+            cancelRasterEntryRouteSearch();
+            rasterBoatPath.clear();
+            rasterBoatPathTarget = finalTarget;
+            rasterBoatPathSupportPlaneY = supportPlaneY;
+            Vec3d previous = boat.getEntityPos();
+            boolean eagerValidation = fixedRoute.size()
+                <= RASTER_FIXED_ROUTE_EAGER_VALIDATION_LIMIT;
+            int routeIndex = 0;
+            for (Vec3d waypoint : fixedRoute) {
+                if (previous.distanceTo(waypoint) <= 0.10) continue;
+                boolean segmentClear = Double.isFinite(supportPlaneY)
+                    ? isRasterBoatLandingSegmentClear(
+                        boat, previous, waypoint, supportPlaneY
+                    )
+                    : isRasterBoatFullSegmentClear(
+                        boat, previous, waypoint
+                    );
+                if (eagerValidation
+                    && !segmentClear && !(routeIndex == 0
+                    && isRasterBoatExteriorSeparatingLiftClear(
+                        boat, previous, waypoint
+                    ))) {
+                    failBoatRaster(
+                        "fixed route prevalidation rejected a blocked or too-narrow segment before "
+                            + BlockPos.ofFloored(waypoint).toShortString()
+                            + ": " + rasterBoatSegmentFailure(
+                                boat,
+                                previous,
+                                waypoint
+                            )
+                    );
+                    return RasterSetPathStatus.FAILED;
+                }
+                rasterBoatPath.addLast(waypoint);
+                previous = waypoint;
+                routeIndex++;
+            }
+            if (previous.distanceTo(finalTarget) > 0.10) {
+                boolean finalClear = Double.isFinite(supportPlaneY)
+                    ? isRasterBoatLandingSegmentClear(
+                        boat, previous, finalTarget, supportPlaneY
+                    )
+                    : isRasterBoatFullSegmentClear(
+                        boat, previous, finalTarget
+                    );
+                if (eagerValidation && !finalClear) {
+                    failBoatRaster(
+                        "fixed route prevalidation rejected its final segment before "
+                            + BlockPos.ofFloored(finalTarget).toShortString()
+                            + ": " + rasterBoatSegmentFailure(
+                                boat,
+                                previous,
+                                finalTarget
+                            )
+                    );
+                    return RasterSetPathStatus.FAILED;
+                }
+                rasterBoatPath.addLast(finalTarget);
+            }
+            resetRasterBoatPathProgress();
+        }
+        return followRasterSetPath(boat, mode, movingStatus, retryOnStall);
+    }
+
+    private double rasterExteriorCruiseY() {
+        int maximumRelativeY = buildTargets.keySet().stream()
+            .mapToInt(BlockPos::getY).max().orElse(0);
+        return mapCorner.getY() + maximumRelativeY + 1.0
+            + RASTER_EXTERIOR_CRUISE_HEIGHT_ABOVE_MAP;
+    }
+
+    private void runRasterVerification() {
+        for (int i = 0; i < orderedBuildTargets.size(); i++) {
+            BlockPos relative = orderedBuildTargets.get(i);
+            BlockPos world = mapCorner.add(relative);
+            Block current = mc.world.getBlockState(world).getBlock();
+            Block expected = buildTargets.get(relative);
+            if (current == expected) continue;
+            rasterCursor = i;
+            rasterConfirmedFrontier = Math.min(rasterConfirmedFrontier, i);
+            if (current != Blocks.AIR) {
+                rasterClearanceQueue.add(world);
+                enterRasterState(State.RasterClearance, "repairing wrong confirmed block");
+            } else {
+                int deadline = rasterBuildRoutePlan.deadline(relative);
+                rasterRouteCursor = deadline;
+                rasterSavedRouteCursor = deadline;
+                beginRasterRouteRejoin(
+                    "verification found a missing target; replaying its lateral side-lane pose"
+                );
+                enterRasterState(
+                    State.RasterPrinting,
+                    "repairing missing target from its lateral side lane"
+                );
+            }
+            return;
+        }
+        enterRasterState(State.RasterDisposeExcess, "disposing excess map material");
+    }
+
+    private void runRasterDisposeExcess() {
+        if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            rasterResumeAfterMount = State.RasterDisposeExcess;
+            enterRasterState(State.RasterMountBoat, "boat dismounted before excess disposal");
+            return;
+        }
+        Vec3d target = dumpStation.getLeft();
+        if (boat.getEntityPos().distanceTo(target) > 0.75) {
+            rasterWaypoint = target;
+            driveBoatWithPath(
+                boat,
+                target,
+                BoatFlyAdapter.DriveMode.TRAVEL,
+                "pathfinding to excess-material station"
+            );
+            return;
+        }
+        boatFlyAdapter.stop();
+        mc.player.setYaw(dumpStation.getRight().getLeft());
+        mc.player.setPitch(dumpStation.getRight().getRight());
+        LinkedHashSet<Item> mapMaterials = buildTargets.values().stream()
+            .map(Block::asItem)
+            .filter(item -> {
+                if (!(item instanceof BlockItem blockItem)) return true;
+                return !(blockItem.getBlock() instanceof ShulkerBoxBlock);
+            })
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        for (Item material : mapMaterials) {
+            int excess = playerItemCount(material)
+                - rasterInventoryBaseline.getOrDefault(material, 0);
+            if (excess <= 0) continue;
+            for (int slot = 0; slot < 36; slot++) {
+                ItemStack stack = mc.player.getInventory().getStack(slot);
+                if (stack.getItem() == material && stack.getCount() <= excess) {
+                    InvUtils.drop().slot(slot);
+                    rasterStatus = "dropping excess " + material.getName().getString();
+                    return;
+                }
+            }
+            // A partial stack containing pre-existing player material is
+            // deliberately retained rather than risking unrelated items.
+        }
+        enterRasterState(State.RasterReturnBoat, "returning boat to launch");
+    }
+
+    private void runRasterReturnBoat() {
+        if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            enterRasterState(State.RasterRecoverBoat, "recovering boat item");
+            return;
+        }
+        Vec3d target = rasterLaunchBlock.toCenterPos().add(0, 1.25, 0);
+        rasterWaypoint = target;
+        if (boat.getEntityPos().distanceTo(target) > 0.75) {
+            driveBoatWithPath(
+                boat,
+                target,
+                BoatFlyAdapter.DriveMode.TRAVEL,
+                "pathfinding back to launch point"
+            );
+            return;
+        }
+        boatFlyAdapter.stop();
+        mc.player.dismountVehicle();
+        enterRasterState(State.RasterRecoverBoat, "breaking and recovering boat");
+    }
+
+    private void runRasterRecoverBoat() {
+        boatFlyAdapter.stop();
+        AbstractBoatEntity boat = findRasterBoat();
+        if (boat == null) {
+            if (InvUtils.find(stack -> stack.getItem() instanceof BoatItem).found()) {
+                if (rasterBoatSourceChest == null) {
+                    enterRasterState(State.RasterCleanup, "cleaning temporary launch blocks");
+                } else {
+                    enterRasterState(State.RasterReturnBoatChest, "returning boat to source chest");
+                }
+                return;
+            }
+            if (clientActionTick - rasterPhaseStartedTick > 120) {
+                failBoatRaster("boat pickup was not server-confirmed");
+            }
+            return;
+        }
+        if (mc.player.squaredDistanceTo(boat) > 16.0) {
+            drivePlayerToward(boat.getEntityPos());
+            return;
+        }
+        stopMovement();
+        mc.interactionManager.attackEntity(mc.player, boat);
+        mc.player.swingHand(Hand.MAIN_HAND);
+    }
+
+    private void runRasterReturnBoatChest() {
+        if (rasterBoatSourceChest == null) {
+            enterRasterState(State.RasterCleanup, "cleaning temporary launch blocks");
+            return;
+        }
+        Vec3d approach = rasterBoatSourceChest.getRight();
+        if (mc.player.getEntityPos().distanceTo(approach) > 0.7) {
+            drivePlayerToward(approach);
+            return;
+        }
+        stopMovement();
+        rasterBoatReturnSubmitted = false;
+        BlockPos chest = rasterBoatSourceChest.getLeft();
+        mc.interactionManager.interactBlock(
+            mc.player,
+            Hand.MAIN_HAND,
+            new BlockHitResult(chest.toCenterPos(), Direction.UP, chest, false)
+        );
+        enterRasterState(State.RasterAwaitBoatReturn, "depositing recovered boat");
+    }
+
+    private void runRasterCleanup() {
+        while (!rasterOwnedTemporaryBlocks.isEmpty()) {
+            BlockPos owned = rasterOwnedTemporaryBlocks.getFirst();
+            BlockState ownedState = mc.world.getBlockState(owned);
+            if (ownedState.isAir()) {
+                rasterOwnedTemporaryBlocks.removeFirst();
+                continue;
+            }
+            if (ownedState.getBlock() instanceof ShulkerBoxBlock) {
+                warning("Boat Raster left staged shulker at "
+                    + owned.toShortString()
+                    + " untouched because generic cleanup cannot guarantee item pickup");
+                rasterOwnedTemporaryBlocks.removeFirst();
+                continue;
+            }
+            if (ownedState.getBlock() != Blocks.COBBLESTONE) {
+                warning("Boat Raster left changed block at "
+                    + owned.toShortString()
+                    + " untouched during cleanup: "
+                    + ownedState.getBlock().getName().getString());
+                rasterOwnedTemporaryBlocks.removeFirst();
+                continue;
+            }
+            if (moveOffRasterTemporaryBlockIfNeeded(
+                    owned,
+                    "temporary cleanup block"
+                )) {
+                return;
+            }
+            if (mc.player.getEyePos().squaredDistanceTo(owned.toCenterPos()) > 25.0) {
+                drivePlayerToward(owned.toCenterPos().add(0, 1, 0));
+                return;
+            }
+            stopMovement();
+            BlockUtils.breakBlock(owned, true);
+            return;
+        }
+        releaseBoatRasterControl("complete");
+        buildingActive = false;
+        printingComplete = true;
+        mapCyclePhase = MapCyclePhase.IDLE;
+        clearLocalCycleCheckpoint("boat-raster-complete");
+        if (rasterCheckpointStore != null) {
+            try {
+                rasterCheckpointStore.clear();
+            } catch (IOException failure) {
+                error("Boat Raster completed, but its checkpoint could not be removed: "
+                    + failure.getMessage());
+                return;
+            }
+        }
+        state = State.SelectingChests;
+        info("Boat Raster completed and restored Entity Control.");
+        if (isActive()) toggle();
+    }
+
+    private boolean moveOffRasterTemporaryBlockIfNeeded(
+        BlockPos temporary,
+        String description
+    ) {
+        if (!rasterTemporaryBlockSupportsOrIntersectsPlayer(temporary)) {
+            return false;
+        }
+        Vec3d safeStance = findRasterSafeBreakStance(temporary);
+        if (safeStance == null) {
+            failBoatRaster("refusing to break " + description + " at "
+                + temporary.toShortString()
+                + " because it supports/intersects the player and no supported retreat exists");
+            return true;
+        }
+        drivePlayerToward(safeStance);
+        rasterStatus = "moving off " + description + " before breaking it";
+        return true;
+    }
+
+    private boolean rasterTemporaryBlockSupportsOrIntersectsPlayer(
+        BlockPos temporary
+    ) {
+        Box player = mc.player.getBoundingBox();
+        Box block = new Box(temporary);
+        if (block.intersects(player.expand(0.05))) return true;
+        Box supportProbe = new Box(
+            player.minX + 0.02,
+            player.minY - 0.16,
+            player.minZ + 0.02,
+            player.maxX - 0.02,
+            player.minY + 0.02,
+            player.maxZ - 0.02
+        );
+        return block.intersects(supportProbe);
+    }
+
+    private Vec3d findRasterSafeBreakStance(BlockPos temporary) {
+        BlockPos origin = mc.player.getBlockPos();
+        for (int radius = 1; radius <= 3; radius++) {
+            for (int dy : new int[] {0, 1, -1}) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                            continue;
+                        }
+                        BlockPos feet = origin.add(dx, dy, dz);
+                        if (feet.down().equals(temporary)) continue;
+                        RasterVoxelPathfinder.Cell cell =
+                            new RasterVoxelPathfinder.Cell(
+                                feet.getX(),
+                                feet.getY(),
+                                feet.getZ()
+                            );
+                        if (!isRasterWalkCellSafe(cell)) continue;
+                        Vec3d stance = new Vec3d(
+                            feet.getX() + 0.5,
+                            feet.getY(),
+                            feet.getZ() + 0.5
+                        );
+                        if (stance.add(0, mc.player.getStandingEyeHeight(), 0)
+                            .squaredDistanceTo(temporary.toCenterPos()) > 25.0) {
+                            continue;
+                        }
+                        if (!findRasterWalkPath(stance).isEmpty()) return stance;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private void failBoatRaster(String reason) {
+        boatFlyAdapter.stop();
+        rasterBoatPath.clear();
+        rasterBoatPathTarget = null;
+        cancelRasterEntryRouteSearch();
+        resetRasterBoatPathProgress();
+        rasterCompiledSegmentPath.clear();
+        rasterCompiledSegmentDestination = -1;
+        releaseBoatRasterControl("failed: " + reason);
+        buildingActive = false;
+        rasterStatus = "failed: " + reason;
+        error("Boat Raster failed closed: " + reason + ".");
+        if (isActive()) toggle();
+    }
+
+    private void disableRasterPreflight(String reason) {
+        boatFlyAdapter.stop();
+        releaseBoatRasterControl("preflight: " + reason);
+        buildingActive = false;
+        rasterStatus = "disabled: " + reason;
+        warning("Boat Raster disabled before movement: " + reason + ".");
+        if (isActive()) toggle();
+    }
+
+    private AbstractBoatEntity findRasterBoat() {
+        Vec3d center = mc.player.getEntityPos();
+        Box search = new Box(center.subtract(16, 8, 16), center.add(16, 10, 16));
+        return mc.world.getEntitiesByClass(
+            AbstractBoatEntity.class,
+            search,
+            entity -> entity.isAlive()
+                && (state == State.RasterRestock
+                    || rasterReturningToParkedBoat
+                    || rasterLaunchBlock == null
+                    || entity.getEntityPos().squaredDistanceTo(
+                        rasterLaunchBlock.toCenterPos()
+                    ) <= 144.0)
+        ).stream().min(Comparator.comparingDouble(mc.player::squaredDistanceTo))
+            .orElse(null);
+    }
+
+    private AbstractBoatEntity findLoadedRasterRecoveryBoat() {
+        if (mc.player == null || mc.world == null) return null;
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity mountedBoat
+            && mountedBoat.isAlive()) {
+            return mountedBoat;
+        }
+        AbstractBoatEntity checkpointBoat = findRasterBoatNear(
+            rasterBoatPosition
+        );
+        if (checkpointBoat != null) return checkpointBoat;
+        Vec3d center = mapCorner == null
+            ? mc.player.getEntityPos()
+            : mapCorner.toCenterPos().add(64.0, 0.0, 64.0);
+        double radius = mapCorner == null ? 48.0 : 112.0;
+        Box search = new Box(
+            center.x - radius,
+            mc.world.getBottomY(),
+            center.z - radius,
+            center.x + radius,
+            mc.world.getTopYInclusive() + 1.0,
+            center.z + radius
+        );
+        return mc.world.getEntitiesByClass(
+            AbstractBoatEntity.class,
+            search,
+            Entity::isAlive
+        ).stream().min(Comparator.comparingDouble(mc.player::squaredDistanceTo))
+            .orElse(null);
+    }
+
+    private BlockPos recoveredRasterLaunchBlock(
+        BoatRasterCheckpointStore.Snapshot snapshot,
+        AbstractBoatEntity boat
+    ) {
+        if (snapshot == null || boat == null || mc.world == null) return null;
+        BlockPos savedLaunch = decodeBlockPos(snapshot.launchBlock());
+        if (savedLaunch != null
+            && !mc.world.getBlockState(savedLaunch)
+                .getCollisionShape(mc.world, savedLaunch).isEmpty()) {
+            return savedLaunch;
+        }
+        return snapshot.ownedTemporaryBlocks().stream()
+            .map(this::decodeBlockPos)
+            .filter(Objects::nonNull)
+            .filter(position -> mc.world.getBlockState(position).isOf(Blocks.COBBLESTONE))
+            .min(Comparator.comparingDouble(position ->
+                boat.getEntityPos().squaredDistanceTo(position.toCenterPos())
+            )).orElse(null);
+    }
+
+    private AbstractBoatEntity findRasterBoatNear(BlockPos position) {
+        if (position == null) return null;
+        Vec3d center = position.toCenterPos();
+        Box search = new Box(
+            center.subtract(8, 5, 8),
+            center.add(8, 6, 8)
+        );
+        return mc.world.getEntitiesByClass(
+            AbstractBoatEntity.class,
+            search,
+            Entity::isAlive
+        ).stream().min(Comparator.comparingDouble(entity ->
+            entity.getEntityPos().squaredDistanceTo(center)
+        )).orElse(null);
+    }
+
+    private int playerBoatItemCount() {
+        if (mc.player == null) return 0;
+        int count = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.getItem() instanceof BoatItem) count += stack.getCount();
+        }
+        return count;
+    }
+
+    private ItemEntity findDroppedRasterBoatItem() {
+        if (rasterBoatPosition == null || mc.world == null) return null;
+        Box search = new Box(rasterBoatPosition).expand(8.0, 5.0, 8.0);
+        return mc.world.getEntitiesByClass(
+            ItemEntity.class,
+            search,
+            entity -> entity.isAlive()
+                && entity.getStack().getItem() instanceof BoatItem
+        ).stream().min(Comparator.comparingDouble(mc.player::squaredDistanceTo))
+            .orElse(null);
+    }
+
+    private int ensureRasterHotbarBoat() {
+        var result = InvUtils.findInHotbar(stack -> stack.getItem() instanceof BoatItem);
+        if (result.found()) {
+            InvUtils.swap(result.slot(), false);
+            return result.slot();
+        }
+        var inventory = InvUtils.find(stack -> stack.getItem() instanceof BoatItem);
+        if (!inventory.found()) return HOTBAR_ITEM_UNAVAILABLE;
+        markRasterSwapSourceManaged(inventory.slot());
+        InvUtils.move().from(inventory.slot()).toHotbar(rasterHotbarStagingSlot());
+        return HOTBAR_SLOT_PENDING;
+    }
+
+    private int ensureRasterHotbarItem(Item item) {
+        var result = InvUtils.findInHotbar(item);
+        if (result.found()) return result.slot();
+        var inventory = InvUtils.find(item);
+        if (!inventory.found()) return HOTBAR_ITEM_UNAVAILABLE;
+        markRasterSwapSourceManaged(inventory.slot());
+        InvUtils.move().from(inventory.slot()).toHotbar(rasterHotbarStagingSlot());
+        return HOTBAR_SLOT_PENDING;
+    }
+
+    private int rasterHotbarStagingSlot() {
+        if (rasterManagedHotbarSlots.isEmpty()) {
+            throw new IllegalStateException("Boat Raster has no managed hotbar staging slot.");
+        }
+        return rasterManagedHotbarSlots.getFirst();
+    }
+
+    private void markRasterSwapSourceManaged(int slot) {
+        if (slot >= 0 && slot < 36 && !availableSlots.contains(slot)) {
+            availableSlots.add(slot);
+            Collections.sort(availableSlots);
+        }
+    }
+
+    private boolean drivePlayerToward(Vec3d target) {
+        boolean targetChanged = rasterWalkPathTarget == null
+            || rasterWalkPathTarget.squaredDistanceTo(target) > 0.04;
+        if (targetChanged) {
+            rasterWalkPath.clear();
+            rasterWalkPathTarget = target;
+            // Do not inherit a planning cooldown from the previous logistics
+            // destination. A new target must be accepted or rejected now.
+            rasterWalkPathPlannedTick = clientActionTick - 10;
+            rasterWalkTrackedWaypoint = null;
+            rasterWalkBestDistance = Double.POSITIVE_INFINITY;
+            rasterWalkLastProgressTick = clientActionTick;
+            rasterWalkRouteFailures = 0;
+            rasterWalkRetryNotBeforeTick = -1L;
+            rasterWalkRetryOrigin = null;
+        }
+        if (rasterWalkRetryNotBeforeTick > clientActionTick) {
+            if (rasterWalkRetryOrigin != null
+                && !rasterWalkRetryOrigin.equals(mc.player.getBlockPos())) {
+                rasterWalkRetryNotBeforeTick = -1L;
+                rasterWalkRetryOrigin = null;
+            } else {
+                stopMovement();
+                rasterStatus = "safe foot-route cooldown; waiting for a world or player-position change";
+                return true;
+            }
+        }
+        if (rasterWalkRetryNotBeforeTick >= 0L) {
+            rasterWalkRetryNotBeforeTick = -1L;
+            rasterWalkRetryOrigin = null;
+            rasterWalkPathPlannedTick = clientActionTick - 10;
+        }
+        while (!rasterWalkPath.isEmpty()
+            && hasReachedRasterWalkWaypoint(rasterWalkPath.getFirst())) {
+            rasterWalkPath.removeFirst();
+            rasterWalkTrackedWaypoint = null;
+        }
+        if (rasterWalkPath.isEmpty()
+            && clientActionTick - rasterWalkPathPlannedTick >= 10) {
+            rasterWalkPathPlannedTick = clientActionTick;
+            if (!planRasterWalkPath(target)) {
+                return rejectRasterWalkRoute(
+                    "no supported foot route to " + target
+                );
+            }
+        }
+        Vec3d next = rasterWalkPath.isEmpty() ? null : rasterWalkPath.getFirst();
+        if (next == null) {
+            stopMovement();
+            rasterStatus = "pathfinding on foot to open logistics position";
+            return true;
+        }
+        RasterVoxelPathfinder.Cell nextCell = new RasterVoxelPathfinder.Cell(
+            (int) Math.floor(next.x),
+            (int) Math.floor(next.y),
+            (int) Math.floor(next.z)
+        );
+        RasterVoxelPathfinder.Cell currentCell = new RasterVoxelPathfinder.Cell(
+            mc.player.getBlockX(),
+            mc.player.getBlockY(),
+            mc.player.getBlockZ()
+        );
+        if (!isRasterWalkCellSafe(currentCell)
+            || !RasterVoxelPathfinder.canTraverse(
+                currentCell,
+                nextCell,
+                RasterVoxelPathfinder.Mode.WALK,
+                this::isRasterWalkCellSafe
+            )) {
+            return rejectRasterWalkRoute(
+                "walking route or support changed before " + next
+            );
+        }
+        double waypointDistance = mc.player.getEntityPos().distanceTo(next);
+        if (rasterWalkTrackedWaypoint == null
+            || rasterWalkTrackedWaypoint.squaredDistanceTo(next) > 0.01) {
+            rasterWalkTrackedWaypoint = next;
+            rasterWalkBestDistance = waypointDistance;
+            rasterWalkLastProgressTick = clientActionTick;
+        } else if (waypointDistance + 0.02 < rasterWalkBestDistance) {
+            rasterWalkBestDistance = waypointDistance;
+            rasterWalkLastProgressTick = clientActionTick;
+            rasterWalkRouteFailures = 0;
+        } else if (clientActionTick - rasterWalkLastProgressTick
+            >= RASTER_ROUTE_STUCK_TICKS) {
+            return rejectRasterWalkRoute(
+                "foot movement made no progress toward " + next
+            );
+        }
+        drivePlayerDirect(next);
+        return true;
+    }
+
+    private boolean rejectRasterWalkRoute(String reason) {
+        rasterWalkPath.clear();
+        rasterWalkTrackedWaypoint = null;
+        rasterWalkBestDistance = Double.POSITIVE_INFINITY;
+        rasterWalkLastProgressTick = clientActionTick;
+        rasterWalkPathPlannedTick = clientActionTick - 10;
+        rasterWalkRouteFailures++;
+        stopMovement();
+        rasterStatus = reason + "; refusing to leave the platform";
+        Addon.LOG.warn(
+            "[Fullblock Printer] Boat Raster foot-route failure {}/{}: {} | state={} | player={} | target={}",
+            rasterWalkRouteFailures,
+            RASTER_WALK_MAX_FAILURES,
+            reason,
+            state,
+            mc.player.getEntityPos(),
+            rasterWalkPathTarget
+        );
+        if (rasterWalkRouteFailures >= RASTER_WALK_MAX_FAILURES
+            && state != State.RasterDeployBoat) {
+            rasterWalkRouteFailures = 0;
+            rasterWalkRetryNotBeforeTick = clientActionTick
+                + RASTER_SAFE_RETRY_COOLDOWN_TICKS;
+            rasterWalkRetryOrigin = mc.player.getBlockPos();
+            rasterStatus = reason
+                + "; stopped safely for five seconds before retrying from the current platform cell";
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster retained its logistics checkpoint after {} foot-route failures; stopped safely at {} for a five-second retry cooldown",
+                RASTER_WALK_MAX_FAILURES,
+                rasterWalkRetryOrigin
+            );
+        }
+        return false;
+    }
+
+    private boolean hasReachedRasterWalkWaypoint(Vec3d waypoint) {
+        if (mc.player.getBlockX() != (int) Math.floor(waypoint.x)
+            || mc.player.getBlockZ() != (int) Math.floor(waypoint.z)
+            || mc.player.getBlockY() != (int) Math.floor(waypoint.y)) {
+            return false;
+        }
+        double dx = mc.player.getX() - waypoint.x;
+        double dz = mc.player.getZ() - waypoint.z;
+        return dx * dx + dz * dz <= 0.04;
+    }
+
+    private void drivePlayerDirect(Vec3d target) {
+        double dx = target.x - mc.player.getX();
+        double dy = target.y - mc.player.getY();
+        double dz = target.z - mc.player.getZ();
+        double horizontalDistanceSquared = dx * dx + dz * dz;
+        if (horizontalDistanceSquared > 0.0225) {
+            mc.player.setYaw((float) Math.toDegrees(Math.atan2(-dx, dz)));
+        }
+        boolean movingForward = horizontalDistanceSquared > 0.0225;
+        RasterVoxelPathfinder.Cell targetCell = new RasterVoxelPathfinder.Cell(
+            (int) Math.floor(target.x),
+            (int) Math.floor(target.y),
+            (int) Math.floor(target.z)
+        );
+        boolean supportedOneBlockDescent = dy < -0.6
+            && dy >= -1.25
+            && isRasterWalkCellSafe(targetCell);
+        Utils.setForwardPressed(movingForward);
+        Utils.setBackwardPressed(false);
+        Utils.setJumpPressed(dy > 0.6);
+        // Crouch during automated foot travel so even a delayed turn cannot
+        // carry the player off a platform edge. Release only for an explicitly
+        // planned, revalidated one-block descent onto solid support.
+        Utils.setSneakPressed(movingForward && !supportedOneBlockDescent);
+        Utils.setSprintPressed(false);
+    }
+
+    private boolean planRasterWalkPath(Vec3d requestedTarget) {
+        List<RasterVoxelPathfinder.Cell> best = findRasterWalkPath(requestedTarget);
+        rasterWalkPath.clear();
+        List<RasterWalkRoute.Point> waypoints = RasterWalkRoute.waypoints(
+            best,
+            new RasterWalkRoute.Point(
+                requestedTarget.x,
+                requestedTarget.y,
+                requestedTarget.z
+            )
+        );
+        for (RasterWalkRoute.Point waypoint : waypoints) {
+            rasterWalkPath.add(new Vec3d(
+                waypoint.x(),
+                waypoint.y(),
+                waypoint.z()
+            ));
+        }
+        if (!rasterWalkPath.isEmpty()) {
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster planned autonomous walking path with {} waypoints to {}",
+                rasterWalkPath.size(),
+                requestedTarget
+            );
+        }
+        return !rasterWalkPath.isEmpty();
+    }
+
+    private List<RasterVoxelPathfinder.Cell> findRasterWalkPath(
+        Vec3d requestedTarget
+    ) {
+        RasterVoxelPathfinder.Cell start = new RasterVoxelPathfinder.Cell(
+            mc.player.getBlockX(),
+            mc.player.getBlockY(),
+            mc.player.getBlockZ()
+        );
+        for (BlockPos goal : rasterWalkGoals(requestedTarget)) {
+            List<RasterVoxelPathfinder.Cell> path = RasterVoxelPathfinder.find(
+                start,
+                new RasterVoxelPathfinder.Cell(goal.getX(), goal.getY(), goal.getZ()),
+                RasterVoxelPathfinder.Mode.WALK,
+                30,
+                5,
+                20000,
+                this::isRasterWalkCellSafe
+            );
+            if (!path.isEmpty()) {
+                return path;
+            }
+        }
+        return List.of();
+    }
+
+    private List<BlockPos> rasterWalkGoals(Vec3d requestedTarget) {
+        BlockPos requested = BlockPos.ofFloored(requestedTarget);
+        ArrayList<BlockPos> goals = new ArrayList<>();
+        for (int radius = 0; radius <= 2; radius++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                        BlockPos candidate = requested.add(dx, dy, dz);
+                        if (isRasterWalkCellSafe(new RasterVoxelPathfinder.Cell(
+                            candidate.getX(), candidate.getY(), candidate.getZ()
+                        ))) goals.add(candidate);
+                    }
+                }
+            }
+        }
+        goals.sort(Comparator.comparingDouble(goal ->
+            goal.toCenterPos().squaredDistanceTo(requestedTarget)
+        ));
+        return List.copyOf(goals);
+    }
+
+    private boolean isRasterWalkCellSafe(RasterVoxelPathfinder.Cell cell) {
+        if (!mc.world.isChunkLoaded(cell.x() >> 4, cell.z() >> 4)) return false;
+        BlockPos feet = new BlockPos(cell.x(), cell.y(), cell.z());
+        BlockPos head = feet.up();
+        BlockPos support = feet.down();
+        BlockState supportState = mc.world.getBlockState(support);
+        BlockState feetState = mc.world.getBlockState(feet);
+        BlockState headState = mc.world.getBlockState(head);
+        if (!feetState.getFluidState().isEmpty()
+            || !headState.getFluidState().isEmpty()
+            || supportState.isOf(Blocks.MAGMA_BLOCK)
+            || feetState.isOf(Blocks.FIRE)
+            || feetState.isOf(Blocks.SOUL_FIRE)
+            || feetState.isOf(Blocks.POWDER_SNOW)
+            || feetState.isOf(Blocks.SWEET_BERRY_BUSH)
+            || feetState.isOf(Blocks.WITHER_ROSE)) {
+            return false;
+        }
+        if (supportState.getCollisionShape(mc.world, support).isEmpty()) {
+            return false;
+        }
+        double supportTop = supportState.getCollisionShape(mc.world, support)
+            .getMax(Direction.Axis.Y);
+        return supportTop >= 0.99 && supportTop <= 1.01
+            && feetState.getCollisionShape(mc.world, feet).isEmpty()
+            && headState.getCollisionShape(mc.world, head).isEmpty()
+            && isRasterPlayerPoseClear(feet);
+    }
+
+    private boolean isRasterPlayerPoseClear(BlockPos feet) {
+        double halfWidth = Math.max(0.31, mc.player.getWidth() / 2.0 + 0.02);
+        double height = Math.max(1.90, mc.player.getHeight() + 0.10);
+        Box playerClearance = new Box(
+            feet.getX() + 0.5 - halfWidth,
+            feet.getY(),
+            feet.getZ() + 0.5 - halfWidth,
+            feet.getX() + 0.5 + halfWidth,
+            feet.getY() + height,
+            feet.getZ() + 0.5 + halfWidth
+        );
+        return mc.world.isBlockSpaceEmpty(mc.player, playerClearance);
+    }
+
+    private void resetRasterRestockLandingState() {
+        rasterRestockLanding = null;
+        rasterRestockDismountCell = null;
+        rasterRejectedRestockLandings.clear();
+        rasterRestockLandingFailures = 0;
+        rasterRestockDismountRequestedTick = -1000L;
+        rasterRestockDiscardPendingSlot = -1;
+        rasterRestockDiscardPendingItem = null;
+        rasterRestockDiscardPendingCount = 0;
+        rasterRestockDiscardAttempts = 0;
+        rasterRestockDiscardedStacks = 0;
+        rasterRestockDiscardSubmittedTick = -1000L;
+    }
+
+    private Vec3d selectRasterRestockLanding(AbstractBoatEntity boat) {
+        Vec3d dump = dumpStation.getLeft();
+        Set<RasterVoxelPathfinder.Cell> logisticsWalkCells =
+            findRasterLogisticsWalkComponent(
+                dump,
+                rasterRestockSource.getRight()
+            );
+        if (logisticsWalkCells.isEmpty()) return null;
+        BlockPos origin = BlockPos.ofFloored(dump);
+        int[] verticalOffsets = {0, 1, -1, 2, -2, 3, -3};
+        for (int radius = 0;
+             radius <= RASTER_RESTOCK_LANDING_SEARCH_RADIUS;
+             radius++) {
+            for (int dy : verticalOffsets) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                    for (int dz = -radius; dz <= radius; dz++) {
+                        if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) {
+                            continue;
+                        }
+                        BlockPos boatFeet = origin.add(dx, dy, dz);
+                        if (rasterRejectedRestockLandings.contains(boatFeet)
+                            || isInsideRasterHorizontalFootprint(boatFeet)
+                            || !isRasterBoatLandingPoseSafe(boat, boatFeet)) {
+                            continue;
+                        }
+                        BlockPos dismount = selectRasterRestockDismountCell(
+                            boatFeet,
+                            dump,
+                            logisticsWalkCells
+                        );
+                        if (dismount == null) continue;
+                        rasterRestockDismountCell = dismount;
+                        Vec3d landing = new Vec3d(
+                            boatFeet.getX() + 0.5,
+                            boatFeet.getY(),
+                            boatFeet.getZ() + 0.5
+                        );
+                        Addon.LOG.info(
+                            "[Fullblock Printer] Boat Raster selected suffocation-safe logistics landing {} with supported dismount {}",
+                            landing,
+                            dismount
+                        );
+                        return landing;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isInsideRasterHorizontalFootprint(BlockPos position) {
+        int relativeX = position.getX() - mapCorner.getX();
+        int relativeZ = position.getZ() - mapCorner.getZ();
+        return relativeX >= 0 && relativeX <= 127
+            && relativeZ >= 0 && relativeZ <= 127;
+    }
+
+    private boolean isRasterBoatLandingPoseSafe(
+        AbstractBoatEntity boat,
+        BlockPos boatFeet
+    ) {
+        double x = boatFeet.getX() + 0.5;
+        double y = boatFeet.getY();
+        double z = boatFeet.getZ() + 0.5;
+        if (!isRasterBoatLandingPositionClear(boat, x, y, z, y)) {
+            return false;
+        }
+        // A narrow logistics dock can safely support the boat on its center
+        // block. Requiring solid support beneath the entire boat footprint
+        // incorrectly rejected the registered oak-log dock. Safe dismount and
+        // walking cells are validated separately and remain mandatory.
+        BlockPos support = BlockPos.ofFloored(x, y - 0.05, z);
+        BlockState state = mc.world.getBlockState(support);
+        if (state.isOf(Blocks.MAGMA_BLOCK)
+            || state.getCollisionShape(mc.world, support).isEmpty()) {
+            return false;
+        }
+        double top = state.getCollisionShape(mc.world, support)
+            .getMax(Direction.Axis.Y);
+        return top >= 0.99 && top <= 1.01;
+    }
+
+    private boolean isRasterBoatLandingPositionClear(
+        AbstractBoatEntity boat,
+        double x,
+        double y,
+        double z,
+        double supportPlaneY
+    ) {
+        Box clearance = rasterMountedClearanceBox(boat, x, y, z);
+        int minChunkX = ((int) Math.floor(clearance.minX)) >> 4;
+        int maxChunkX = ((int) Math.floor(clearance.maxX)) >> 4;
+        int minChunkZ = ((int) Math.floor(clearance.minZ)) >> 4;
+        int maxChunkZ = ((int) Math.floor(clearance.maxZ)) >> 4;
+        for (int chunkX = minChunkX; chunkX <= maxChunkX; chunkX++) {
+            for (int chunkZ = minChunkZ; chunkZ <= maxChunkZ; chunkZ++) {
+                if (!mc.world.isChunkLoaded(chunkX, chunkZ)) return false;
+            }
+        }
+        if (clearance.minY < mc.world.getBottomY()
+            || clearance.maxY > mc.world.getTopYInclusive() + 1
+            || rasterActiveRowVirtualCollision(clearance)) {
+            return false;
+        }
+        int minX = (int) Math.floor(clearance.minX + 1.0e-7);
+        int maxX = (int) Math.floor(clearance.maxX - 1.0e-7);
+        int minY = (int) Math.floor(clearance.minY + 1.0e-7);
+        int maxY = (int) Math.floor(clearance.maxY - 1.0e-7);
+        int minZ = (int) Math.floor(clearance.minZ + 1.0e-7);
+        int maxZ = (int) Math.floor(clearance.maxZ - 1.0e-7);
+        for (int blockX = minX; blockX <= maxX; blockX++) {
+            for (int blockY = minY; blockY <= maxY; blockY++) {
+                for (int blockZ = minZ; blockZ <= maxZ; blockZ++) {
+                    BlockPos position = new BlockPos(
+                        blockX, blockY, blockZ
+                    );
+                    BlockState candidate = mc.world.getBlockState(position);
+                    for (Box shape : candidate.getCollisionShape(
+                            mc.world, position
+                        ).getBoundingBoxes()) {
+                        Box worldShape = shape.offset(
+                            blockX, blockY, blockZ
+                        );
+                        // The expanded envelope extends below the boat. Shapes
+                        // ending at the dock plane are support, not obstacles.
+                        if (clearance.intersects(worldShape)
+                            && !RasterSupportedTravelPolicy.isSupportContact(
+                                worldShape.maxY,
+                                supportPlaneY
+                            )) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private BlockPos selectRasterRestockDismountCell(
+        BlockPos boatFeet,
+        Vec3d dump,
+        Set<RasterVoxelPathfinder.Cell> logisticsWalkCells
+    ) {
+        ArrayList<BlockPos> candidates = new ArrayList<>();
+        for (int radius = 1; radius <= 2; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    BlockPos candidate = boatFeet.add(dx, 0, dz);
+                    RasterVoxelPathfinder.Cell cell = new RasterVoxelPathfinder.Cell(
+                        candidate.getX(),
+                        candidate.getY(),
+                        candidate.getZ()
+                    );
+                    if (logisticsWalkCells.contains(cell)) {
+                        candidates.add(candidate);
+                    }
+                }
+            }
+        }
+        candidates.sort(Comparator.comparingDouble(candidate ->
+            candidate.toCenterPos().squaredDistanceTo(dump)
+        ));
+        return candidates.isEmpty() ? null : candidates.getFirst();
+    }
+
+    private Set<RasterVoxelPathfinder.Cell> findRasterLogisticsWalkComponent(
+        Vec3d dump,
+        Vec3d source
+    ) {
+        List<BlockPos> sourceGoals = rasterWalkGoals(source);
+        for (BlockPos dumpGoal : rasterWalkGoals(dump)) {
+            RasterVoxelPathfinder.Cell start = new RasterVoxelPathfinder.Cell(
+                dumpGoal.getX(), dumpGoal.getY(), dumpGoal.getZ()
+            );
+            Set<RasterVoxelPathfinder.Cell> reachable =
+                RasterVoxelPathfinder.reachable(
+                start,
+                RasterVoxelPathfinder.Mode.WALK,
+                64,
+                8,
+                80000,
+                this::isRasterWalkCellSafe
+            );
+            boolean reachesSource = sourceGoals.stream().anyMatch(goal ->
+                reachable.contains(new RasterVoxelPathfinder.Cell(
+                    goal.getX(), goal.getY(), goal.getZ()
+                ))
+            );
+            if (reachesSource) return reachable;
+        }
+        return Set.of();
+    }
+
+    private void scheduleRasterRestock(Item material) {
+        scheduleRasterRestock(material, false);
+    }
+
+    private void scheduleRasterRestock(
+        Item material,
+        boolean beforeDeployment
+    ) {
+        boatFlyAdapter.stop();
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity boat) {
+            rasterBoatPosition = boat.getBlockPos();
+        }
+        if (rasterInventoryFillPlan.isEmpty()) {
+            planRasterInventoryFill();
+        }
+        Optional<Item> plannedMaterial = nextRasterInventoryFillMaterial();
+        if (plannedMaterial.isPresent()) {
+            material = plannedMaterial.orElseThrow();
+        } else if (playerItemCount(material) <= 0) {
+            failBoatRaster("inventory cannot reserve space for required material "
+                + material.getName().getString());
+            return;
+        }
+        ArrayList<Pair<BlockPos, Vec3d>> sources = materialShulkerDict == null
+            ? null : materialShulkerDict.get(material);
+        if (sources == null || sources.isEmpty()) {
+            failBoatRaster("no registered single-material shulker source for "
+                + material.getName().getString());
+            return;
+        }
+        rasterRestockMaterial = material;
+        rasterRestockShulkerItem = null;
+        rasterRestockSource = sources.stream().min(
+            Comparator.comparingDouble(source ->
+                source.getRight().squaredDistanceTo(mc.player.getEntityPos()))
+        ).orElseThrow();
+        resetRasterRestockLandingState();
+        rasterReturningToParkedBoat = false;
+        rasterBoatPath.clear();
+        rasterBoatPathTarget = null;
+        cancelRasterEntryRouteSearch();
+        resetRasterBoatPathProgress();
+        rasterWalkPath.clear();
+        rasterWalkPathTarget = null;
+        rasterStagingBlock = null;
+        rasterRestockSyncId = -1;
+        rasterRestockAttempts = 0;
+        rasterStagingBreakProgressTicks = 0;
+        rasterStagingBreakFirstDispatchTick = -1L;
+        rasterStagingBreakLastDispatchTick = -1000L;
+        rasterRestockMaterialBefore = playerItemCount(material);
+        rasterRestockTargetPlayerCount = 0;
+        rasterRestockTransferBeforePlayerCount = 0;
+        rasterRestockContainerSlots = 0;
+        rasterRestockQueuedSourceSlot = -1;
+        rasterRestockQueuedSyncId = -1;
+        rasterLastRestockActionTick = -1000L;
+        rasterRestockConfirmationReopen = false;
+        rasterRestockReturnConfirmationReopen = false;
+        rasterRestockPlayerMaterialSlots.clear();
+        rasterRestockPlayerShulkerSlots.clear();
+        rasterRestockBeforeDeployment = beforeDeployment;
+        rasterRestockBoatBreakLastAttemptTick = -1000L;
+        if (!beforeDeployment
+            && rasterBuildRoutePlan != null
+            && !orderedBuildTargets.isEmpty()) {
+            int unfinished = firstUnfinishedRasterIndex(Math.clamp(
+                rasterCursor,
+                0,
+                orderedBuildTargets.size()
+            ));
+            rasterRestockResumeRouteIndex = unfinished
+                < orderedBuildTargets.size()
+                ? rasterBuildRoutePlan.replayIndexFor(
+                    orderedBuildTargets.get(unfinished),
+                    RASTER_ROUTE_REJOIN_REPLAY_POINTS
+                )
+                : Math.clamp(
+                    rasterRouteCursor,
+                    0,
+                    rasterBuildRoutePlan.points().size() - 1
+                );
+        } else {
+            rasterRestockResumeRouteIndex = -1;
+        }
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity) {
+            rasterSavedRouteCursor = rasterRouteCursor;
+        }
+        rasterRestockExteriorAcquired = false;
+        rasterRestockPhase = mc.player.getVehicle() instanceof AbstractBoatEntity
+            ? RasterRestockPhase.EGRESS_ROUTE
+            : RasterRestockPhase.WALK_SOURCE;
+        rasterResumeAfterMount = State.RasterRestock;
+        enterRasterState(
+            State.RasterRestock,
+            "restocking " + material.getName().getString()
+        );
+    }
+
+    private void runRasterRestock() {
+        if (rasterRestockSource == null || rasterRestockMaterial == null) {
+            failBoatRaster("restock checkpoint lost its source or material");
+            return;
+        }
+        if (mc.player.getVehicle() instanceof AbstractBoatEntity
+            && rasterRestockPhase == RasterRestockPhase.WALK_SOURCE) {
+            rasterWalkPath.clear();
+            rasterWalkPathTarget = null;
+            rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
+            rasterStatus = "mounted checkpoint corrected to flat logistics flight";
+            return;
+        }
+        Vec3d approach = rasterRestockSource.getRight();
+        switch (rasterRestockPhase) {
+            case EGRESS_ROUTE -> {
+                if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+                    rasterResumeAfterMount = State.RasterRestock;
+                    enterRasterState(
+                        State.RasterMountBoat,
+                        "remounting before compiled-route logistics egress"
+                    );
+                    return;
+                }
+                if (!validateRasterCompiledRouteBatch(boat)) return;
+                int retained = Math.clamp(
+                    rasterSavedRouteCursor,
+                    0,
+                    rasterBuildRoutePlan.points().size() - 1
+                );
+                List<RasterBuildRoutePlan.Point<BlockPos>> forward =
+                    rasterBuildRoutePlan.forwardEgressAlongRoute(retained);
+                if (forward.isEmpty()) {
+                    failBoatRaster(
+                        "forward row egress produced no exterior logistics checkpoint"
+                    );
+                    return;
+                }
+                Vec3d anchor = rasterRouteVehiclePose(
+                    boat,
+                    forward.getLast()
+                );
+                ArrayList<Vec3d> egress = new ArrayList<>();
+                Vec3d retainedPose = rasterRouteVehiclePose(
+                    boat,
+                    rasterBuildRoutePlan.points().get(retained)
+                );
+                appendRasterWorldWaypoint(
+                    egress,
+                    retainedPose
+                );
+                for (RasterBuildRoutePlan.Point<BlockPos> point : forward) {
+                    appendRasterWorldWaypoint(
+                        egress,
+                        rasterRouteVehiclePose(boat, point)
+                    );
+                }
+                RasterSetPathStatus status = driveRasterFixedSetPath(
+                    boat,
+                    anchor,
+                    egress,
+                    BoatFlyAdapter.DriveMode.TRAVEL,
+                    "finishing forward lateral egress before logistics"
+                );
+                if (status == RasterSetPathStatus.ARRIVED) {
+                    rasterBoatPath.clear();
+                    rasterBoatPathTarget = null;
+                    resetRasterBoatPathProgress();
+                    rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
+                    rasterPhaseStartedTick = clientActionTick;
+                }
+            }
+            case TRAVEL_SOURCE -> {
+                if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+                    rasterResumeAfterMount = State.RasterRestock;
+                    enterRasterState(
+                        State.RasterMountBoat,
+                        "remounting boat before safe logistics landing"
+                    );
+                    return;
+                }
+                rasterBoatPosition = boat.getBlockPos();
+                if (rasterRestockLanding == null) {
+                    rasterRestockLanding = selectRasterRestockLanding(boat);
+                    if (rasterRestockLanding == null) {
+                        failBoatRaster(
+                            "no supported, rider-clear logistics landing connects the dump station to the restock source"
+                        );
+                        return;
+                    }
+                    rasterBoatPath.clear();
+                    rasterBoatPathTarget = null;
+                    cancelRasterEntryRouteSearch();
+                    resetRasterBoatPathProgress();
+                }
+                RasterLogisticsRouteStatus route =
+                    driveRasterExteriorLogisticsRoute(
+                        boat,
+                        rasterRestockLanding,
+                        false
+                    );
+                if (route == RasterLogisticsRouteStatus.REJECTED) {
+                    rasterRejectedRestockLandings.add(
+                        BlockPos.ofFloored(rasterRestockLanding)
+                    );
+                    rasterRestockLandingFailures++;
+                    rasterRestockLanding = null;
+                    rasterRestockDismountCell = null;
+                    if (rasterRestockLandingFailures
+                        >= RASTER_RESTOCK_MAX_LANDING_FAILURES) {
+                        failBoatRaster(
+                            "no complete collision-free route to a safe logistics landing after "
+                                + rasterRestockLandingFailures
+                                + " bounded alternatives"
+                        );
+                    } else {
+                        rasterStatus = "selecting another supported logistics landing";
+                    }
+                    return;
+                }
+                if (route == RasterLogisticsRouteStatus.ARRIVED) {
+                    rasterRestockPhase = RasterRestockPhase.DISEMBARK;
+                    rasterPhaseStartedTick = clientActionTick;
+                }
+            }
+            case DISEMBARK -> {
+                if (mc.player.getVehicle() instanceof AbstractBoatEntity boat) {
+                    if (rasterRestockLanding == null
+                        || rasterRestockDismountCell == null
+                        || !isRasterBoatLandingPoseSafe(
+                            boat,
+                            BlockPos.ofFloored(rasterRestockLanding)
+                        )
+                        || !isRasterWalkCellSafe(new RasterVoxelPathfinder.Cell(
+                            rasterRestockDismountCell.getX(),
+                            rasterRestockDismountCell.getY(),
+                            rasterRestockDismountCell.getZ()
+                        ))) {
+                        if (rasterRestockLanding != null) {
+                            rasterRejectedRestockLandings.add(
+                                BlockPos.ofFloored(rasterRestockLanding)
+                            );
+                        }
+                        rasterRestockLanding = null;
+                        rasterRestockDismountCell = null;
+                        rasterRestockLandingFailures++;
+                        rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
+                        rasterRestockDismountRequestedTick = -1000L;
+                        return;
+                    }
+                    if (rasterRestockDismountRequestedTick < 0L) {
+                        rasterBoatPosition = boat.getBlockPos();
+                        mc.player.setYaw((float) Rotations.getYaw(
+                            rasterRestockDismountCell.toCenterPos()
+                        ));
+                        // Restore normal Entity Control settings before asking
+                        // Minecraft to choose and perform its vanilla dismount.
+                        // The landed boat remains untouched until the server's
+                        // resulting player position is settled and verified.
+                        boatFlyAdapter.release();
+                        mc.player.dismountVehicle();
+                        rasterRestockDismountRequestedTick = clientActionTick;
+                        rasterStatus = "waiting for vanilla dismount to settle before breaking boat";
+                    } else if (clientActionTick
+                        - rasterRestockDismountRequestedTick > 30L) {
+                        failBoatRaster(
+                            "vanilla dismount request was not acknowledged after 30 ticks"
+                        );
+                    } else {
+                        rasterStatus = "waiting for vanilla dismount acknowledgement";
+                    }
+                    return;
+                }
+                long dismountAge = clientActionTick
+                    - rasterRestockDismountRequestedTick;
+                if (rasterRestockDismountRequestedTick < 0L
+                    || dismountAge < 4L) {
+                    stopMovement();
+                    rasterStatus = "waiting for authoritative vanilla dismount position";
+                    return;
+                }
+                RasterVoxelPathfinder.Cell current =
+                    new RasterVoxelPathfinder.Cell(
+                        mc.player.getBlockX(),
+                        mc.player.getBlockY(),
+                        mc.player.getBlockZ()
+                    );
+                if (!isRasterWalkCellSafe(current)) {
+                    stopMovement();
+                    if (dismountAge <= 30L) {
+                        rasterStatus = "waiting for vanilla floor collision to settle after dismount";
+                        return;
+                    }
+                    failBoatRaster(
+                        "vanilla dismount did not settle on a supported clear walk cell after 30 ticks"
+                    );
+                    return;
+                }
+                rasterWalkPath.clear();
+                rasterWalkPathTarget = null;
+                rasterRestockBoatCountBefore = playerBoatItemCount();
+                rasterRestockBoatBreakLastAttemptTick = -1000L;
+                rasterRestockDismountRequestedTick = -1000L;
+                rasterRestockPhase = RasterRestockPhase.BREAK_BOAT;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case BREAK_BOAT -> {
+                AbstractBoatEntity boat = findRasterBoatNear(rasterBoatPosition);
+                if (boat == null) {
+                    rasterRestockPhase = RasterRestockPhase.COLLECT_BOAT;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                if (mc.player.squaredDistanceTo(boat) > 3.5 * 3.5) {
+                    rasterWaypoint = boat.getEntityPos();
+                    drivePlayerToward(boat.getEntityPos());
+                    rasterStatus = "approaching landed boat for autonomous recovery";
+                    return;
+                }
+                stopMovement();
+                if (clientActionTick - rasterRestockBoatBreakLastAttemptTick >= 3L) {
+                    rasterRestockBoatBreakLastAttemptTick = clientActionTick;
+                    mc.interactionManager.attackEntity(mc.player, boat);
+                    mc.player.swingHand(Hand.MAIN_HAND);
+                    rasterStatus = "breaking landed boat before logistics";
+                }
+                if (clientActionTick - rasterPhaseStartedTick > 120L) {
+                    failBoatRaster("landed restock boat could not be broken after bounded autonomous attempts");
+                }
+            }
+            case COLLECT_BOAT -> {
+                if (playerBoatItemCount() > rasterRestockBoatCountBefore) {
+                    rasterWalkPath.clear();
+                    rasterWalkPathTarget = null;
+                    rasterRestockPhase = RasterRestockPhase.WALK_DUMP;
+                    rasterPhaseStartedTick = clientActionTick;
+                    rasterStatus = "recovered boat item; continuing logistics";
+                    return;
+                }
+                ItemEntity droppedBoat = findDroppedRasterBoatItem();
+                if (droppedBoat != null) {
+                    rasterWaypoint = droppedBoat.getEntityPos();
+                    drivePlayerToward(droppedBoat.getEntityPos());
+                    rasterStatus = "collecting recovered boat item";
+                } else {
+                    stopMovement();
+                    rasterStatus = "waiting for recovered boat item entity";
+                }
+                if (clientActionTick - rasterPhaseStartedTick > 120L) {
+                    failBoatRaster("broken restock boat item was not authoritatively collected");
+                }
+            }
+            case WALK_DUMP -> {
+                Vec3d dump = dumpStation.getLeft();
+                if (mc.player.getEntityPos().distanceTo(dump) > 0.70) {
+                    rasterWaypoint = dump;
+                    drivePlayerToward(dump);
+                    return;
+                }
+                stopMovement();
+                mc.player.setYaw(dumpStation.getRight().getLeft());
+                mc.player.setPitch(dumpStation.getRight().getRight());
+                rasterRestockPhase = RasterRestockPhase.DISCARD_EXCESS;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case DISCARD_EXCESS -> {
+                if (!runRasterRestockDisposal()) return;
+                // Disposal changes the real slot topology. Recompute now so
+                // this trip fills every newly available route-ordered stack
+                // while RasterInventoryRunPlanner still reserves one empty
+                // logistics slot.
+                planRasterInventoryFill();
+                Optional<Item> fullestMaterial =
+                    nextRasterInventoryFillMaterial();
+                if (fullestMaterial.isPresent()) {
+                    scheduleRasterRestock(
+                        fullestMaterial.orElseThrow(),
+                        false
+                    );
+                    return;
+                }
+                rasterWalkPath.clear();
+                rasterWalkPathTarget = null;
+                rasterRestockPhase = RasterRestockPhase.WALK_SOURCE;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case WALK_SOURCE -> {
+                if (mc.player.getEntityPos().distanceTo(approach) > 0.70) {
+                    rasterWaypoint = approach;
+                    drivePlayerToward(approach);
+                    return;
+                }
+                stopMovement();
+                rasterRestockPhase = RasterRestockPhase.OPEN_SOURCE;
+            }
+            case OPEN_SOURCE -> {
+                if (!rasterRestockActionReady()) return;
+                interactRasterContainer(rasterRestockSource.getLeft());
+                rasterRestockPhase = RasterRestockPhase.WAIT_SOURCE;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case WAIT_SOURCE -> retryRasterContainerOpen(
+                RasterRestockPhase.OPEN_SOURCE,
+                "source material chest"
+            );
+            case WITHDRAW_SENT -> {
+                if (rasterRestockQueuedSourceSlot >= 0) {
+                    if (!rasterRestockActionReady()) return;
+                    if (mc.player.currentScreenHandler.syncId
+                        != rasterRestockQueuedSyncId) {
+                        rasterRestockQueuedSourceSlot = -1;
+                        rasterRestockQueuedSyncId = -1;
+                        retryRasterPhaseOrFail(
+                            RasterRestockPhase.OPEN_SOURCE,
+                            "source handler changed before the paced shulker withdrawal"
+                        );
+                        return;
+                    }
+                    Utils.performAuthoritativeInventoryClick(
+                        rasterRestockQueuedSyncId,
+                        rasterRestockQueuedSourceSlot,
+                        1,
+                        SlotActionType.QUICK_MOVE
+                    );
+                    rasterRestockQueuedSourceSlot = -1;
+                    rasterRestockQueuedSyncId = -1;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                if (findInventoryShulker(rasterRestockMaterial, false).found()) {
+                    mc.player.closeHandledScreen();
+                    rasterStagingBlock = selectRasterStagingBlock(approach);
+                    if (rasterStagingBlock == null) {
+                        failBoatRaster("no safe temporary shulker staging cell near "
+                            + rasterRestockSource.getLeft().toShortString());
+                        return;
+                    }
+                    rasterRestockPhase = RasterRestockPhase.PLACE_STAGING;
+                    rasterPhaseStartedTick = clientActionTick;
+                } else if (clientActionTick - rasterPhaseStartedTick > 60) {
+                    retryRasterPhaseOrFail(
+                        RasterRestockPhase.OPEN_SOURCE,
+                        "shulker withdrawal was not confirmed"
+                    );
+                }
+            }
+            case PLACE_STAGING -> {
+                if (mc.world.getBlockState(rasterStagingBlock).getBlock()
+                    instanceof ShulkerBoxBlock) {
+                    rasterRestockPhase = RasterRestockPhase.OPEN_STAGING;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                if (!BlockUtils.canPlace(rasterStagingBlock)) {
+                    BlockPos replacement = selectRasterStagingBlock(approach);
+                    if (replacement == null) {
+                        failBoatRaster("no currently placeable temporary shulker staging cell near "
+                            + rasterRestockSource.getLeft().toShortString());
+                        return;
+                    }
+                    if (!replacement.equals(rasterStagingBlock)) {
+                        Addon.LOG.info(
+                            "[Fullblock Printer] Boat Raster reselected staging block {} -> {}",
+                            rasterStagingBlock,
+                            replacement
+                        );
+                        rasterStagingBlock = replacement;
+                        rasterPhaseStartedTick = clientActionTick;
+                    }
+                }
+                if (mc.player.getEyePos().squaredDistanceTo(rasterStagingBlock.toCenterPos())
+                    > 25.0) {
+                    drivePlayerToward(
+                        rasterStagingBlock.toCenterPos().add(0, 1.5, 0)
+                    );
+                    return;
+                }
+                stopMovement();
+                var shulker = findInventoryShulker(rasterRestockMaterial, false);
+                if (!shulker.found()) {
+                    failBoatRaster("withdrawn material shulker disappeared before staging");
+                    return;
+                }
+                if (!rasterRestockActionReady()) return;
+                int slot = shulker.slot();
+                if (slot > 8) {
+                    markRasterSwapSourceManaged(slot);
+                    InvUtils.move().from(slot).toHotbar(rasterHotbarStagingSlot());
+                    return;
+                }
+                InvUtils.swap(slot, false);
+                ItemStack stack = mc.player.getInventory().getStack(slot);
+                Block shulkerBlock = ((BlockItem) stack.getItem()).getBlock();
+                if (submitPlacement(
+                    rasterStagingBlock,
+                    slot,
+                    BuildPlacementPolicy.Mode.ADJACENT,
+                    shulkerBlock
+                )) {
+                    rasterOwnedTemporaryBlocks.add(new BlockPos(rasterStagingBlock));
+                }
+                if (clientActionTick - rasterPhaseStartedTick > 80) {
+                    retryRasterPhaseOrFail(
+                        RasterRestockPhase.PLACE_STAGING,
+                        "shulker staging placement was not confirmed"
+                    );
+                }
+            }
+            case OPEN_STAGING -> {
+                if (!rasterRestockActionReady()) return;
+                interactRasterContainer(rasterStagingBlock);
+                rasterRestockPhase = RasterRestockPhase.WAIT_STAGING;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case WAIT_STAGING -> retryRasterContainerOpen(
+                RasterRestockPhase.OPEN_STAGING,
+                "staged material shulker"
+            );
+            case TRANSFER_SENT -> {
+                if (rasterRestockQueuedSourceSlot >= 0) {
+                    if (!rasterRestockActionReady()) return;
+                    if (mc.player.currentScreenHandler.syncId
+                        != rasterRestockQueuedSyncId) {
+                        retryRasterPhaseOrFail(
+                            RasterRestockPhase.OPEN_STAGING,
+                            "staged shulker handler changed before the authoritative transfer"
+                        );
+                        rasterRestockQueuedSourceSlot = -1;
+                        rasterRestockQueuedSyncId = -1;
+                        return;
+                    }
+                    Utils.performAuthoritativeInventoryClick(
+                        rasterRestockQueuedSyncId,
+                        rasterRestockQueuedSourceSlot,
+                        1,
+                        SlotActionType.QUICK_MOVE
+                    );
+                    rasterRestockQueuedSourceSlot = -1;
+                    rasterRestockQueuedSyncId = -1;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                if (clientActionTick - rasterPhaseStartedTick
+                    >= RASTER_CONTAINER_CLOSE_SETTLE_TICKS) {
+                    mc.player.closeHandledScreen();
+                    rasterRestockConfirmationReopen = true;
+                    rasterRestockPhase = RasterRestockPhase.OPEN_STAGING;
+                    rasterPhaseStartedTick = clientActionTick;
+                }
+            }
+            case BREAK_STAGING -> {
+                if (mc.world.getBlockState(rasterStagingBlock).isAir()) {
+                    Addon.LOG.info(
+                        "[Fullblock Printer] Boat Raster confirmed staged shulker broken at {} after {} progressive mining ticks",
+                        rasterStagingBlock,
+                        rasterStagingBreakProgressTicks
+                    );
+                    rasterOwnedTemporaryBlocks.remove(rasterStagingBlock);
+                    rasterRestockPhase = RasterRestockPhase.COLLECT_STAGING;
+                    rasterPhaseStartedTick = clientActionTick;
+                    rasterStagingBreakProgressTicks = 0;
+                    rasterStagingBreakFirstDispatchTick = -1L;
+                    rasterStagingBreakLastDispatchTick = -1000L;
+                    return;
+                }
+                if (moveOffRasterTemporaryBlockIfNeeded(
+                        rasterStagingBlock,
+                        "staged restock shulker"
+                    )) {
+                    return;
+                }
+                if (mc.player.getEyePos().squaredDistanceTo(rasterStagingBlock.toCenterPos())
+                    > 25.0) {
+                    drivePlayerToward(
+                        rasterStagingBlock.toCenterPos().add(0, 1.5, 0)
+                    );
+                    return;
+                }
+                stopMovement();
+                BlockState stagingState = mc.world.getBlockState(rasterStagingBlock);
+                if (!(stagingState.getBlock() instanceof ShulkerBoxBlock)) {
+                    failBoatRaster(
+                        "refusing to mine unexpected staging block "
+                            + stagingState.getBlock().getName().getString()
+                            + " at " + rasterStagingBlock.toShortString()
+                    );
+                    return;
+                }
+                int toolSlot = findBestCarriedRasterTool(stagingState);
+                if (toolSlot > 8) {
+                    markRasterSwapSourceManaged(toolSlot);
+                    InvUtils.move().from(toolSlot).toHotbar(rasterHotbarStagingSlot());
+                    return;
+                }
+                if (toolSlot >= 0) InvUtils.swap(toolSlot, false);
+                if (clientActionTick - rasterPhaseStartedTick
+                    < rasterRestockActionDelayTicks()) return;
+                // A shulker is not always an instant break. BlockUtils must be
+                // continued every client tick or vanilla discards its partial
+                // mining progress. The old code reset phaseStartedTick after
+                // every dispatch, which reduced this to one isolated hit per
+                // restock-action delay and could therefore wait forever.
+                ((IClientPlayerInteractionManager) mc.interactionManager)
+                    .setBlockBreakingCooldown(0);
+                boolean dispatched = BlockUtils.breakBlock(
+                    rasterStagingBlock,
+                    true
+                );
+                if (dispatched) {
+                    if (rasterStagingBreakFirstDispatchTick < 0L) {
+                        rasterStagingBreakFirstDispatchTick = clientActionTick;
+                        Addon.LOG.info(
+                            "[Fullblock Printer] Boat Raster started continuous staged-shulker mining at {} with {}",
+                            rasterStagingBlock,
+                            toolSlot >= 0
+                                ? mc.player.getInventory().getStack(toolSlot).getName().getString()
+                                : "the held item"
+                        );
+                    }
+                    rasterStagingBreakLastDispatchTick = clientActionTick;
+                    rasterStagingBreakProgressTicks++;
+                } else if (rasterStagingBreakLastDispatchTick >= 0L
+                    && clientActionTick - rasterStagingBreakLastDispatchTick > 10L) {
+                    Addon.LOG.warn(
+                        "[Fullblock Printer] Boat Raster lost staged-shulker mining progress at {}; continuing from the current legal position",
+                        rasterStagingBlock
+                    );
+                    rasterStagingBreakLastDispatchTick = clientActionTick;
+                }
+                if (rasterStagingBreakFirstDispatchTick >= 0L
+                    && clientActionTick - rasterStagingBreakFirstDispatchTick
+                        > RASTER_STAGING_BREAK_WATCHDOG_TICKS) {
+                    rasterStagingBreakProgressTicks = 0;
+                    rasterStagingBreakFirstDispatchTick = -1L;
+                    rasterStagingBreakLastDispatchTick = -1000L;
+                    retryRasterPhaseOrFail(
+                        RasterRestockPhase.BREAK_STAGING,
+                        "staged shulker remained solid after continuous mining watchdog"
+                    );
+                    return;
+                }
+                rasterStatus = "continuous mining of staged shulker ("
+                    + rasterStagingBreakProgressTicks + " ticks)";
+            }
+            case COLLECT_STAGING -> {
+                if (findInventoryRestockShulker().found()) {
+                    stopMovement();
+                    rasterRestockAttempts = 0;
+                    rasterRestockPhase = RasterRestockPhase.RETURN_SOURCE;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                ItemEntity dropped = findDroppedRasterRestockShulker();
+                Vec3d pickup = dropped == null
+                    ? rasterStagingBlock.toCenterPos()
+                    : dropped.getEntityPos();
+                double horizontalDistance = Math.hypot(
+                    mc.player.getX() - pickup.x,
+                    mc.player.getZ() - pickup.z
+                );
+                if (horizontalDistance > 0.40) {
+                    drivePlayerToward(pickup);
+                    rasterStatus = dropped == null
+                        ? "moving onto broken shulker staging cell"
+                        : "collecting dropped restock shulker";
+                } else {
+                    // Keep nudging through the entity instead of stopping on
+                    // the edge of its pickup box. This also recovers drops that
+                    // settle a few tenths of a block away from the cell center.
+                    Vec3d pickupNudge = new Vec3d(
+                        pickup.x,
+                        mc.player.getY(),
+                        pickup.z
+                    );
+                    drivePlayerToward(pickupNudge);
+                    rasterStatus = "nudging through dropped shulker until inventory confirmation";
+                }
+                if (clientActionTick - rasterPhaseStartedTick > 400) {
+                    failBoatRaster("broken restock shulker was not recovered after walking onto its drop");
+                }
+            }
+            case RETURN_SOURCE -> {
+                if (mc.player.getEntityPos().distanceTo(approach) > 0.70) {
+                    drivePlayerToward(approach);
+                    return;
+                }
+                stopMovement();
+                rasterRestockPhase = RasterRestockPhase.OPEN_RETURN;
+            }
+            case OPEN_RETURN -> {
+                if (!rasterRestockActionReady()) return;
+                interactRasterContainer(rasterRestockSource.getLeft());
+                rasterRestockPhase = RasterRestockPhase.WAIT_RETURN;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            case WAIT_RETURN -> retryRasterContainerOpen(
+                RasterRestockPhase.OPEN_RETURN,
+                "source chest for shulker return"
+            );
+            case DEPOSIT_SENT -> {
+                if (rasterRestockQueuedSourceSlot >= 0) {
+                    if (!rasterRestockActionReady()) return;
+                    if (mc.player.currentScreenHandler.syncId
+                        != rasterRestockQueuedSyncId) {
+                        rasterRestockQueuedSourceSlot = -1;
+                        rasterRestockQueuedSyncId = -1;
+                        retryRasterPhaseOrFail(
+                            RasterRestockPhase.OPEN_RETURN,
+                            "source handler changed before the paced shulker return"
+                        );
+                        return;
+                    }
+                    Utils.performAuthoritativeInventoryClick(
+                        rasterRestockQueuedSyncId,
+                        rasterRestockQueuedSourceSlot,
+                        1,
+                        SlotActionType.QUICK_MOVE
+                    );
+                    rasterRestockQueuedSourceSlot = -1;
+                    rasterRestockQueuedSyncId = -1;
+                    rasterPhaseStartedTick = clientActionTick;
+                    return;
+                }
+                if (clientActionTick - rasterPhaseStartedTick
+                    >= RASTER_CONTAINER_CLOSE_SETTLE_TICKS) {
+                    mc.player.closeHandledScreen();
+                    rasterRestockReturnConfirmationReopen = true;
+                    rasterRestockPhase = RasterRestockPhase.OPEN_RETURN;
+                    rasterPhaseStartedTick = clientActionTick;
+                }
+            }
+            case REJOIN_ROUTE -> runRasterRestockRejoinRoute();
+            case NONE -> failBoatRaster("restock state machine was not initialized");
+        }
+    }
+
+    private boolean runRasterRestockDisposal() {
+        RasterVoxelPathfinder.Cell current = new RasterVoxelPathfinder.Cell(
+            mc.player.getBlockX(),
+            mc.player.getBlockY(),
+            mc.player.getBlockZ()
+        );
+        if (!isRasterWalkCellSafe(current)) {
+            failBoatRaster(
+                "restock disposal stance lost solid support or player head clearance"
+            );
+            return false;
+        }
+        mc.player.setYaw(dumpStation.getRight().getLeft());
+        mc.player.setPitch(dumpStation.getRight().getRight());
+
+        if (rasterRestockDiscardPendingSlot >= 0) {
+            ItemStack observed = mc.player.getInventory().getStack(
+                rasterRestockDiscardPendingSlot
+            );
+            if (observed.isEmpty()
+                || observed.getItem() != rasterRestockDiscardPendingItem
+                || observed.getCount() < rasterRestockDiscardPendingCount) {
+                rasterRestockDiscardPendingSlot = -1;
+                rasterRestockDiscardPendingItem = null;
+                rasterRestockDiscardPendingCount = 0;
+                rasterRestockDiscardAttempts = 0;
+                rasterRestockDiscardedStacks++;
+                rasterStatus = "confirmed discarded surplus map-material stack";
+                return false;
+            }
+            if (clientActionTick - rasterRestockDiscardSubmittedTick <= 40) {
+                rasterStatus = "waiting for discarded stack confirmation";
+                return false;
+            }
+            rasterRestockDiscardAttempts++;
+            if (rasterRestockDiscardAttempts > 3) {
+                failBoatRaster(
+                    "surplus map-material stack was not authoritatively discarded after bounded retries"
+                );
+                return false;
+            }
+            InvUtils.drop().slot(rasterRestockDiscardPendingSlot);
+            rasterRestockDiscardSubmittedTick = clientActionTick;
+            rasterStatus = "retrying paced surplus-stack disposal";
+            return false;
+        }
+
+        LinkedHashSet<Item> managedMaterials = buildTargets.values().stream()
+            .map(Block::asItem)
+            .filter(item -> {
+                if (!(item instanceof BlockItem blockItem)) return true;
+                return !(blockItem.getBlock() instanceof ShulkerBoxBlock);
+            })
+            .collect(Collectors.toCollection(LinkedHashSet::new));
+        ArrayList<RasterRestockDiscardPlanner.Slot<Item>> inventory =
+            new ArrayList<>(36);
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            inventory.add(stack.isEmpty()
+                ? RasterRestockDiscardPlanner.Slot.empty()
+                : new RasterRestockDiscardPlanner.Slot<>(
+                    stack.getItem(), stack.getCount()
+                ));
+        }
+        Map<Item, Integer> protectedCounts =
+            rasterRestockProtectedMaterialCounts(managedMaterials);
+        List<Integer> discardSlots = RasterRestockDiscardPlanner.selectSlots(
+            inventory,
+            managedMaterials,
+            protectedCounts
+        );
+        if (discardSlots.isEmpty()) {
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster ground disposal complete: {} surplus stacks discarded; tools, boat, shulkers, and {} immediate-run material types retained",
+                rasterRestockDiscardedStacks,
+                protectedCounts.size()
+            );
+            return true;
+        }
+        if (!rasterRestockActionReady()) {
+            rasterStatus = "pacing selective ground disposal";
+            return false;
+        }
+        int slot = discardSlots.getFirst();
+        ItemStack stack = mc.player.getInventory().getStack(slot);
+        rasterRestockDiscardPendingSlot = slot;
+        rasterRestockDiscardPendingItem = stack.getItem();
+        rasterRestockDiscardPendingCount = stack.getCount();
+        rasterRestockDiscardSubmittedTick = clientActionTick;
+        InvUtils.drop().slot(slot);
+        rasterStatus = "discarding surplus "
+            + stack.getItem().getName().getString();
+        return false;
+    }
+
+    private Map<Item, Integer> rasterRestockProtectedMaterialCounts(
+        Set<Item> managedMaterials
+    ) {
+        HashMap<Item, Integer> remainingDemand = new HashMap<>();
+        int start = firstUnfinishedRasterIndex(Math.max(
+            0,
+            Math.min(rasterConfirmedFrontier, orderedBuildTargets.size())
+        ));
+        for (int index = start; index < orderedBuildTargets.size(); index++) {
+            BlockPos relative = orderedBuildTargets.get(index);
+            if (isRasterTargetAuthoritativelyConfirmed(relative)) continue;
+            Block expected = buildTargets.get(relative);
+            if (expected != null) {
+                remainingDemand.merge(expected.asItem(), 1, Integer::sum);
+            }
+        }
+        LinkedHashMap<Item, Integer> protectedCounts = new LinkedHashMap<>();
+        for (Item material : managedMaterials) {
+            int carried = playerItemCount(material);
+            int immediateRunNeed = rasterInventoryRunKeepCounts.getOrDefault(
+                material,
+                0
+            );
+            int keep = Math.min(carried, immediateRunNeed);
+            if (remainingDemand.getOrDefault(material, 0) > 0) {
+                keep = Math.max(keep, Math.min(1, carried));
+            }
+            if (keep > 0) protectedCounts.put(material, keep);
+        }
+        return Map.copyOf(protectedCounts);
+    }
+
+    private void runRasterRestockRejoinRoute() {
+        if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            rasterResumeAfterMount = State.RasterRestock;
+            enterRasterState(
+                State.RasterMountBoat,
+                "remounting before compiled-route rejoin"
+            );
+            return;
+        }
+        if (!validateRasterCompiledRouteBatch(boat)) return;
+        int replay = rasterRestockResumeRouteIndex >= 0
+            ? Math.clamp(
+                rasterRestockResumeRouteIndex,
+                0,
+                rasterBuildRoutePlan.points().size() - 1
+            )
+            : rasterBuildRoutePlan.replayIndex(
+                rasterSavedRouteCursor,
+                RASTER_ROUTE_REJOIN_REPLAY_POINTS
+            );
+        RasterBuildRoutePlan.Point<BlockPos> anchorPoint =
+            rasterBuildRoutePlan.previousExteriorAccess(replay);
+        Vec3d anchor = rasterRouteVehiclePose(boat, anchorPoint);
+        if (!rasterRestockExteriorAcquired) {
+            RasterLogisticsRouteStatus route =
+                driveRasterExteriorLogisticsRoute(boat, anchor, true);
+            if (route == RasterLogisticsRouteStatus.REJECTED) {
+                failBoatRaster(
+                    "logistics path could not return the boat to the retained route's exterior anchor"
+                );
+                return;
+            }
+            if (route != RasterLogisticsRouteStatus.ARRIVED) return;
+            rasterRestockExteriorAcquired = true;
+            rasterBoatPath.clear();
+            rasterBoatPathTarget = null;
+            cancelRasterEntryRouteSearch();
+            resetRasterBoatPathProgress();
+        }
+
+        ArrayList<Vec3d> entry = new ArrayList<>();
+        Vec3d retained = rasterRouteVehiclePose(
+            boat,
+            rasterBuildRoutePlan.points().get(replay)
+        );
+        appendRasterWorldWaypoint(entry, anchor);
+        for (RasterBuildRoutePlan.Point<BlockPos> point
+            : rasterBuildRoutePlan.entryAlongRoute(replay)) {
+            appendRasterWorldWaypoint(
+                entry,
+                rasterRouteVehiclePose(boat, point)
+            );
+        }
+        appendRasterWorldWaypoint(entry, retained);
+        RasterSetPathStatus status = driveRasterFixedSetPath(
+            boat,
+            retained,
+            entry,
+            BoatFlyAdapter.DriveMode.TRAVEL,
+            "replaying compiled exterior entry after restock"
+        );
+        if (status != RasterSetPathStatus.ARRIVED) return;
+
+        rasterRouteCursor = replay;
+        rasterRouteRejoinCursor = replay;
+        rasterRouteRejoinPending = false;
+        rasterRouteRejoinSnapshotAccepted = false;
+        rasterPrintCorridorAcquired = true;
+        resetRasterCompiledRouteProgress();
+        clearRasterRestockTransaction();
+        rasterReturningToParkedBoat = false;
+        enterRasterState(
+            State.RasterPrinting,
+            "restock complete; retained route replay resumed"
+        );
+    }
+
+    private void clearRasterRestockTransaction() {
+        rasterRestockPhase = RasterRestockPhase.NONE;
+        rasterRestockMaterial = null;
+        rasterRestockShulkerItem = null;
+        rasterRestockSource = null;
+        rasterStagingBlock = null;
+        rasterRestockSyncId = -1;
+        rasterRestockTargetPlayerCount = 0;
+        rasterRestockTransferBeforePlayerCount = 0;
+        rasterRestockContainerSlots = 0;
+        rasterRestockQueuedSourceSlot = -1;
+        rasterRestockQueuedSyncId = -1;
+        rasterStagingBreakProgressTicks = 0;
+        rasterStagingBreakFirstDispatchTick = -1L;
+        rasterStagingBreakLastDispatchTick = -1000L;
+        rasterLastRestockActionTick = -1000L;
+        rasterRestockConfirmationReopen = false;
+        rasterRestockReturnConfirmationReopen = false;
+        rasterRestockPlayerMaterialSlots.clear();
+        rasterRestockPlayerShulkerSlots.clear();
+        rasterRestockBeforeDeployment = false;
+        rasterRestockExteriorAcquired = false;
+        rasterRestockBoatCountBefore = 0;
+        rasterRestockBoatBreakLastAttemptTick = -1000L;
+        rasterRestockResumeRouteIndex = -1;
+        resetRasterRestockLandingState();
+    }
+
+    private int rasterRestockActionDelayTicks() {
+        return boatRasterRestockActionDelay.get();
+    }
+
+    private boolean rasterRestockActionReady() {
+        int delay = rasterRestockActionDelayTicks();
+        if (clientActionTick - rasterPhaseStartedTick < delay
+            || clientActionTick - rasterLastRestockActionTick < delay) {
+            return false;
+        }
+        rasterLastRestockActionTick = clientActionTick;
+        return true;
+    }
+
+    private void interactRasterContainer(BlockPos position) {
+        lastInteractedChest = position;
+        mc.interactionManager.interactBlock(
+            mc.player,
+            Hand.MAIN_HAND,
+            new BlockHitResult(position.toCenterPos(), Direction.UP, position, false)
+        );
+    }
+
+    private void retryRasterContainerOpen(
+        RasterRestockPhase retry,
+        String description
+    ) {
+        if (clientActionTick - rasterPhaseStartedTick <= 80) return;
+        retryRasterPhaseOrFail(retry, description + " did not open");
+    }
+
+    private void retryRasterPhaseOrFail(
+        RasterRestockPhase retry,
+        String reason
+    ) {
+        rasterRestockAttempts++;
+        Addon.LOG.warn(
+            "[Fullblock Printer] Boat Raster restock retry {}/3: {} | retryPhase={} | staging={} | player={} | selectedSlot={}",
+            rasterRestockAttempts,
+            reason,
+            retry,
+            rasterStagingBlock,
+            mc.player == null ? "unavailable" : mc.player.getEntityPos(),
+            mc.player == null ? -1 : mc.player.getInventory().getSelectedSlot()
+        );
+        if (rasterRestockAttempts > 3) {
+            failBoatRaster(reason + " after bounded retries");
+            return;
+        }
+        rasterRestockPhase = retry;
+        rasterPhaseStartedTick = clientActionTick;
+    }
+
+    private meteordevelopment.meteorclient.utils.player.FindItemResult
+        findInventoryShulker(Item material, boolean empty) {
+        return InvUtils.find(stack -> {
+            if (!(stack.getItem() instanceof BlockItem blockItem)
+                || !(blockItem.getBlock() instanceof ShulkerBoxBlock)) {
+                return false;
+            }
+            if (empty) {
+                return isEmptyShulker(stack)
+                    && (rasterRestockShulkerItem == null
+                        || stack.getItem() == rasterRestockShulkerItem);
+            }
+            if (rasterRestockShulkerItem != null
+                && stack.getItem() != rasterRestockShulkerItem) return false;
+            return singleMaterialShulker(stack)
+                .filter(item -> item == material)
+                .isPresent();
+        });
+    }
+
+    private meteordevelopment.meteorclient.utils.player.FindItemResult
+        findInventoryRestockShulker() {
+        return InvUtils.find(this::isCurrentRestockShulker);
+    }
+
+    private ItemEntity findDroppedRasterRestockShulker() {
+        if (rasterStagingBlock == null) return null;
+        Box search = new Box(rasterStagingBlock).expand(8.0, 4.0, 8.0);
+        return mc.world.getEntitiesByClass(
+            ItemEntity.class,
+            search,
+            entity -> entity.isAlive()
+                && isCurrentRestockShulker(entity.getStack())
+        ).stream().min(Comparator.comparingDouble(mc.player::squaredDistanceTo))
+            .orElse(null);
+    }
+
+    private boolean isCurrentRestockShulker(ItemStack stack) {
+        if (stack.isEmpty() || stack.getItem() != rasterRestockShulkerItem) {
+            return false;
+        }
+        if (!(stack.getItem() instanceof BlockItem blockItem)
+            || !(blockItem.getBlock() instanceof ShulkerBoxBlock)) {
+            return false;
+        }
+        return isEmptyShulker(stack)
+            || singleMaterialShulker(stack)
+                .filter(item -> item == rasterRestockMaterial)
+                .isPresent();
+    }
+
+    private BlockPos selectRasterStagingBlock(Vec3d approach) {
+        BlockPos origin = BlockPos.ofFloored(approach);
+        for (int radius = 1; radius <= 3; radius++) {
+            for (int dx = -radius; dx <= radius; dx++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
+                    BlockPos candidate = origin.add(dx, 0, dz);
+                    int relativeX = candidate.getX() - mapCorner.getX();
+                    int relativeZ = candidate.getZ() - mapCorner.getZ();
+                    if (relativeX >= -1 && relativeX <= 128
+                        && relativeZ >= -2 && relativeZ <= 128) continue;
+                    if (mc.world.getBlockState(candidate).isAir()
+                        && !mc.world.getBlockState(candidate.down()).isAir()
+                        && BlockUtils.canPlace(candidate)
+                        && !mc.player.getBoundingBox().intersects(new Box(candidate))) {
+                        Addon.LOG.info(
+                            "[Fullblock Printer] Boat Raster selected staging block {} (support={}, distance={})",
+                            candidate,
+                            mc.world.getBlockState(candidate.down()).getBlock().getName().getString(),
+                            String.format(Locale.ROOT, "%.2f", mc.player.getEyePos().distanceTo(candidate.toCenterPos()))
+                        );
+                        return candidate;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private void finishRasterRestock() {
+        if (playerItemCount(rasterRestockMaterial) <= rasterRestockMaterialBefore) {
+            failBoatRaster("restock finished without an authoritative material increase");
+            return;
+        }
+        boolean deployAfterRestock = rasterRestockBeforeDeployment;
+        rasterPrintCorridorAcquired = false;
+        rasterDescentWaypoint = null;
+        rasterCorrectionPending = false;
+        rasterResumeAfterMount = State.RasterPrinting;
+        Optional<Item> nextMaterial = nextRasterInventoryFillMaterial();
+        if (nextMaterial.isEmpty()) {
+            // A presence-only startup trip and whole-stack transfers can both
+            // change available capacity. Keep planning additional full stacks
+            // until no more fit with one slot reserved.
+            planRasterInventoryFill();
+            nextMaterial = nextRasterInventoryFillMaterial();
+        }
+        if (nextMaterial.isPresent()) {
+            clearRasterRestockTransaction();
+            scheduleRasterRestock(nextMaterial.orElseThrow(), deployAfterRestock);
+            return;
+        }
+        if (rasterEmptyInventorySlotCount() < 1) {
+            failBoatRaster(
+                "maximum restock completed without the required free logistics slot"
+            );
+            return;
+        }
+        rasterInventoryFillPlan.clear();
+        rasterInventoryRunKeepCounts.clear();
+        if (deployAfterRestock) {
+            clearRasterRestockTransaction();
+            // Logistics can leave the player on a different connected part of
+            // the platform. Re-select from the current position rather than
+            // trusting a launch chosen before the chest trips began.
+            rasterLaunchBlock = null;
+            resetRasterLaunchScaffoldProgress();
+            rasterWalkPath.clear();
+            rasterWalkPathTarget = null;
+            enterRasterState(State.RasterDeployBoat, "inventory-full restock complete; deploying boat");
+        } else {
+            rasterRestockPhase = RasterRestockPhase.REJOIN_ROUTE;
+            rasterRestockExteriorAcquired = false;
+            rasterReturningToParkedBoat = false;
+            rasterBoatPosition = null;
+            rasterLaunchBlock = null;
+            rasterBoatDeployAttempts = 0;
+            rasterBoatDeployLastAttemptTick = -1000L;
+            rasterBoatMountAttempts = 0;
+            rasterBoatMountTargetId = Integer.MIN_VALUE;
+            resetRasterLaunchScaffoldProgress();
+            rasterWalkPath.clear();
+            rasterWalkPathTarget = null;
+            rasterResumeAfterMount = State.RasterRestock;
+            enterRasterState(
+                State.RasterDeployBoat,
+                "inventory-full restock complete; redeploying recovered boat"
+            );
+        }
+    }
+
+    private int rasterEmptyInventorySlotCount() {
+        int empty = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            if (mc.player.getInventory().getStack(slot).isEmpty()) empty++;
+        }
+        return empty;
+    }
+
+    private void planRasterInventoryFill() {
+        planRasterInventoryFill(Set.of());
+    }
+
+    private Set<Item> planRasterInventoryFill(
+        Collection<Item> minimumPresentMaterials
+    ) {
+        rasterInventoryFillPlan.clear();
+        rasterInventoryRunKeepCounts.clear();
+        if (mc.player == null || orderedBuildTargets.isEmpty()) {
+            return Set.copyOf(minimumPresentMaterials);
+        }
+
+        ArrayList<RasterInventoryRunPlanner.Slot<Item>> inventory = new ArrayList<>(36);
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            inventory.add(stack.isEmpty()
+                ? RasterInventoryRunPlanner.Slot.empty()
+                : new RasterInventoryRunPlanner.Slot<>(
+                    stack.getItem(),
+                    stack.getCount(),
+                    stack.getMaxCount()
+                ));
+        }
+
+        int start = firstUnfinishedRasterIndex(Math.max(
+            0,
+            Math.min(rasterConfirmedFrontier, orderedBuildTargets.size())
+        ));
+        ArrayList<Item> unfinishedRoute = new ArrayList<>();
+        for (int index = start; index < orderedBuildTargets.size(); index++) {
+            BlockPos relative = orderedBuildTargets.get(index);
+            Block expected = buildTargets.get(relative);
+            if (expected == null || isRasterTargetAuthoritativelyConfirmed(relative)) {
+                continue;
+            }
+            unfinishedRoute.add(expected.asItem());
+        }
+        // While mounted the boat is an entity, but restocking now recovers it
+        // into inventory before opening staging shulkers. Reserve its future
+        // slot in addition to the normal logistics workspace slot.
+        int reservedEmptySlots = mc.player.getVehicle() instanceof AbstractBoatEntity
+            && playerBoatItemCount() == 0 ? 2 : 1;
+        RasterInventoryRunPlanner.Plan<Item> plan =
+            RasterInventoryRunPlanner.create(
+                inventory,
+                unfinishedRoute,
+                material -> material.getDefaultStack().getMaxCount(),
+                reservedEmptySlots,
+                minimumPresentMaterials
+            );
+
+        for (int index = 0;
+             index < plan.coveredTargets() && index < unfinishedRoute.size();
+             index++) {
+            rasterInventoryRunKeepCounts.merge(
+                unfinishedRoute.get(index),
+                1,
+                Integer::sum
+            );
+        }
+
+        int additionalBlocks = 0;
+        for (Map.Entry<Item, Integer> addition : plan.additions().entrySet()) {
+            int desiredCount = playerItemCount(addition.getKey()) + addition.getValue();
+            rasterInventoryFillPlan.put(addition.getKey(), desiredCount);
+            additionalBlocks += addition.getValue();
+        }
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster inventory-run plan: coveredTargets={}, additionalBlocks={}, materialTypes={}, reservedEmptySlots={}, missingMinimumTypes={}, desiredPlayerCounts={}",
+            plan.coveredTargets(),
+            additionalBlocks,
+            rasterInventoryFillPlan.size(),
+            reservedEmptySlots,
+            plan.missingMinimumMaterials().stream()
+                .map(item -> item.getName().getString())
+                .collect(Collectors.joining(", ")),
+            rasterInventoryFillPlan.entrySet().stream()
+                .map(entry -> entry.getKey().getName().getString() + "=" + entry.getValue())
+                .collect(Collectors.joining(", "))
+        );
+        return plan.missingMinimumMaterials();
+    }
+
+    private RasterInventoryRunPlanner.PresencePlan<Item>
+    planRasterStartupMaterialPresence() {
+        LinkedHashMap<Item, Integer> carried = new LinkedHashMap<>();
+        for (Item material : rasterMaterialDemand.keySet()) {
+            carried.put(material, playerItemCount(material));
+        }
+        RasterInventoryRunPlanner.PresencePlan<Item> presence =
+            RasterInventoryRunPlanner.minimumPresence(
+                rasterMaterialDemand.keySet(),
+                carried
+            );
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster startup material presence: ready={}, carriedTypes={}/{}, missing={}",
+            presence.ready(),
+            carried.values().stream().filter(count -> count > 0).count(),
+            carried.size(),
+            presence.missingMaterials().stream()
+                .map(item -> item.getName().getString())
+                .collect(Collectors.joining(", "))
+        );
+        return presence;
+    }
+
+    private Optional<Item> nextRasterInventoryFillMaterial() {
+        for (Map.Entry<Item, Integer> target : rasterInventoryFillPlan.entrySet()) {
+            if (playerItemCount(target.getKey()) < target.getValue()) {
+                return Optional.of(target.getKey());
+            }
+        }
+        return Optional.empty();
+    }
+
     private void startBuilding() {
+        startBoatRasterBuilding();
+    }
+
+    private record RasterTraversalCandidate(
+        String name,
+        List<BlockPos> targets,
+        List<RasterFlightPlan.Target> flightTargets,
+        List<RasterFlightPlan.Target> selectionFlightTargets,
+        RasterBuildRoutePlan.Plan<BlockPos> buildRoute,
+        int stripPassCount
+    ) {
+    }
+
+    private record CompiledRasterTraversal(
+        RasterTraversalCandidate candidate,
+        RasterFlightPlan.Plan flightPlan,
+        double selectionPathLength
+    ) {
+    }
+
+    private RasterTraversalCandidate createRasterTraversalCandidate(
+        boolean rows,
+        boolean outerAscending,
+        boolean firstInnerAscending
+    ) {
+        int minimumX = buildTargets.keySet().stream().mapToInt(BlockPos::getX).min().orElseThrow();
+        int maximumX = buildTargets.keySet().stream().mapToInt(BlockPos::getX).max().orElseThrow();
+        int minimumZ = buildTargets.keySet().stream().mapToInt(BlockPos::getZ).min().orElseThrow();
+        int maximumZ = buildTargets.keySet().stream().mapToInt(BlockPos::getZ).max().orElseThrow();
+        HashMap<Long, BlockPos> horizontal = new HashMap<>();
+        for (BlockPos target : buildTargets.keySet()) {
+            horizontal.put(
+                ((long) target.getX() << 32) ^ (target.getZ() & 0xffffffffL),
+                target
+            );
+        }
+
+        int outerMinimum = rows ? minimumZ : minimumX;
+        int outerMaximum = rows ? maximumZ : maximumX;
+        int innerMinimum = rows ? minimumX : minimumZ;
+        int innerMaximum = rows ? maximumX : maximumZ;
+        ArrayList<RasterThreeLanePathPlanner.Slice<BlockPos>> slices =
+            new ArrayList<>();
+        for (RasterBandTraversal.Step step : RasterBandTraversal.create(
+            outerMinimum,
+            outerMaximum,
+            innerMinimum,
+            innerMaximum,
+            RASTER_PRINT_BAND_ROWS,
+            outerAscending,
+            firstInnerAscending,
+            true
+        )) {
+                ArrayList<BlockPos> stepTargets = new ArrayList<>(step.outerLanes().size());
+                for (int outer : step.outerLanes()) {
+                    int inner = step.inner();
+                    int x = rows ? inner : outer;
+                    int z = rows ? outer : inner;
+                    BlockPos target = horizontal.get(
+                        ((long) x << 32) ^ (z & 0xffffffffL)
+                    );
+                    if (target != null) stepTargets.add(target);
+                }
+                if (stepTargets.isEmpty()) continue;
+                slices.add(new RasterThreeLanePathPlanner.Slice<>(
+                    step.band(),
+                    step.direction(),
+                    stepTargets.stream().map(target ->
+                        new RasterThreeLanePathPlanner.Target<>(
+                            target.getX(),
+                            target.getY(),
+                            target.getZ(),
+                            target
+                        )
+                    ).toList()
+                ));
+        }
+        RasterThreeLanePathPlanner.Plan<BlockPos> stripPlan =
+            RasterThreeLanePathPlanner.create(
+                slices,
+                rasterBuildInteractionRange()
+            );
+        RasterBuildRoutePlan.Plan<BlockPos> buildRoute =
+            RasterBuildRoutePlan.create(
+                stripPlan,
+                minimumX,
+                maximumX,
+                minimumZ,
+                maximumZ,
+                RasterBuildRoutePlan.DEFAULT_EXTERIOR_MARGIN
+            );
+        ArrayList<BlockPos> ordered = new ArrayList<>(buildTargets.size());
+        ArrayList<RasterFlightPlan.Target> flight =
+            new ArrayList<>(buildTargets.size());
+        for (RasterThreeLanePathPlanner.Assignment<BlockPos> assignment
+            : stripPlan.assignments()) {
+            ordered.add(assignment.target().payload());
+            flight.add(new RasterFlightPlan.Target(
+                assignment.pathX(),
+                assignment.pathSurfaceY(),
+                assignment.pathZ(),
+                assignment.band(),
+                assignment.direction()
+            ));
+        }
+        String axis = rows
+            ? "single row band"
+            : "single column band";
+        String outer = outerAscending ? "+" : "-";
+        String first = firstInnerAscending ? "+" : "-";
+        return new RasterTraversalCandidate(
+            axis + " (outer " + outer + ", first " + first + ")",
+            List.copyOf(ordered),
+            List.copyOf(flight),
+            List.copyOf(flight),
+            buildRoute,
+            stripPlan.passCount()
+        );
+    }
+
+    private boolean compileRasterJobPlan() {
+        CompiledRasterTraversal best = null;
+        double bestColumnLength = Double.POSITIVE_INFINITY;
+        try {
+            for (boolean outerAscending : List.of(true, false)) {
+                RasterTraversalCandidate candidate =
+                    createRasterTraversalCandidate(
+                        false,
+                        outerAscending,
+                        true
+                    );
+                RasterFlightPlan.Plan plan = RasterFlightPlan.create(
+                    candidate.flightTargets(),
+                    rasterBuildInteractionRange(),
+                    1.0,
+                    8,
+                    4
+                );
+                RasterFlightPlan.Plan selectionPlan =
+                    RasterFlightPlan.create(
+                        candidate.selectionFlightTargets(),
+                        rasterBuildInteractionRange(),
+                        1.0,
+                        8,
+                        4
+                    );
+                bestColumnLength = Math.min(
+                    bestColumnLength,
+                    selectionPlan.pathLength()
+                );
+                if (best == null
+                    || selectionPlan.pathLength()
+                        < best.selectionPathLength()) {
+                    best = new CompiledRasterTraversal(
+                        candidate,
+                        plan,
+                        selectionPlan.pathLength()
+                    );
+                }
+            }
+        } catch (IllegalArgumentException failure) {
+            error("Boat Raster could not compile its complete flight path: "
+                + failure.getMessage());
+            rasterStatus = "flight planning failed";
+            return false;
+        }
+        if (best == null || best.candidate().targets().size() != buildTargets.size()) {
+            error("Boat Raster could not produce a complete structural traversal.");
+            rasterStatus = "incomplete traversal";
+            return false;
+        }
+        orderedBuildTargets.clear();
+        orderedBuildTargets.addAll(best.candidate().targets());
+        rasterFlightPlan = best.flightPlan();
+        rasterBuildRoutePlan = best.candidate().buildRoute();
+        rasterTraversalName = best.candidate().name();
+        info("Staircased Printer selected alternating north/south traversal; best column="
+            + String.format(Locale.ROOT, "%.1f", bestColumnLength)
+            + " blocks; selected " + rasterTraversalName
+            + " so the printer follows one continuous serpentine lateral side lane beside each active row with "
+            + best.candidate().stripPassCount()
+            + " pass before advancing to the next line.");
+
+        rasterMaterialDemand.clear();
+        rasterMaterialUseIndices.clear();
+        rasterTargetIndices.clear();
+        rasterTargetsByHorizontalCell.clear();
+        for (int index = 0; index < orderedBuildTargets.size(); index++) {
+            BlockPos relative = orderedBuildTargets.get(index);
+            Item material = buildTargets.get(relative).asItem();
+            rasterTargetIndices.put(relative, index);
+            rasterTargetsByHorizontalCell.put(
+                rasterHorizontalKey(relative.getX(), relative.getZ()),
+                relative
+            );
+            rasterMaterialDemand.merge(material, 1, Integer::sum);
+            rasterMaterialUseIndices.computeIfAbsent(
+                material,
+                ignored -> new ArrayList<>()
+            ).add(index);
+        }
+        if (rasterFlightPlan.waypoints().size() != orderedBuildTargets.size()) {
+            error("Boat Raster flight plan did not cover every structural target.");
+            rasterStatus = "incomplete flight plan";
+            return false;
+        }
+        if (rasterBuildRoutePlan.deadlineByTarget().size()
+            != orderedBuildTargets.size()) {
+            error("Boat Raster compiled route did not assign a placement deadline to every structural target.");
+            rasterStatus = "incomplete placement schedule";
+            return false;
+        }
+        if (rasterSurface == null
+            || rasterSurface.visibleSpanY() > RasterSurfaceNormalizer.MAX_MAP_SPAN) {
+            error("Boat Raster visible map does not fit inside a 128x128x128 volume.");
+            rasterStatus = "map exceeds 128-block volume";
+            return false;
+        }
+
+        int totalMaterials = rasterMaterialDemand.values().stream()
+            .mapToInt(Integer::intValue).sum();
+        info("Boat Raster precomputed " + rasterFlightPlan.waypoints().size()
+            + " target envelopes, "
+            + rasterBuildRoutePlan.points().size()
+            + " adjacent BoatFly route points, "
+            + String.format(Locale.ROOT, "%.1f", rasterFlightPlan.pathLength())
+            + " blocks of print travel, and " + totalMaterials
+            + " required blocks across " + rasterMaterialDemand.size()
+            + " material types.");
+        info("Boat Raster visible volume: 128x"
+            + rasterSurface.visibleSpanY()
+            + "x128 blocks; auxiliary north reference row: 128x1, structural Y span "
+            + rasterSurface.structuralSpanY() + ".");
+        for (Map.Entry<Item, Integer> demand : rasterMaterialDemand.entrySet()) {
+            info("  " + demand.getKey().getName().getString()
+                + ": " + demand.getValue());
+        }
+        return true;
+    }
+
+    private boolean setupRasterSlots() {
+        availableSlots = Utils.getAvailableSlots(materialDict);
+        availableHotBarSlots.clear();
+        rasterManagedHotbarSlots.clear();
+        for (int slot : availableSlots) {
+            if (slot < 9) {
+                availableHotBarSlots.add(slot);
+                rasterManagedHotbarSlots.add(slot);
+            }
+        }
+        if (rasterManagedHotbarSlots.isEmpty()) {
+            warning(
+                "Boat Raster needs one empty hotbar slot, or one hotbar slot already containing a registered map material."
+            );
+            rasterStatus = "missing staging hotbar slot";
+            return false;
+        }
+        info("Boat Raster managed hotbar slots: " + rasterManagedHotbarSlots);
+        return true;
+    }
+
+    private void startBoatRasterBuilding() {
+        rasterPreflightRetryNotBeforeTick = -1L;
+        if (mc.player == null || mc.world == null || mapCorner == null
+            || compactPlan == null || buildTargets.isEmpty()) {
+            error("Boat Raster cannot start before a map area and NBT plan are loaded.");
+            return;
+        }
+        if (SlaveSystem.isFileMode() || SlaveSystem.isSlave()) {
+            error("Boat Raster is single-client only; disable file/slave coordination first.");
+            return;
+        }
+        // Migrate the persisted four-block test setting to the requested
+        // single-row build speed for this and subsequent activations.
+        boatRasterBuildSpeed.set(
+            BoatFlyAdapter.BUILD_BLOCKS_PER_SECOND
+        );
+        boatRasterTravelSpeed.set(
+            BoatFlyAdapter.CRUISE_BLOCKS_PER_SECOND
+        );
+        boatRasterRestockActionDelay.set(2);
+        BoatFlyAdapter.Compatibility compatibility = boatFlyAdapter.compatibility();
+        if (!compatibility.compatible()) {
+            error("Boat Raster preflight failed: " + compatibility.reason());
+            rasterStatus = "incompatible: " + compatibility.reason();
+            return;
+        }
+        if (dumpStation == null) {
+            error("Boat Raster requires a registered excess-material drop point.");
+            rasterStatus = "missing drop point";
+            return;
+        }
+        if (!(mc.interactionManager instanceof IClientPlayerInteractionManager)) {
+            error("Boat Raster preflight failed: Nerv Smart Air support is not loaded.");
+            rasterStatus = "missing Smart Air support";
+            return;
+        }
+        if (!compileRasterJobPlan()) {
+            disableRasterPreflight(rasterStatus);
+            return;
+        }
+        if (!setupRasterSlots()) return;
+        if (!isRasterAreaLoaded()) {
+            warning("Boat Raster is waiting for map, reference-row, launch, and flight-corridor chunks to load; preflight will retry automatically.");
+            rasterStatus = "waiting for map/corridor chunks to load";
+            rasterPreflightRetryNotBeforeTick = clientActionTick + 20L;
+            return;
+        }
+
+        if (localCycleRecoveryCandidate) {
+            warning("Legacy circular-route checkpoint invalidated; map/chest/tool/drop registrations remain available.");
+            clearLocalCycleCheckpoint("boat-raster-migration");
+            localCycleRecoveryCandidate = false;
+        }
+        Optional<BoatRasterCheckpointStore.Snapshot> recovered =
+            readCompatibleRasterCheckpoint();
+        if (recovered.isPresent()
+            && !scoreRasterBaseY(recovered.orElseThrow().selectedY()).valid()) {
+            warning("Discarded Boat Raster checkpoint because its saved Y no longer has a safe, breakable 128-block build volume.");
+            try {
+                rasterCheckpointStore.clear();
+            } catch (IOException failure) {
+                disableRasterPreflight(
+                    "could not clear unsafe checkpoint: " + failure.getMessage()
+                );
+                return;
+            }
+            recovered = Optional.empty();
+        }
+        recovered.map(BoatRasterCheckpointStore.Snapshot::boatPosition)
+            .map(this::decodeBlockPos)
+            .ifPresent(position -> rasterBoatPosition = position);
+        OptionalInt selectedY = recovered.isPresent()
+            ? OptionalInt.of(recovered.orElseThrow().selectedY())
+            : selectRasterBaseY();
+        if (selectedY.isEmpty()) {
+            disableRasterPreflight(
+                "no safe 128x128x128 build volume exists in the loaded world height; all candidate target/flight corridors are out of bounds or unbreakable"
+            );
+            return;
+        }
+        mapCorner = new BlockPos(mapCorner.getX(), selectedY.getAsInt(), mapCorner.getZ());
+        rasterSelectedBaseY = mapCorner.getY();
+        resetMapAreaCache();
+        calculateRemainingRasterMaterialDemand();
+        LinkedHashSet<String> missingMaterialSources = new LinkedHashSet<>();
+        for (Map.Entry<Item, Integer> demand : rasterMaterialDemand.entrySet()) {
+            if (playerItemCount(demand.getKey()) > 0) continue;
+            if (materialShulkerDict == null
+                || !materialShulkerDict.containsKey(demand.getKey())
+                || materialShulkerDict.get(demand.getKey()).isEmpty()) {
+                missingMaterialSources.add(demand.getKey().getName().getString());
+            }
+        }
+        if (!missingMaterialSources.isEmpty()) {
+            error("Boat Raster is missing registered material shulkers: "
+                + String.join(", ", missingMaterialSources));
+            rasterStatus = "missing material sources";
+            return;
+        }
+
+        if (!prepareRasterBoatSource()) return;
+        AbstractBoatEntity mountedRasterBoat =
+            mc.player.getVehicle() instanceof AbstractBoatEntity boat
+                && boat.isAlive() ? boat : null;
+        boolean freshBoatSourceAvailable = rasterBoatItem instanceof BoatItem
+            || rasterBoatSourceChest != null;
+        // A loaded boat elsewhere in the build volume is not proof that it is
+        // the boat this activation can reach. Prefer a mounted boat, then a
+        // fresh inventory/chest boat. Only recover a loose loaded boat when it
+        // is the sole available source; otherwise an old boat far below the
+        // platform hijacks startup and makes the player pathfind into midair.
+        AbstractBoatEntity existingRasterBoat = mountedRasterBoat != null
+            ? mountedRasterBoat
+            : freshBoatSourceAvailable
+                ? null
+                : findLoadedRasterRecoveryBoat();
+        rasterLaunchBlock = existingRasterBoat == null
+            ? chooseRasterLaunchBlock()
+            : recoveredRasterLaunchBlock(
+                recovered.orElse(null),
+                existingRasterBoat
+            );
+        if (rasterLaunchBlock == null && existingRasterBoat != null) {
+            rasterLaunchBlock = chooseRasterLaunchBlock();
+        }
+        if (rasterLaunchBlock == null) {
+            error("Boat Raster could not select a loaded launch point outside the map footprint.");
+            return;
+        }
+        if (existingRasterBoat == null
+            && mc.world.getBlockState(rasterLaunchBlock).isAir()
+            && !InvUtils.find(Blocks.COBBLESTONE.asItem()).found()) {
+            error("Boat Raster preflight failed: one carried cobblestone is required for the temporary launch point.");
+            rasterStatus = "missing launch block";
+            return;
+        }
+        if (!prepareRasterClearance()) return;
+
+        rasterInventoryBaseline.clear();
+        buildTargets.values().stream()
+            .map(Block::asItem)
+            .distinct()
+            .forEach(item -> rasterInventoryBaseline.put(item, playerItemCount(item)));
+
+        boatRasterActive = true;
+        buildingActive = true;
+        resetBuildActionState();
+        rasterCursor = firstUnfinishedRasterIndex(0);
+        rasterConfirmedFrontier = rasterCursor;
+        rasterRouteCursor = rasterCursor >= orderedBuildTargets.size()
+            ? Math.max(0, rasterBuildRoutePlan.points().size() - 1)
+            : rasterBuildRoutePlan.replayIndexFor(
+                orderedBuildTargets.get(rasterCursor),
+                RASTER_ROUTE_REJOIN_REPLAY_POINTS
+            );
+        rasterSavedRouteCursor = rasterRouteCursor;
+        rasterRouteRejoinCursor = rasterRouteCursor;
+        rasterRoutePreviousPosition = null;
+        rasterRouteRejoinPending = false;
+        rasterRouteRejoinSnapshotAccepted = false;
+        rasterRouteValidationCursor = 0;
+        rasterRouteValidated = false;
+        recovered.ifPresent(this::restoreRasterCheckpoint);
+        rasterPhaseStartedTick = clientActionTick;
+        mapCyclePhase = MapCyclePhase.BUILDING;
+        if (cycleStartedAtMs < 0) cycleStartedAtMs = System.currentTimeMillis();
+        RasterInventoryRunPlanner.PresencePlan<Item> startupPresence =
+            planRasterStartupMaterialPresence();
+        if (startupPresence.ready()) {
+            rasterInventoryFillPlan.clear();
+            rasterInventoryRunKeepCounts.clear();
+            if (existingRasterBoat != null && existingRasterBoat.isAlive()) {
+                rasterBoatPosition = existingRasterBoat.getBlockPos();
+                rasterReturningToParkedBoat = mc.player.getVehicle()
+                    != existingRasterBoat;
+                rasterStatus = "all required material types carried; recovering deployed boat";
+                state = State.RasterMountBoat;
+            } else {
+                rasterStatus = "all required material types already carried; deploying boat";
+                state = State.RasterDeployBoat;
+            }
+        } else {
+            Set<Item> unplannedMinimums = planRasterInventoryFill(
+                startupPresence.missingMaterials()
+            );
+            if (!unplannedMinimums.isEmpty()) {
+                failBoatRaster(
+                    "inventory cannot seed every missing map material while reserving one free logistics slot: "
+                        + unplannedMinimums.stream()
+                            .map(item -> item.getName().getString())
+                            .collect(Collectors.joining(", "))
+                );
+                return;
+            }
+            Optional<Item> firstRestockMaterial =
+                nextRasterInventoryFillMaterial();
+            if (firstRestockMaterial.isEmpty()) {
+                failBoatRaster(
+                    "maximum startup restock produced no withdrawable material plan"
+                );
+                return;
+            }
+            scheduleRasterRestock(firstRestockMaterial.orElseThrow(), true);
+        }
+        info("Boat Raster selected Y=" + rasterSelectedBaseY
+            + " with " + rasterClearanceQueue.size() + " clearance targets; safe world Y range "
+            + (rasterSelectedBaseY + minimumSafeRasterRelativeY()) + ".."
+            + (rasterSelectedBaseY + maximumSafeRasterRelativeY()) + ".");
+    }
+
+    /** Retained only as a migration reference; new cycles never enter it. */
+    private void startLegacyBuilding() {
         if (SlaveSystem.isFileMode() && activeConfigSha256 == null) {
             error(
                 "File coordination requires every bot to load the same saved "
@@ -21606,9 +29497,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         if (state == State.SelectingChests) {
-            if (adoptProvableUncheckpointedTeardown()) {
-                return;
-            }
             if (validateStartRequirements()) {
                 info("Starting Staircase from the module control.");
                 startBuilding();
@@ -21619,6 +29507,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || state == State.AwaitMasterNextMap) {
             info("Continuing Staircase from the module control.");
             start();
+            return;
+        }
+        if (isBoatRasterState()) {
+            info("Boat Raster is already active: " + rasterStatus + ".");
             return;
         }
         switch (activeRecoveryOwner()) {
@@ -22103,8 +29995,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             error("No config file name selected.");
             return;
         }
-        if (cartographyTable == null || finishedMapChest == null || dumpStation == null || mapCorner == null
-            || materialDict.isEmpty() || usedToolChest == null || toolSet.isEmpty()) {
+        if (dumpStation == null || mapCorner == null
+            || materialShulkerDict == null || materialShulkerDict.isEmpty()) {
             error("Cannot save config: Missing required data.");
             return;
         }
@@ -22167,8 +30059,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 error("Config file is of type " + data.type + " and not 'staircased'.");
                 return false;
             }
-            if (data.cartographyTable == null || data.finishedMapChest == null || data.dumpStation == null || data.mapCorner == null
-                || data.materialDict.isEmpty() || data.usedToolChest == null || toolSet == null) {
+            if (data.dumpStation == null || data.mapCorner == null
+                || data.materialDict.isEmpty()) {
                 error("Config file is missing required data.");
                 return false;
             }
@@ -22186,6 +30078,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             this.northWalkwayRelativeY = null;
             resetMapAreaCache();
             this.materialDict = data.materialDict;
+            this.materialShulkerDict = new HashMap<>();
+            for (Map.Entry<Item, ArrayList<Pair<BlockPos, Vec3d>>> entry
+                : data.materialDict.entrySet()) {
+                if (entry.getKey() instanceof BoatItem
+                    || entry.getKey() == Items.MAP
+                    || entry.getKey() == Items.GLASS_PANE) continue;
+                materialShulkerDict.put(
+                    entry.getKey(),
+                    new ArrayList<>(entry.getValue())
+                );
+            }
             this.toolSet = data.toolSet;
             this.registeredToolMinimumEfficiency =
                 new HashMap<>(data.toolMinimumEfficiency);
@@ -24060,27 +31963,61 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             blockPaletteDict.put(state, new Pair<>(entry.getLeft(), 0));
         }
 
-        for (CompactCircularNbtPlan.PairRoute route : plan.pairRoutes()) {
-            int firstX = route.outboundX();
-            int secondX = route.returnX();
-
-            for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
-                addRuntimeSurfaceTarget(plan, firstX, nbtZ);
-            }
-            for (CompactCircularNbtPlan.Position connector : route.relativeInterior()) {
-                BlockPos relative = new BlockPos(
-                    connector.x(),
-                    connector.y(),
-                    connector.z() - 1
-                );
-                addRuntimeTarget(relative, plan.cobblestoneState(), true);
-            }
-            for (int nbtZ = CompactCircularNbtPlan.FAR_Z; nbtZ >= 1; nbtZ--) {
-                addRuntimeSurfaceTarget(plan, secondX, nbtZ);
+        int[][] sourceSurface = new int[
+            CompactCircularNbtPlan.MAP_WIDTH
+        ][CompactCircularNbtPlan.SOURCE_Z_SIZE];
+        for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
+            for (int z = CompactCircularNbtPlan.START_Z;
+                 z <= CompactCircularNbtPlan.FAR_Z;
+                 z++) {
+                sourceSurface[x][z] = plan.sourceTopY(x, z);
             }
         }
+        rasterSurface = RasterSurfaceNormalizer.normalize(
+            sourceSurface,
+            CompactCircularNbtPlan.START_Z,
+            CompactCircularNbtPlan.START_Z + 1,
+            CompactCircularNbtPlan.FAR_Z
+        );
 
-        int expectedTargets = 128 * 128 + plan.connectorBlocks().size();
+        // The north reference row remains an auxiliary structural strip. The
+        // visible 128x128 map uses the source column deltas, normalized per X
+        // column, instead of the connector-optimized offsets. This preserves
+        // every map shade while guaranteeing a maximum visible height of 128.
+        // Circular connectors and walkways existed only to support grounded
+        // traversal and must never be emitted by the raster printer.
+        ArrayList<RasterRoutePlan.Cell<Integer>> structural = new ArrayList<>();
+        for (int nbtZ = CompactCircularNbtPlan.START_Z;
+             nbtZ <= CompactCircularNbtPlan.FAR_Z;
+             nbtZ++) {
+            for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
+                structural.add(new RasterRoutePlan.Cell<>(
+                    x,
+                    rasterSurface.height(x, nbtZ),
+                    nbtZ - 1,
+                    nbtZ == CompactCircularNbtPlan.START_Z
+                        ? plan.cobblestoneState()
+                        : plan.sourceTopState(x, nbtZ),
+                    nbtZ == CompactCircularNbtPlan.START_Z
+                ));
+            }
+        }
+        RasterRoutePlan.Plan<Integer> raster = RasterRoutePlan.create(
+            structural,
+            0,
+            CompactCircularNbtPlan.MAP_WIDTH - 1,
+            -1,
+            CompactCircularNbtPlan.FAR_Z - 1
+        );
+        for (RasterRoutePlan.Cell<Integer> target : raster.orderedCells()) {
+            addRuntimeTarget(
+                new BlockPos(target.x(), target.y(), target.z()),
+                target.payload(),
+                false
+            );
+        }
+
+        int expectedTargets = 128 * 129;
         if (buildTargets.size() != expectedTargets || orderedBuildTargets.size() != expectedTargets) {
             throw new IllegalArgumentException(
                 "Runtime compact plan has " + buildTargets.size()
@@ -24099,13 +32036,739 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
+    private boolean configureRasterCheckpointing() {
+        if (mc.player == null || mapFolder == null) return false;
+        try {
+            rasterCheckpointStore = BoatRasterCheckpointStore.open(
+                mapFolder.toPath(),
+                mc.player.getName().getString()
+            );
+            return true;
+        } catch (IOException | IllegalArgumentException failure) {
+            error("Could not initialize Boat Raster checkpointing: "
+                + failure.getMessage());
+            return false;
+        }
+    }
+
+    private void persistRasterCheckpoint(String checkpoint) {
+        if (rasterCheckpointStore == null || !isBoatRasterState()) return;
+        try {
+            rasterCheckpointStore.save(new BoatRasterCheckpointStore.Snapshot(
+                BoatRasterCheckpointStore.SCHEMA_VERSION,
+                activeSourceSha256,
+                activeConfigSha256,
+                mapCorner.getX(),
+                mapCorner.getZ(),
+                rasterSelectedBaseY,
+                Math.max(0, rasterRow),
+                rasterDirection >= 0 ? 1 : -1,
+                Math.max(0, rasterCursor),
+                Math.max(0, rasterRouteCursor),
+                Math.max(0, rasterConfirmedFrontier),
+                state.name(),
+                rasterWaypoint == null ? null : rasterWaypoint.x,
+                rasterWaypoint == null ? null : rasterWaypoint.y,
+                rasterWaypoint == null ? null : rasterWaypoint.z,
+                rasterBoatPosition == null
+                    ? null : encodeBlockPos(rasterBoatPosition),
+                rasterLaunchBlock == null
+                    ? null : encodeBlockPos(rasterLaunchBlock),
+                rasterBoatSourceChest == null
+                    ? null : encodeBlockPos(rasterBoatSourceChest.getLeft()),
+                rasterRestockMaterial == null
+                    ? null : Registries.ITEM.getId(rasterRestockMaterial).toString(),
+                rasterRestockSource == null
+                    ? null : encodeBlockPos(rasterRestockSource.getLeft()),
+                rasterRestockBeforeDeployment,
+                rasterOwnedTemporaryBlocks.stream()
+                    .map(this::encodeBlockPos).toList(),
+                rasterInventoryBaseline.entrySet().stream().collect(
+                    Collectors.toMap(
+                        entry -> Registries.ITEM.getId(entry.getKey()).toString(),
+                        Map.Entry::getValue
+                    )
+                ),
+                System.currentTimeMillis()
+            ));
+            lastRasterCheckpointTick = clientActionTick;
+            debugLog("BoatRaster", "checkpoint=" + checkpoint
+                + " cursor=" + rasterCursor
+                + " route=" + rasterRouteCursor
+                + " frontier=" + rasterConfirmedFrontier
+                + " state=" + state);
+        } catch (IOException | IllegalArgumentException failure) {
+            String reason = "could not persist raster checkpoint: " + failure.getMessage();
+            error("Boat Raster failed closed: " + reason + ".");
+            rasterStatus = "failed: " + reason;
+            boatFlyAdapter.release();
+            boatRasterActive = false;
+            buildingActive = false;
+            state = State.SelectingChests;
+            if (isActive()) toggle();
+        }
+    }
+
+    private Optional<BoatRasterCheckpointStore.Snapshot>
+        readCompatibleRasterCheckpoint() {
+        if (rasterCheckpointStore == null) return Optional.empty();
+        try {
+            Optional<BoatRasterCheckpointStore.Snapshot> persisted =
+                rasterCheckpointStore.read();
+            if (persisted.isEmpty()) return Optional.empty();
+            BoatRasterCheckpointStore.Snapshot snapshot = persisted.orElseThrow();
+            if (!Objects.equals(snapshot.sourceFingerprint(), activeSourceSha256)
+                || !Objects.equals(snapshot.configFingerprint(), activeConfigSha256)
+                || snapshot.mapOriginX() != mapCorner.getX()
+                || snapshot.mapOriginZ() != mapCorner.getZ()) {
+                warning("Discarded Boat Raster checkpoint because its source, config, or registered map origin changed.");
+                rasterCheckpointStore.clear();
+                return Optional.empty();
+            }
+            return persisted;
+        } catch (IOException failure) {
+            warning("Discarded incompatible Boat Raster checkpoint: "
+                + failure.getMessage());
+            try {
+                rasterCheckpointStore.clear();
+            } catch (IOException clearFailure) {
+                error("Could not clear incompatible Boat Raster checkpoint: "
+                    + clearFailure.getMessage());
+            }
+            return Optional.empty();
+        }
+    }
+
+    private void restoreRasterCheckpoint(
+        BoatRasterCheckpointStore.Snapshot snapshot
+    ) {
+        // Traversal shape is allowed to evolve between builds (for example,
+        // three lanes to one strict lane). A numeric frontier from the old
+        // ordering is not portable. Reconcile from authoritative world state
+        // so completed blocks are neither repeated nor skipped.
+        int persistedFrontier = Math.min(
+            snapshot.confirmedFrontier(),
+            orderedBuildTargets.size()
+        );
+        rasterConfirmedFrontier = firstUnfinishedRasterIndex(0);
+        rasterCursor = rasterConfirmedFrontier;
+        if (rasterConfirmedFrontier != persistedFrontier) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster reconciled checkpoint frontier {} -> {} against the current strict traversal and authoritative blocks",
+                persistedFrontier,
+                rasterConfirmedFrontier
+            );
+        }
+        if (rasterCursor >= orderedBuildTargets.size()) {
+            rasterRouteCursor = rasterBuildRoutePlan == null
+                ? 0 : Math.max(0, rasterBuildRoutePlan.points().size() - 1);
+        } else {
+            rasterRouteCursor = rasterBuildRoutePlan == null
+                ? 0
+                : rasterBuildRoutePlan.resumeIndexFor(
+                    orderedBuildTargets.get(rasterCursor),
+                    snapshot.routeCursor(),
+                    RASTER_ROUTE_REJOIN_REPLAY_POINTS
+                );
+        }
+        if (rasterRouteCursor != snapshot.routeCursor()) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Boat Raster reconciled stale checkpoint route {} -> {} from authoritative frontier {} and first unfinished target {}",
+                snapshot.routeCursor(),
+                rasterRouteCursor,
+                rasterConfirmedFrontier,
+                rasterCursor
+            );
+        }
+        rasterSavedRouteCursor = rasterRouteCursor;
+        rasterRouteRejoinCursor = rasterBuildRoutePlan == null
+            ? rasterRouteCursor
+            : rasterBuildRoutePlan.replayIndex(
+                rasterRouteCursor,
+                RASTER_ROUTE_REJOIN_REPLAY_POINTS
+            );
+        rasterRouteRejoinPending = true;
+        rasterRouteRejoinSnapshotAccepted = false;
+        rasterPrintCorridorAcquired = false;
+        rasterRow = snapshot.row();
+        rasterDirection = snapshot.direction();
+        if (snapshot.waypointX() != null
+            && snapshot.waypointY() != null
+            && snapshot.waypointZ() != null) {
+            rasterWaypoint = new Vec3d(
+                snapshot.waypointX(), snapshot.waypointY(), snapshot.waypointZ()
+            );
+        }
+        BlockPos recoveredBoatPosition = decodeBlockPos(
+            snapshot.boatPosition()
+        );
+        if (recoveredBoatPosition != null) {
+            rasterBoatPosition = recoveredBoatPosition;
+        }
+        BlockPos recoveredLaunch = decodeBlockPos(snapshot.launchBlock());
+        if (recoveredLaunch != null
+            && mc.world != null
+            && !mc.world.getBlockState(recoveredLaunch)
+                .getCollisionShape(mc.world, recoveredLaunch).isEmpty()) {
+            rasterLaunchBlock = recoveredLaunch;
+        }
+        rasterRestockBeforeDeployment = Boolean.TRUE.equals(
+            snapshot.restockBeforeDeployment()
+        );
+        rasterOwnedTemporaryBlocks.clear();
+        for (String encoded : snapshot.ownedTemporaryBlocks()) {
+            BlockPos parsed = decodeBlockPos(encoded);
+            if (parsed != null) rasterOwnedTemporaryBlocks.add(parsed);
+        }
+        rasterInventoryBaseline.clear();
+        for (Map.Entry<String, Integer> entry : snapshot.inventoryBaseline().entrySet()) {
+            Item item = Registries.ITEM.get(
+                net.minecraft.util.Identifier.of(entry.getKey())
+            );
+            rasterInventoryBaseline.put(item, entry.getValue());
+        }
+        State persistedState;
+        try {
+            persistedState = State.valueOf(snapshot.phase());
+        } catch (IllegalArgumentException ignored) {
+            persistedState = State.RasterPrinting;
+        }
+        rasterResumeAfterMount = persistedState == State.RasterRestock
+            ? State.RasterRestock
+            : persistedState == State.RasterDisposeExcess
+                ? State.RasterDisposeExcess
+            : persistedState == State.RasterClearance
+                ? State.RasterClearance
+                : State.RasterPrinting;
+        if (snapshot.restockMaterial() != null) {
+            rasterRestockMaterial = Registries.ITEM.get(
+                net.minecraft.util.Identifier.of(snapshot.restockMaterial())
+            );
+            ArrayList<Pair<BlockPos, Vec3d>> sources =
+                materialShulkerDict == null
+                    ? null : materialShulkerDict.get(rasterRestockMaterial);
+            BlockPos expectedSource = decodeBlockPos(snapshot.restockSource());
+            if (sources != null) {
+                rasterRestockSource = sources.stream()
+                    .filter(source -> expectedSource == null
+                        || source.getLeft().equals(expectedSource))
+                    .findFirst().orElse(sources.getFirst());
+                rasterStagingBlock = rasterOwnedTemporaryBlocks.stream()
+                    .filter(position -> mc.world != null
+                        && mc.world.getBlockState(position).getBlock()
+                            instanceof ShulkerBoxBlock)
+                    .findFirst().orElse(null);
+                rasterRestockPhase = rasterStagingBlock == null
+                    ? mc.player != null
+                        && mc.player.getVehicle() instanceof AbstractBoatEntity
+                            ? RasterRestockPhase.EGRESS_ROUTE
+                            : RasterRestockPhase.WALK_SOURCE
+                    : RasterRestockPhase.OPEN_STAGING;
+                if (rasterStagingBlock != null) {
+                    rasterRestockShulkerItem = mc.world
+                        .getBlockState(rasterStagingBlock)
+                        .getBlock().asItem();
+                }
+            }
+        }
+        info("Recovered Boat Raster checkpoint at row " + rasterRow
+            + ", frontier " + rasterConfirmedFrontier + ".");
+    }
+
+    private String encodeBlockPos(BlockPos position) {
+        return position.getX() + "," + position.getY() + "," + position.getZ();
+    }
+
+    private BlockPos decodeBlockPos(String encoded) {
+        if (encoded == null) return null;
+        String[] parts = encoded.split(",");
+        if (parts.length != 3) return null;
+        try {
+            return new BlockPos(
+                Integer.parseInt(parts[0]),
+                Integer.parseInt(parts[1]),
+                Integer.parseInt(parts[2])
+            );
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private Optional<Item> singleMaterialShulker(ItemStack shulker) {
+        if (!(shulker.getItem() instanceof BlockItem blockItem)
+            || !(blockItem.getBlock() instanceof ShulkerBoxBlock)) {
+            return Optional.empty();
+        }
+        ContainerComponent contents = shulker.get(
+            DataComponentTypes.CONTAINER
+        );
+        if (contents == null) return Optional.empty();
+        Item material = null;
+        for (ItemStack contained : contents.iterateNonEmpty()) {
+            if (contained.isEmpty()) continue;
+            if (material != null && material != contained.getItem()) {
+                return Optional.empty();
+            }
+            material = contained.getItem();
+        }
+        return Optional.ofNullable(material);
+    }
+
+    private boolean isEmptyShulker(ItemStack stack) {
+        if (!(stack.getItem() instanceof BlockItem blockItem)
+            || !(blockItem.getBlock() instanceof ShulkerBoxBlock)) {
+            return false;
+        }
+        ContainerComponent contents = stack.get(DataComponentTypes.CONTAINER);
+        return contents == null || !contents.iterateNonEmpty().iterator().hasNext();
+    }
+
+    private void handleRasterBoatChestPacket(InventoryS2CPacket packet) {
+        int containerSlots = packet.contents().size() - 36;
+        for (int slot = Math.max(0, containerSlots); slot < packet.contents().size(); slot++) {
+            if (rasterBoatWithdrawalSubmitted
+                && packet.contents().get(slot).getItem() instanceof BoatItem) {
+                mc.player.closeHandledScreen();
+                enterRasterState(State.RasterDeployBoat, "boat withdrawal confirmed");
+                return;
+            }
+        }
+        for (int slot = 0; slot < containerSlots; slot++) {
+            if (!(packet.contents().get(slot).getItem() instanceof BoatItem)) continue;
+            mc.interactionManager.clickSlot(
+                packet.syncId(),
+                slot,
+                0,
+                SlotActionType.QUICK_MOVE,
+                mc.player
+            );
+            rasterBoatWithdrawalSubmitted = true;
+            rasterPhaseStartedTick = clientActionTick;
+            return;
+        }
+        if (!rasterBoatWithdrawalSubmitted) {
+            failBoatRaster("registered boat chest contains no boat");
+        }
+    }
+
+    private void handleRasterBoatReturnPacket(InventoryS2CPacket packet) {
+        int containerSlots = packet.contents().size() - 36;
+        if (containerSlots <= 0) return;
+        int playerBoatSlot = -1;
+        for (int slot = containerSlots; slot < packet.contents().size(); slot++) {
+            if (packet.contents().get(slot).getItem() instanceof BoatItem) {
+                playerBoatSlot = slot;
+                break;
+            }
+        }
+        if (rasterBoatReturnSubmitted) {
+            if (playerBoatSlot < 0) {
+                mc.player.closeHandledScreen();
+                enterRasterState(State.RasterCleanup, "boat returned to source chest");
+            }
+            return;
+        }
+        if (playerBoatSlot < 0) {
+            failBoatRaster("recovered boat was missing before chest return");
+            return;
+        }
+        mc.interactionManager.clickSlot(
+            packet.syncId(), playerBoatSlot, 0, SlotActionType.QUICK_MOVE, mc.player
+        );
+        rasterBoatReturnSubmitted = true;
+        rasterPhaseStartedTick = clientActionTick;
+    }
+
+    private void handleRasterRestockPacket(InventoryS2CPacket packet) {
+        int containerSlots = packet.contents().size() - 36;
+        if (containerSlots <= 0) return;
+        rasterRestockSyncId = packet.syncId();
+        if (rasterRestockPhase == RasterRestockPhase.WAIT_SOURCE) {
+            ArrayList<Integer> matchingShulkerCounts = new ArrayList<>(
+                Collections.nCopies(containerSlots, 0)
+            );
+            LinkedHashSet<String> invalid = new LinkedHashSet<>();
+            for (int slot = 0; slot < containerSlots; slot++) {
+                ItemStack stack = packet.contents().get(slot);
+                if (stack.isEmpty()) continue;
+                if (!(stack.getItem() instanceof BlockItem blockItem)
+                    || !(blockItem.getBlock() instanceof ShulkerBoxBlock)) {
+                    invalid.add(stack.getName().getString());
+                    continue;
+                }
+                Optional<Item> material = singleMaterialShulker(stack);
+                if (material.isPresent() && material.get() == rasterRestockMaterial) {
+                    int containedCount = 0;
+                    ContainerComponent contents = stack.get(DataComponentTypes.CONTAINER);
+                    if (contents != null) {
+                        for (ItemStack contained : contents.iterateNonEmpty()) {
+                            containedCount += contained.getCount();
+                        }
+                    }
+                    matchingShulkerCounts.set(slot, containedCount);
+                } else if (!isEmptyShulker(stack)) {
+                    invalid.add(stack.getName().getString());
+                }
+            }
+            if (!invalid.isEmpty()) {
+                failBoatRaster("material chest contains mixed or mismatched entries: "
+                    + String.join(", ", invalid));
+                return;
+            }
+            int match = RasterRestockTransferPolicy.fullestShulkerIndex(
+                matchingShulkerCounts
+            );
+            if (match < 0) {
+                failBoatRaster("material chest has no "
+                    + rasterRestockMaterial.getName().getString()
+                    + " shulker available");
+                return;
+            }
+            int matchingMaterialCount = matchingShulkerCounts.get(match);
+            rasterRestockShulkerItem = packet.contents().get(match).getItem();
+            int capacity = rasterInventoryCapacity(rasterRestockMaterial);
+            if (capacity <= 0) {
+                failBoatRaster("inventory has no capacity for "
+                    + rasterRestockMaterial.getName().getString()
+                    + "; clear inventory before resuming");
+                return;
+            }
+            Addon.LOG.info(
+                "[Fullblock Printer] Boat Raster source shulker contains {} {}; available player capacity={}",
+                matchingMaterialCount,
+                rasterRestockMaterial.getName().getString(),
+                capacity
+            );
+            rasterRestockQueuedSourceSlot = match;
+            rasterRestockQueuedSyncId = packet.syncId();
+            rasterRestockPhase = RasterRestockPhase.WITHDRAW_SENT;
+            rasterPhaseStartedTick = clientActionTick;
+            return;
+        }
+        if (rasterRestockPhase == RasterRestockPhase.WAIT_STAGING
+            || rasterRestockPhase == RasterRestockPhase.TRANSFER_SENT) {
+            rememberRasterRestockPlayerSlots(packet, containerSlots);
+            int contained = 0;
+            for (int slot = 0; slot < containerSlots; slot++) {
+                ItemStack stack = packet.contents().get(slot);
+                if (stack.isEmpty()) continue;
+                if (stack.getItem() != rasterRestockMaterial) {
+                    failBoatRaster("staged shulker is mixed: expected "
+                        + rasterRestockMaterial.getName().getString()
+                        + " but found " + stack.getName().getString());
+                    return;
+                }
+                contained += stack.getCount();
+            }
+
+            int playerCount = packetPlayerItemCount(
+                packet,
+                rasterRestockMaterial
+            );
+            if (rasterRestockTargetPlayerCount == 0) {
+                int planned = plannedRasterRestockAmount(
+                    rasterRestockMaterial,
+                    rasterInventoryCapacity(rasterRestockMaterial),
+                    contained
+                );
+                if (planned <= 0) {
+                    failBoatRaster("staged shulker could not satisfy the current "
+                        + rasterRestockMaterial.getName().getString()
+                        + " demand or inventory capacity");
+                    return;
+                }
+                rasterRestockTargetPlayerCount = playerCount + planned;
+                Addon.LOG.info(
+                    "[Fullblock Printer] Boat Raster planned staged withdrawal: material={}, amount={}, playerBefore={}, playerTarget={}, shulkerAvailable={}, inventoryRunTarget={}",
+                    rasterRestockMaterial.getName().getString(),
+                    planned,
+                    playerCount,
+                    rasterRestockTargetPlayerCount,
+                    contained,
+                    rasterInventoryFillPlan.getOrDefault(rasterRestockMaterial, playerCount)
+                );
+            }
+
+            if (rasterRestockPhase == RasterRestockPhase.TRANSFER_SENT) {
+                if (playerCount <= rasterRestockTransferBeforePlayerCount) {
+                    return;
+                }
+                rasterRestockAttempts = 0;
+            } else if (rasterRestockConfirmationReopen) {
+                RasterRestockTransferPolicy.Confirmation confirmation =
+                    RasterRestockTransferPolicy.confirmAfterReopen(
+                        rasterRestockTransferBeforePlayerCount,
+                        playerCount,
+                        rasterRestockAttempts,
+                        3
+                    );
+                rasterRestockConfirmationReopen = false;
+                if (confirmation
+                    == RasterRestockTransferPolicy.Confirmation.FAIL) {
+                    failBoatRaster("material transfer was not confirmed after bounded authoritative retries");
+                    return;
+                }
+                if (confirmation
+                    == RasterRestockTransferPolicy.Confirmation.RETRY) {
+                    rasterRestockAttempts++;
+                    Addon.LOG.warn(
+                        "[Fullblock Printer] Boat Raster authoritative transfer made no player-inventory progress; retry {}/3",
+                        rasterRestockAttempts
+                    );
+                } else {
+                    rasterRestockAttempts = 0;
+                }
+            }
+
+            if (RasterRestockTransferPolicy.targetReached(
+                    playerCount,
+                    rasterRestockTargetPlayerCount
+                )
+                || contained == 0
+                || rasterInventoryCapacity(rasterRestockMaterial) <= 0) {
+                finishRasterStagedWithdrawal(playerCount, contained);
+                return;
+            }
+
+            ArrayList<Integer> sourceCounts = new ArrayList<>(containerSlots);
+            for (int slot = 0; slot < containerSlots; slot++) {
+                ItemStack stack = packet.contents().get(slot);
+                sourceCounts.add(
+                    stack.getItem() == rasterRestockMaterial
+                        ? stack.getCount() : 0
+                );
+            }
+            int sourceSlot = RasterRestockTransferPolicy.bestSourceStackIndex(
+                sourceCounts,
+                Math.max(1, rasterRestockTargetPlayerCount - playerCount)
+            );
+            if (sourceSlot >= 0) {
+                rasterRestockTransferBeforePlayerCount = playerCount;
+                rasterRestockQueuedSourceSlot = sourceSlot;
+                rasterRestockQueuedSyncId = packet.syncId();
+                rasterRestockPhase = RasterRestockPhase.TRANSFER_SENT;
+                rasterPhaseStartedTick = clientActionTick;
+                return;
+            }
+            return;
+        }
+        if (rasterRestockPhase == RasterRestockPhase.WAIT_RETURN) {
+            rememberRasterRestockPlayerSlots(packet, containerSlots);
+            int playerShulkers = packetPlayerRestockShulkerCount(packet);
+            int sourceShulkers = packetContainerRestockShulkerCount(
+                packet,
+                containerSlots
+            );
+            if (rasterRestockReturnConfirmationReopen) {
+                RasterRestockTransferPolicy.ReturnConfirmation confirmation =
+                    RasterRestockTransferPolicy.confirmReturnAfterReopen(
+                        playerShulkers,
+                        sourceShulkers,
+                        rasterRestockAttempts,
+                        3
+                    );
+                rasterRestockReturnConfirmationReopen = false;
+                if (confirmation
+                    == RasterRestockTransferPolicy.ReturnConfirmation.COMPLETE) {
+                    mc.player.closeHandledScreen();
+                    finishRasterRestock();
+                    return;
+                }
+                if (confirmation
+                    == RasterRestockTransferPolicy.ReturnConfirmation.FAIL) {
+                    failBoatRaster("returned shulker was absent from both the player and its source chest, or return retries were exhausted");
+                    return;
+                }
+                rasterRestockAttempts++;
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Boat Raster shulker remained in player inventory after return attempt; retry {}/3",
+                    rasterRestockAttempts
+                );
+            }
+            for (int slot = containerSlots; slot < packet.contents().size(); slot++) {
+                if (!isCurrentRestockShulker(packet.contents().get(slot))) continue;
+                rasterRestockQueuedSourceSlot = slot;
+                rasterRestockQueuedSyncId = packet.syncId();
+                rasterEmptyShellsBefore = playerShulkers;
+                rasterRestockPhase = RasterRestockPhase.DEPOSIT_SENT;
+                rasterPhaseStartedTick = clientActionTick;
+                return;
+            }
+            if (playerShulkers == 0 && sourceShulkers > 0) {
+                mc.player.closeHandledScreen();
+                finishRasterRestock();
+                return;
+            }
+            failBoatRaster("restock shulker was not present in either the player inventory or source chest");
+        } else if (rasterRestockPhase == RasterRestockPhase.DEPOSIT_SENT
+            && packetPlayerRestockShulkerCount(packet) < rasterEmptyShellsBefore) {
+            mc.player.closeHandledScreen();
+            finishRasterRestock();
+        }
+    }
+
+    private void rememberRasterRestockPlayerSlots(
+        InventoryS2CPacket packet,
+        int containerSlots
+    ) {
+        rasterRestockContainerSlots = containerSlots;
+        rasterRestockPlayerMaterialSlots.clear();
+        rasterRestockPlayerShulkerSlots.clear();
+        int playerEnd = Math.min(
+            packet.contents().size(),
+            containerSlots + 36
+        );
+        for (int slot = containerSlots; slot < playerEnd; slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            rasterRestockPlayerMaterialSlots.put(
+                slot,
+                stack.getItem() == rasterRestockMaterial ? stack.getCount() : 0
+            );
+            rasterRestockPlayerShulkerSlots.put(
+                slot,
+                isCurrentRestockShulker(stack) ? stack.getCount() : 0
+            );
+        }
+    }
+
+    private void handleRasterRestockSlotPacket(
+        ScreenHandlerSlotUpdateS2CPacket packet
+    ) {
+        if (rasterRestockContainerSlots <= 0
+            || packet.getSyncId() != rasterRestockSyncId
+            || packet.getSlot() < rasterRestockContainerSlots
+            || packet.getSlot() >= rasterRestockContainerSlots + 36) {
+            return;
+        }
+
+        int slot = packet.getSlot();
+        ItemStack stack = packet.getStack();
+        rasterRestockPlayerMaterialSlots.put(
+            slot,
+            stack.getItem() == rasterRestockMaterial ? stack.getCount() : 0
+        );
+        rasterRestockPlayerShulkerSlots.put(
+            slot,
+            isCurrentRestockShulker(stack) ? stack.getCount() : 0
+        );
+
+        if (rasterRestockPhase == RasterRestockPhase.TRANSFER_SENT) {
+            int playerCount = rasterRestockPlayerMaterialSlots.values().stream()
+                .mapToInt(Integer::intValue).sum();
+            if (playerCount <= rasterRestockTransferBeforePlayerCount) return;
+            rasterRestockAttempts = 0;
+            if (RasterRestockTransferPolicy.targetReached(
+                playerCount,
+                rasterRestockTargetPlayerCount
+            )) {
+                finishRasterStagedWithdrawal(playerCount, -1);
+            } else {
+                mc.player.closeHandledScreen();
+                rasterRestockPhase = RasterRestockPhase.OPEN_STAGING;
+                rasterPhaseStartedTick = clientActionTick;
+            }
+            return;
+        }
+
+        if (rasterRestockPhase == RasterRestockPhase.DEPOSIT_SENT) {
+            int shulkers = rasterRestockPlayerShulkerSlots.values().stream()
+                .mapToInt(Integer::intValue).sum();
+            if (shulkers < rasterEmptyShellsBefore) {
+                mc.player.closeHandledScreen();
+                finishRasterRestock();
+            }
+        }
+    }
+
+    private void finishRasterStagedWithdrawal(
+        int authoritativePlayerCount,
+        int authoritativeShulkerCount
+    ) {
+        Addon.LOG.info(
+            "[Fullblock Printer] Boat Raster staged withdrawal complete: material={}, playerCount={}, target={}, remainingInShulker={}",
+            rasterRestockMaterial.getName().getString(),
+            authoritativePlayerCount,
+            rasterRestockTargetPlayerCount,
+            authoritativeShulkerCount
+        );
+        mc.player.closeHandledScreen();
+        rasterRestockPhase = RasterRestockPhase.BREAK_STAGING;
+        rasterPhaseStartedTick = clientActionTick;
+        rasterRestockAttempts = 0;
+        rasterStagingBreakProgressTicks = 0;
+        rasterStagingBreakFirstDispatchTick = -1L;
+        rasterStagingBreakLastDispatchTick = -1000L;
+    }
+
+    private int plannedRasterRestockAmount(
+        Item material,
+        int inventoryCapacity,
+        int sourceAvailable
+    ) {
+        int desired = rasterInventoryFillPlan.getOrDefault(
+            material,
+            playerItemCount(material)
+        );
+        int shortage = Math.max(0, desired - playerItemCount(material));
+        return Math.min(shortage, Math.min(inventoryCapacity, sourceAvailable));
+    }
+
+    private int packetPlayerEmptyShulkerCount(InventoryS2CPacket packet) {
+        int count = 0;
+        int playerStart = Math.max(0, packet.contents().size() - 36);
+        for (int slot = playerStart; slot < packet.contents().size(); slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (isEmptyShulker(stack)) count += stack.getCount();
+        }
+        return count;
+    }
+
+    private int packetPlayerRestockShulkerCount(InventoryS2CPacket packet) {
+        int count = 0;
+        int playerStart = Math.max(0, packet.contents().size() - 36);
+        for (int slot = playerStart; slot < packet.contents().size(); slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (isCurrentRestockShulker(stack)) count += stack.getCount();
+        }
+        return count;
+    }
+
+    private int packetContainerRestockShulkerCount(
+        InventoryS2CPacket packet,
+        int containerSlots
+    ) {
+        int count = 0;
+        int end = Math.min(containerSlots, packet.contents().size());
+        for (int slot = 0; slot < end; slot++) {
+            ItemStack stack = packet.contents().get(slot);
+            if (isCurrentRestockShulker(stack)) count += stack.getCount();
+        }
+        return count;
+    }
+
+    private int rasterInventoryCapacity(Item material) {
+        int capacity = 0;
+        int maximum = material.getDefaultStack().getMaxCount();
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getStack(slot);
+            if (stack.isEmpty()) capacity += maximum;
+            else if (stack.getItem() == material) {
+                capacity += Math.max(0, stack.getMaxCount() - stack.getCount());
+            }
+        }
+        return capacity;
+    }
+
     private void addRuntimeSurfaceTarget(CompactCircularNbtPlan.Result plan, int x, int nbtZ) {
         BlockPos relative = new BlockPos(
             x,
             plan.targetSurfaceY(x, nbtZ),
             nbtZ - 1
         );
-        addRuntimeTarget(relative, plan.sourceTopState(x, nbtZ), false);
+        int state = nbtZ == CompactCircularNbtPlan.START_Z
+            ? plan.cobblestoneState()
+            : plan.sourceTopState(x, nbtZ);
+        addRuntimeTarget(relative, state, false);
     }
 
     private void addRuntimeTarget(BlockPos relative, int state, boolean connector) {
@@ -24134,10 +32797,32 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         WButton startContinueButton =
             table.add(
-                theme.button("Start / Continue Staircase")
+                theme.button("Start / Continue Staircased Printer")
             ).widget();
         startContinueButton.action = this::startOrContinueFromHud;
         table.row();
+
+        table.add(theme.label("Staircased Printer", true));
+        table.row();
+        rasterPhaseLabel = table.add(theme.label("Phase: " + rasterStatus)).widget();
+        table.row();
+        rasterProgressLabel = table.add(theme.label("Y - | row 0 | east | frontier 0/0")).widget();
+        table.row();
+        rasterLogisticsLabel = table.add(theme.label(
+            "BoatFly: "
+                + String.format(Locale.ROOT, "%.1f", boatRasterTravelSpeed.get())
+                + " travel / "
+                + String.format(Locale.ROOT, "%.1f", boatRasterBuildSpeed.get())
+                + " strict build blocks/s | confirmations: 0 | boat: not mounted | demand: none"
+        )).widget();
+        table.row();
+        rasterCorrectionLabel = table.add(theme.label("Last server correction: none")).widget();
+        table.row();
+        rasterPlanLabel = table.add(theme.label(
+            "Precomputed plan: 0 waypoints | 0 blocks | 0 materials"
+        )).widget();
+        table.row();
+        refreshRasterStatusWidgets();
 
         File widgetMapFolder = mapFolder;
         if (widgetMapFolder == null) {
@@ -24178,18 +32863,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         };
         table.row();
 
-        WTable slaveTable = new WTable();
-        list.add(slaveTable);
-
-        SlaveTableController slaveController = new SlaveTableController(slaveTable, theme, true);
-        slaveController.rebuild();
-
-        SlaveSystem.tableController = slaveController;
         return list;
     }
 
     @Override
     public String getInfoString() {
+        if (isBoatRasterState()) return rasterStatus;
         if (activeMapName != null) {
             return activeMapName;
         } else if (mapFile != null) {
@@ -24203,14 +32882,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void onRender(Render3DEvent event) {
         if (mapCorner == null || !render.get()) return;
 
-        int renderedDepth = compactPlan == null ? 128 : compactPlan.sizeZ() - 1;
+        int renderedDepth = 129;
         event.renderer.box(
             mapCorner.getX(),
             mapCorner.getY(),
-            mapCorner.getZ(),
+            mapCorner.getZ() - 1,
             mapCorner.getX() + 128,
             mapCorner.getY(),
-            mapCorner.getZ() + renderedDepth,
+            mapCorner.getZ() - 1 + renderedDepth,
             color.get(),
             color.get(),
             ShapeMode.Lines,
@@ -24222,7 +32901,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || state.equals(State.AwaitBlockBreak)
             || state.equals(State.MiningUTraversal)
             || state.equals(State.AwaitUBlockBreak))) {
-            for (BlockPos relative : orderedBuildTargets) {
+            int renderStart = isBoatRasterState()
+                ? Math.max(0, rasterConfirmedFrontier)
+                : 0;
+            int renderEnd = isBoatRasterState()
+                ? Math.min(orderedBuildTargets.size(), renderStart + 256)
+                : orderedBuildTargets.size();
+            for (int renderIndex = renderStart;
+                 renderIndex < renderEnd;
+                 renderIndex++) {
+                BlockPos relative = orderedBuildTargets.get(renderIndex);
                 if (!isInWorkingInterval(relative)) continue;
                 BlockPos renderPos = mapCorner.add(relative);
                 if (!MapAreaCache.getCachedBlockState(renderPos).isAir()) continue;
@@ -24780,6 +33468,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         AwaitSlaveContinue,
         AwaitSlaveMineLine,
         AwaitManualRepair,
+        RasterAcquireBoat,
+        RasterAwaitBoatChest,
+        RasterDeployBoat,
+        RasterMountBoat,
+        RasterClearance,
+        RasterPrinting,
+        RasterRestock,
+        RasterVerify,
+        RasterDisposeExcess,
+        RasterReturnBoat,
+        RasterRecoverBoat,
+        RasterReturnBoatChest,
+        RasterAwaitBoatReturn,
+        RasterCleanup,
         Walking,
         MiningUTraversal,
         Mining,
@@ -24790,6 +33492,44 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Off,
         NotPlacing,
         Always
+    }
+
+    private enum RasterRestockPhase {
+        NONE,
+        EGRESS_ROUTE,
+        TRAVEL_SOURCE,
+        DISEMBARK,
+        BREAK_BOAT,
+        COLLECT_BOAT,
+        WALK_DUMP,
+        DISCARD_EXCESS,
+        WALK_SOURCE,
+        OPEN_SOURCE,
+        WAIT_SOURCE,
+        WITHDRAW_SENT,
+        PLACE_STAGING,
+        OPEN_STAGING,
+        WAIT_STAGING,
+        TRANSFER_SENT,
+        BREAK_STAGING,
+        COLLECT_STAGING,
+        RETURN_SOURCE,
+        OPEN_RETURN,
+        WAIT_RETURN,
+        DEPOSIT_SENT,
+        REJOIN_ROUTE
+    }
+
+    private enum RasterLogisticsRouteStatus {
+        SEARCHING,
+        ARRIVED,
+        REJECTED
+    }
+
+    private enum RasterSetPathStatus {
+        MOVING,
+        ARRIVED,
+        FAILED
     }
 
     private enum ErrorAction {

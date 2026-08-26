@@ -24,6 +24,7 @@ import net.minecraft.util.Pair;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
 import java.util.*;
@@ -166,9 +167,71 @@ public final class Utils {
         Input.setKeyState(mc.options.backKey, pressed);
     }
 
+    public static void setLeftPressed(boolean pressed) {
+        mc.options.leftKey.setPressed(pressed);
+        Input.setKeyState(mc.options.leftKey, pressed);
+    }
+
+    public static void setRightPressed(boolean pressed) {
+        mc.options.rightKey.setPressed(pressed);
+        Input.setKeyState(mc.options.rightKey, pressed);
+    }
+
     public static void setJumpPressed(boolean pressed) {
         mc.options.jumpKey.setPressed(pressed);
         Input.setKeyState(mc.options.jumpKey, pressed);
+    }
+
+    public static void setSprintPressed(boolean pressed) {
+        mc.options.sprintKey.setPressed(pressed);
+        Input.setKeyState(mc.options.sprintKey, pressed);
+    }
+
+    public static void setSneakPressed(boolean pressed) {
+        mc.options.sneakKey.setPressed(pressed);
+        Input.setKeyState(mc.options.sneakKey, pressed);
+    }
+
+    public static boolean isPhysicalMovementPressed() {
+        if (mc.getWindow() == null) return false;
+        long window = mc.getWindow().getHandle();
+        return physicalKeyPressed(window, mc.options.forwardKey)
+            || physicalKeyPressed(window, mc.options.backKey)
+            || physicalKeyPressed(window, mc.options.leftKey)
+            || physicalKeyPressed(window, mc.options.rightKey)
+            || physicalKeyPressed(window, mc.options.jumpKey)
+            || physicalKeyPressed(window, mc.options.sprintKey)
+            || physicalKeyPressed(window, mc.options.sneakKey);
+    }
+
+    /** Restores movement bindings to the real keyboard state after automation yields. */
+    public static void restorePhysicalMovementKeys() {
+        if (mc.getWindow() == null) return;
+        long window = mc.getWindow().getHandle();
+        restorePhysicalKey(window, mc.options.forwardKey);
+        restorePhysicalKey(window, mc.options.backKey);
+        restorePhysicalKey(window, mc.options.leftKey);
+        restorePhysicalKey(window, mc.options.rightKey);
+        restorePhysicalKey(window, mc.options.jumpKey);
+        restorePhysicalKey(window, mc.options.sprintKey);
+        restorePhysicalKey(window, mc.options.sneakKey);
+    }
+
+    private static boolean physicalKeyPressed(
+        long window,
+        net.minecraft.client.option.KeyBinding binding
+    ) {
+        int key = Input.getKey(binding);
+        return key >= 0 && GLFW.glfwGetKey(window, key) == GLFW.GLFW_PRESS;
+    }
+
+    private static void restorePhysicalKey(
+        long window,
+        net.minecraft.client.option.KeyBinding binding
+    ) {
+        boolean pressed = physicalKeyPressed(window, binding);
+        binding.setPressed(pressed);
+        Input.setKeyState(binding, pressed);
     }
 
     public static int findHighestFreeSlot(InventoryS2CPacket packet) {
@@ -222,6 +285,21 @@ public final class Utils {
             button,
             actionType,
             mc.player
+        );
+    }
+
+    /**
+     * Requests a full authoritative player-inventory snapshot without
+     * changing any slot. SWAP on a hotbar slot with that same hotbar button is
+     * an inventory self-swap; the forced stale revision still makes the server
+     * resynchronize handler zero.
+     */
+    public static void requestAuthoritativeHotbarSnapshot(int hotbarSlot) {
+        performAuthoritativeInventoryClick(
+            0,
+            PlayerInventorySyncProbe.handlerSlotForHotbar(hotbarSlot),
+            hotbarSlot,
+            SlotActionType.SWAP
         );
     }
 
