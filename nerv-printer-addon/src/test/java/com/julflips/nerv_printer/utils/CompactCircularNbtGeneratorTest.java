@@ -29,17 +29,22 @@ class CompactCircularNbtGeneratorTest {
 
         assertEquals(untouchedSource, source);
         assertNotEquals(source, generated.root());
-        assertEquals(2, generated.root().getList("palette").orElseThrow().size());
-        assertEquals(16_512, generated.root().getList("blocks").orElseThrow().size());
+        assertEquals(3, generated.root().getList("palette").orElseThrow().size());
+        assertEquals(16_656, generated.root().getList("blocks").orElseThrow().size());
         assertEquals(128, generated.plan().sizeX());
-        assertEquals(1, generated.plan().sizeY());
+        assertEquals(4, generated.plan().sizeY());
         assertEquals(129, generated.plan().sizeZ());
+        assertEquals(144, generated.plan().lightingBlocks().size());
+        assertTrue(generated.plan().minimumGuaranteedSurfaceLight() >= 1);
         CompoundTag marker = generated.root()
             .getCompound("nerv_printer:compact_circular_u")
             .orElseThrow();
         assertEquals("compact_circular_u", marker.getString("format").orElseThrow());
         assertEquals(1, marker.getInt("schema_version").orElseThrow());
         assertEquals(1, marker.getInt("geometry_version").orElseThrow());
+        assertEquals(1, marker.getInt("lighting_version").orElseThrow());
+        assertEquals(3,
+            marker.getInt("end_rod_height_above_surface").orElseThrow());
 
         Path destination = temporaryDirectory.resolve("flat_compact.nbt");
         CompactCircularNbtGenerator.writeValidated(generated, destination);
@@ -86,6 +91,48 @@ class CompactCircularNbtGeneratorTest {
     }
 
     @Test
+    void generatesAndReloadsAContiguousTwoByTwoGrid() {
+        CompoundTag source = flatSourceNbt(256, 257);
+
+        CompactCircularNbtGenerator.GeneratedNbt generated =
+            CompactCircularNbtGenerator.generate(source);
+        CompactCircularNbtGenerator.LoadedNbt reloaded =
+            CompactCircularNbtGenerator.loadOrGenerate(generated.root());
+
+        assertEquals(2, generated.plan().mapColumns());
+        assertEquals(2, generated.plan().mapRows());
+        assertEquals(256, generated.plan().mapWidth());
+        assertEquals(256, generated.plan().visibleRows());
+        assertEquals(257, generated.plan().sourceDepth());
+        assertEquals(576, generated.plan().lightingBlocks().size());
+        assertEquals(66_368,
+            generated.root().getList("blocks").orElseThrow().size());
+        assertEquals(
+            CompactCircularNbtGenerator.InputKind.MARKED_COMPACT,
+            reloaded.inputKind()
+        );
+        assertEquals(generated.root(), reloaded.generated().root());
+    }
+
+    @Test
+    void normalizesAnExactTwoByTwoSingleNbtWithoutDroppingAVisibleRow() {
+        CompoundTag exactSource = flatSourceNbt(256, 256);
+        CompoundTag untouched = exactSource.copy();
+
+        CompactCircularNbtGenerator.GeneratedNbt generated =
+            CompactCircularNbtGenerator.generate(exactSource);
+
+        assertEquals(untouched, exactSource);
+        assertEquals(2, generated.plan().mapColumns());
+        assertEquals(2, generated.plan().mapRows());
+        assertEquals(256, generated.plan().visibleRows());
+        assertEquals(257, generated.plan().sourceDepth());
+        assertEquals(0, generated.plan().sourceTopY(0, 1));
+        assertEquals(0, generated.plan().sourceTopState(0, 1));
+        assertEquals(66_368, generated.plan().generatedBlocks().size());
+    }
+
+    @Test
     void rejectsMarkedCompactNbtWhoseConnectorWasChanged() {
         CompoundTag corrupt = CompactCircularNbtGenerator.generate(steppedSourceNbt())
             .root()
@@ -126,6 +173,44 @@ class CompactCircularNbtGeneratorTest {
     }
 
     @Test
+    void validatesAndUpgradesACompactFileCreatedBeforeLighting() {
+        CompoundTag oldCompact = CompactCircularNbtGenerator
+            .generate(flatSourceNbt())
+            .root()
+            .copy();
+        ListTag blocks = oldCompact.getList("blocks").orElseThrow();
+        for (int index = blocks.size() - 1; index >= 0; index--) {
+            CompoundTag block = blocks.getCompound(index).orElseThrow();
+            if (block.getBooleanOr(
+                "nerv_printer:generated_end_rod",
+                false
+            )) {
+                blocks.remove(index);
+            }
+        }
+        ListTag palette = oldCompact.getList("palette").orElseThrow();
+        palette.remove(palette.size() - 1);
+        oldCompact.getList("size").orElseThrow()
+            .set(1, IntTag.valueOf(1));
+        CompoundTag marker = oldCompact.getCompound(
+            "nerv_printer:compact_circular_u"
+        ).orElseThrow();
+        marker.remove("lighting_version");
+        marker.remove("minimum_surface_block_light");
+        marker.remove("end_rod_height_above_surface");
+
+        CompactCircularNbtGenerator.LoadedNbt loaded =
+            CompactCircularNbtGenerator.loadOrGenerate(oldCompact);
+
+        assertEquals(
+            CompactCircularNbtGenerator.InputKind.MARKED_COMPACT,
+            loaded.inputKind()
+        );
+        assertEquals(144, loaded.generated().plan().lightingBlocks().size());
+        assertEquals(4, loaded.generated().plan().sizeY());
+    }
+
+    @Test
     void rejectsEntitiesAndBlockEntitiesInsteadOfSilentlyDroppingTheirCoordinates() {
         CompoundTag withEntity = flatSourceNbt();
         withEntity.getList("entities").orElseThrow().add(new CompoundTag());
@@ -154,13 +239,17 @@ class CompactCircularNbtGeneratorTest {
     }
 
     private static CompoundTag flatSourceNbt() {
+        return flatSourceNbt(128, 129);
+    }
+
+    private static CompoundTag flatSourceNbt(int width, int sourceDepth) {
         CompoundTag root = new CompoundTag();
         root.putString("author", "compact-test");
 
         ListTag size = new ListTag();
-        size.add(IntTag.valueOf(128));
+        size.add(IntTag.valueOf(width));
         size.add(IntTag.valueOf(1));
-        size.add(IntTag.valueOf(129));
+        size.add(IntTag.valueOf(sourceDepth));
         root.put("size", size);
 
         ListTag palette = new ListTag();
@@ -170,8 +259,8 @@ class CompactCircularNbtGeneratorTest {
         root.put("palette", palette);
 
         ListTag blocks = new ListTag();
-        for (int x = 0; x < 128; x++) {
-            for (int z = 0; z < 129; z++) {
+        for (int x = 0; x < width; x++) {
+            for (int z = 0; z < sourceDepth; z++) {
                 CompoundTag block = new CompoundTag();
                 ListTag position = new ListTag();
                 position.add(IntTag.valueOf(x));

@@ -20,8 +20,10 @@ class CompactCircularNbtPlanTest {
 
         assertEquals(CompactCircularNbtPlan.PAIR_COUNT, result.pairRoutes().size());
         assertEquals(0, result.connectorBlocks().size());
+        assertEquals(144, result.lightingBlocks().size());
+        assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
         assertEquals(CompactCircularNbtPlan.SOURCE_Z_SIZE, result.sizeZ());
-        assertEquals(1, result.sizeY());
+        assertEquals(4, result.sizeY());
         assertEquals(1, result.cobblestoneState());
         assertTrue(result.pairRoutes().stream().allMatch(route -> route.minimumEdges() == 1));
         assertTrue(result.pairRoutes().stream().allMatch(route -> route.routeFamily().equals("simple_u")));
@@ -107,6 +109,59 @@ class CompactCircularNbtPlanTest {
     }
 
     @Test
+    void flatTwoByTwoGridUsesTheDeclaredDynamicDimensions() {
+        int width = 2 * MapGridLayout.TILE_SIZE;
+        int sourceDepth = 2 * MapGridLayout.TILE_SIZE + 1;
+        int[][] heights = new int[width][sourceDepth];
+
+        CompactCircularNbtPlan.Result result =
+            CompactCircularNbtPlan.generate(
+                sourceWithProfiles(heights, width, sourceDepth),
+                List.of("minecraft:stone"),
+                width,
+                sourceDepth
+            );
+
+        assertEquals(2, result.mapColumns());
+        assertEquals(2, result.mapRows());
+        assertEquals(256, result.mapWidth());
+        assertEquals(256, result.visibleRows());
+        assertEquals(257, result.sourceDepth());
+        assertEquals(128, result.pairCount());
+        assertEquals(128, result.pairRoutes().size());
+        assertEquals(0, result.connectorBlocks().size());
+        assertEquals(576, result.lightingBlocks().size());
+        assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
+        assertEquals(66_368, result.generatedBlocks().size());
+        assertEquals(257, result.sizeZ());
+    }
+
+    @Test
+    void flatFiveByFiveSinglePlanCoversEveryMapTile() {
+        int width = 5 * MapGridLayout.TILE_SIZE;
+        int sourceDepth = 5 * MapGridLayout.TILE_SIZE + 1;
+        int[][] heights = new int[width][sourceDepth];
+
+        CompactCircularNbtPlan.Result result =
+            CompactCircularNbtPlan.generate(
+                sourceWithProfiles(heights, width, sourceDepth),
+                List.of("minecraft:stone"),
+                width,
+                sourceDepth
+            );
+
+        assertEquals(5, result.mapColumns());
+        assertEquals(5, result.mapRows());
+        assertEquals(640, result.mapWidth());
+        assertEquals(640, result.visibleRows());
+        assertEquals(641, result.sourceDepth());
+        assertEquals(320, result.pairRoutes().size());
+        assertEquals(3_481, result.lightingBlocks().size());
+        assertEquals(413_721, result.generatedBlocks().size());
+        assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
+    }
+
+    @Test
     void invalidOrIncompleteSourcesFailClosed() {
         int[][] heights = new int[CompactCircularNbtPlan.MAP_WIDTH][CompactCircularNbtPlan.SOURCE_Z_SIZE];
         List<CompactCircularNbtPlan.SourceBlock> missing = sourceWithProfiles(heights);
@@ -134,9 +189,21 @@ class CompactCircularNbtPlanTest {
     }
 
     private static List<CompactCircularNbtPlan.SourceBlock> sourceWithProfiles(int[][] heights) {
+        return sourceWithProfiles(
+            heights,
+            CompactCircularNbtPlan.MAP_WIDTH,
+            CompactCircularNbtPlan.SOURCE_Z_SIZE
+        );
+    }
+
+    private static List<CompactCircularNbtPlan.SourceBlock> sourceWithProfiles(
+        int[][] heights,
+        int width,
+        int sourceDepth
+    ) {
         List<CompactCircularNbtPlan.SourceBlock> blocks = new ArrayList<>();
-        for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
-            for (int z = 0; z < CompactCircularNbtPlan.SOURCE_Z_SIZE; z++) {
+        for (int x = 0; x < width; x++) {
+            for (int z = 0; z < sourceDepth; z++) {
                 blocks.add(new CompactCircularNbtPlan.SourceBlock(
                     blocks.size(),
                     new CompactCircularNbtPlan.Position(x, heights[x][z], z),

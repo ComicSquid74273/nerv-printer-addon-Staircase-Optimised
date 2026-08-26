@@ -27,6 +27,9 @@ public final class CompactCircularNbtGenerator {
     private static final String MARKER_FORMAT = "compact_circular_u";
     private static final int MARKER_SCHEMA_VERSION = 1;
     private static final int MARKER_GEOMETRY_VERSION = 1;
+    private static final int MARKER_LIGHTING_VERSION = 1;
+    private static final String LIGHT_BLOCK_MARKER =
+        "nerv_printer:generated_end_rod";
 
     private CompactCircularNbtGenerator() {
     }
@@ -57,14 +60,14 @@ public final class CompactCircularNbtGenerator {
         if (sourceRoot != null && sourceRoot.get(MARKER_KEY) != null) {
             throw fail("A marked compact NBT must be loaded with loadOrGenerate().");
         }
-        return generateCanonical(sourceRoot);
+        return generateCanonical(sourceRoot, true);
     }
 
     /**
-     * Accepts either a raw 128x129 source or an exact compact file previously
-     * produced by this generator. Compact inputs are reconstructed and
-     * canonical-regenerated before use; the marker or filename is never trusted
-     * as proof that their geometry is valid.
+     * Accepts either a raw contiguous map-grid source or an exact compact file
+     * previously produced by this generator. Compact inputs are reconstructed
+     * and canonical-regenerated before use; the marker or filename is never
+     * trusted as proof that their geometry is valid.
      */
     public static LoadedNbt loadOrGenerate(CompoundTag inputRoot) {
         if (inputRoot == null) throw fail("The structure root is missing.");
@@ -78,7 +81,7 @@ public final class CompactCircularNbtGenerator {
 
         IllegalArgumentException sourceFailure;
         try {
-            GeneratedNbt generated = generateCanonical(inputRoot);
+            GeneratedNbt generated = generateCanonical(inputRoot, true);
             CompoundTag legacyForm = withoutMarker(generated.root());
             if (legacyForm.equals(inputRoot)) {
                 return new LoadedNbt(generated, InputKind.LEGACY_COMPACT);
@@ -95,23 +98,29 @@ public final class CompactCircularNbtGenerator {
             );
         } catch (IllegalArgumentException compactFailure) {
             throw fail(
-                "Input is neither a valid 128x129 source nor an exact generated compact NBT. "
+                "Input is neither a valid contiguous map-grid source nor an exact generated compact NBT. "
                     + "Source check: " + validationMessage(sourceFailure)
                     + " Compact check: " + validationMessage(compactFailure)
             );
         }
     }
 
-    private static GeneratedNbt generateCanonical(CompoundTag sourceRoot) {
+    private static GeneratedNbt generateCanonical(
+        CompoundTag sourceRoot,
+        boolean includeLighting
+    ) {
         if (sourceRoot == null) throw fail("The structure root is missing.");
         if (sourceRoot.get(MARKER_KEY) != null) validateMarker(sourceRoot);
+        sourceRoot = normalizeExactMapGridDepth(sourceRoot);
         ListTag sourceSize = requiredList(sourceRoot, "size");
         ListTag sourcePalette = requiredList(sourceRoot, "palette");
         ListTag sourceBlockList = requiredList(sourceRoot, "blocks");
         if (sourceSize.size() != 3) throw fail("The structure size tag must contain exactly three integers.");
-        requiredInt(sourceSize, 0, "size X");
-        requiredInt(sourceSize, 1, "size Y");
-        requiredInt(sourceSize, 2, "size Z");
+        int sourceWidth = requiredInt(sourceSize, 0, "size X");
+        int sourceHeight = requiredInt(sourceSize, 1, "size Y");
+        int sourceDepth = requiredInt(sourceSize, 2, "size Z");
+        if (sourceHeight <= 0) throw fail("The structure size Y must be positive.");
+        CompactCircularNbtPlan.dimensions(sourceWidth, sourceDepth);
         if (sourcePalette.isEmpty()) throw fail("The structure palette is empty.");
         if (sourceBlockList.isEmpty()) throw fail("The structure contains no blocks.");
 
@@ -125,7 +134,15 @@ public final class CompactCircularNbtGenerator {
 
         List<String> paletteNames = readPaletteNames(sourcePalette);
         List<CompactCircularNbtPlan.SourceBlock> sourceBlocks = readSourceBlocks(sourceBlockList);
-        CompactCircularNbtPlan.Result plan = CompactCircularNbtPlan.generate(sourceBlocks, paletteNames);
+        int uprightEndRodState = uprightEndRodState(sourcePalette);
+        CompactCircularNbtPlan.Result plan = CompactCircularNbtPlan.generate(
+            sourceBlocks,
+            paletteNames,
+            sourceWidth,
+            sourceDepth,
+            uprightEndRodState,
+            includeLighting
+        );
 
         CompoundTag outputRoot = sourceRoot.copy();
         ListTag outputPalette = requiredList(outputRoot, "palette");
@@ -139,6 +156,21 @@ public final class CompactCircularNbtGenerator {
         if (plan.cobblestoneState() >= outputPalette.size()) {
             throw fail("Could not resolve the cobblestone palette state.");
         }
+        if (plan.lightingEnabled()
+            && plan.endRodState() == outputPalette.size()) {
+            CompoundTag endRod = new CompoundTag();
+            endRod.putString("Name", CompactCircularNbtPlan.END_ROD_NAME);
+            CompoundTag properties = new CompoundTag();
+            properties.putString("facing", "up");
+            endRod.put("Properties", properties);
+            outputPalette.add(endRod);
+            paletteNames = new ArrayList<>(paletteNames);
+            paletteNames.add(CompactCircularNbtPlan.END_ROD_NAME);
+        }
+        if (plan.lightingEnabled()
+            && plan.endRodState() >= outputPalette.size()) {
+            throw fail("Could not resolve the upright end-rod palette state.");
+        }
 
         ListTag outputBlocks = requiredList(outputRoot, "blocks");
         if (outputBlocks.size() != sourceBlocks.size()) {
@@ -146,7 +178,7 @@ public final class CompactCircularNbtGenerator {
         }
 
         for (CompactCircularNbtPlan.GeneratedBlock generated : plan.generatedBlocks()) {
-            if (generated.connector()) continue;
+            if (generated.connector() || generated.lighting()) continue;
             int sourceIndex = generated.sourceIndex();
             CompoundTag block = outputBlocks.getCompound(sourceIndex)
                 .orElseThrow(() -> fail("Output block " + sourceIndex + " is not a compound."));
@@ -172,6 +204,11 @@ public final class CompactCircularNbtGenerator {
             block.putInt("state", connector.state());
             outputBlocks.add(block);
         }
+        for (CompactCircularNbtPlan.GeneratedBlock light : plan.lightingBlocks()) {
+            CompoundTag block = generatedBlockTag(light);
+            block.putBoolean(LIGHT_BLOCK_MARKER, true);
+            outputBlocks.add(block);
+        }
 
         ListTag outputSize = requiredList(outputRoot, "size");
         outputSize.set(0, IntTag.valueOf(plan.sizeX()));
@@ -182,6 +219,83 @@ public final class CompactCircularNbtGenerator {
         GeneratedNbt generated = new GeneratedNbt(outputRoot, plan, paletteNames);
         verifyGeneratedNbt(generated, outputRoot);
         return generated;
+    }
+
+    /**
+     * Converts an exact C*128 by R*128 map mosaic into the canonical source
+     * form used by the staircase planner. The first visible row is retained
+     * at Z=1 and copied to Z=0 as a synthetic northern reference row.
+     */
+    private static CompoundTag normalizeExactMapGridDepth(
+        CompoundTag sourceRoot
+    ) {
+        ListTag sourceSize = requiredList(sourceRoot, "size");
+        if (sourceSize.size() != 3) {
+            throw fail(
+                "The structure size tag must contain exactly three integers."
+            );
+        }
+        int sourceWidth = requiredInt(sourceSize, 0, "size X");
+        int sourceDepth = requiredInt(sourceSize, 2, "size Z");
+        MapGridLayout.Detected detected =
+            MapGridLayout.detectRawStructure(
+                sourceWidth,
+                sourceDepth
+            );
+        if (detected.includesNorthernReferenceRow()) {
+            return sourceRoot;
+        }
+
+        CompoundTag normalized = sourceRoot.copy();
+        ListTag inputBlocks = requiredList(sourceRoot, "blocks");
+        ListTag normalizedBlocks = new ListTag();
+        boolean copiedReferenceShaft = false;
+        for (int index = 0; index < inputBlocks.size(); index++) {
+            int blockIndex = index;
+            CompoundTag input = inputBlocks.getCompound(index)
+                .orElseThrow(() -> fail(
+                    "Block " + blockIndex + " is not a compound."
+                ));
+            ListTag inputPosition = requiredList(input, "pos");
+            if (inputPosition.size() != 3) {
+                throw fail(
+                    "Block " + index + " has an invalid position."
+                );
+            }
+            int z = requiredInt(
+                inputPosition,
+                2,
+                "block " + index + " Z"
+            );
+            if (z < 0 || z >= sourceDepth) {
+                throw fail(
+                    "Block " + index
+                        + " lies outside the declared source depth."
+                );
+            }
+            if (z == 0) {
+                normalizedBlocks.add(input.copy());
+                copiedReferenceShaft = true;
+            }
+
+            CompoundTag shifted = input.copy();
+            ListTag shiftedPosition = requiredList(shifted, "pos");
+            shiftedPosition.set(2, IntTag.valueOf(z + 1));
+            normalizedBlocks.add(shifted);
+        }
+        if (!copiedReferenceShaft) {
+            throw fail(
+                "An exact-size map-grid NBT has no Z=0 blocks from which "
+                    + "to synthesize its northern reference row."
+            );
+        }
+
+        normalized.put("blocks", normalizedBlocks);
+        requiredList(normalized, "size").set(
+            2,
+            IntTag.valueOf(Math.addExact(sourceDepth, 1))
+        );
+        return normalized;
     }
 
     private static GeneratedNbt loadCanonicalCompact(
@@ -195,14 +309,24 @@ public final class CompactCircularNbtGenerator {
         }
 
         CompoundTag reconstructedSource = reconstructSource(compactRoot);
-        GeneratedNbt canonical = generateCanonical(reconstructedSource);
+        boolean hasLighting = hasGeneratedLighting(compactRoot);
+        GeneratedNbt canonical = generateCanonical(
+            reconstructedSource,
+            true
+        );
+        GeneratedNbt validationCanonical = hasLighting
+            ? canonical
+            : generateCanonical(reconstructedSource, false);
         if (marked) {
-            verifyGeneratedNbt(canonical, compactRoot);
+            verifyGeneratedNbt(validationCanonical, compactRoot);
         } else {
             CompoundTag upgraded = compactRoot.copy();
-            CompoundTag marker = requiredCompound(canonical.root(), MARKER_KEY);
+            CompoundTag marker = requiredCompound(
+                validationCanonical.root(),
+                MARKER_KEY
+            );
             upgraded.put(MARKER_KEY, marker.copy());
-            verifyGeneratedNbt(canonical, upgraded);
+            verifyGeneratedNbt(validationCanonical, upgraded);
         }
         return canonical;
     }
@@ -216,9 +340,20 @@ public final class CompactCircularNbtGenerator {
 
         ListTag compactBlocks = requiredList(compactRoot, "blocks");
         if (compactBlocks.isEmpty()) throw fail("The structure contains no blocks.");
-        int[] startingTopY = new int[CompactCircularNbtPlan.MAP_WIDTH];
-        int[] startingTopState = new int[CompactCircularNbtPlan.MAP_WIDTH];
-        boolean[] startingTopPresent = new boolean[CompactCircularNbtPlan.MAP_WIDTH];
+        int sourceWidth = CompactCircularNbtPlan.MAP_WIDTH;
+        int sourceDepth = CompactCircularNbtPlan.SOURCE_Z_SIZE;
+        CompoundTag marker = compactRoot.getCompound(MARKER_KEY).orElse(null);
+        if (marker != null) {
+            sourceWidth = marker.getInt("source_width")
+                .orElseThrow(() -> fail("The compact marker has no source width."));
+            sourceDepth = marker.getInt("source_depth")
+                .orElseThrow(() -> fail("The compact marker has no source depth."));
+        }
+        CompactCircularNbtPlan.Dimensions dimensions =
+            CompactCircularNbtPlan.dimensions(sourceWidth, sourceDepth);
+        int[] startingTopY = new int[dimensions.mapWidth()];
+        int[] startingTopState = new int[dimensions.mapWidth()];
+        boolean[] startingTopPresent = new boolean[dimensions.mapWidth()];
 
         for (int index = 0; index < compactBlocks.size(); index++) {
             int blockIndex = index;
@@ -235,7 +370,7 @@ public final class CompactCircularNbtGenerator {
             }
             if (position.z() != CompactCircularNbtPlan.START_Z
                 || position.x() < 0
-                || position.x() >= CompactCircularNbtPlan.MAP_WIDTH) {
+                || position.x() >= dimensions.mapWidth()) {
                 continue;
             }
             if (!startingTopPresent[position.x()]
@@ -246,7 +381,7 @@ public final class CompactCircularNbtGenerator {
             }
         }
 
-        for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
+        for (int x = 0; x < dimensions.mapWidth(); x++) {
             if (!startingTopPresent[x]) {
                 throw fail("A generated compact NBT is missing its Z=0 surface at X=" + x + ".");
             }
@@ -263,9 +398,15 @@ public final class CompactCircularNbtGenerator {
         ListTag sourceBlocks = new ListTag();
         for (int index = 0; index < compactBlocks.size(); index++) {
             CompoundTag compactBlock = compactBlocks.getCompound(index).orElseThrow();
+            if (compactBlock.getBooleanOr(
+                LIGHT_BLOCK_MARKER,
+                false
+            )) {
+                continue;
+            }
             CompactCircularNbtPlan.Position position =
                 readPosition(requiredList(compactBlock, "pos"));
-            if (position.z() > CompactCircularNbtPlan.FAR_Z) continue;
+            if (position.z() > dimensions.visibleRows()) continue;
 
             CompoundTag sourceBlock = compactBlock.copy();
             ListTag sourcePosition = requiredList(sourceBlock, "pos");
@@ -275,9 +416,9 @@ public final class CompactCircularNbtGenerator {
         source.put("blocks", sourceBlocks);
 
         ListTag sourceSize = new ListTag();
-        sourceSize.add(IntTag.valueOf(CompactCircularNbtPlan.MAP_WIDTH));
+        sourceSize.add(IntTag.valueOf(dimensions.mapWidth()));
         sourceSize.add(IntTag.valueOf(1));
-        sourceSize.add(IntTag.valueOf(CompactCircularNbtPlan.SOURCE_Z_SIZE));
+        sourceSize.add(IntTag.valueOf(dimensions.sourceDepth()));
         source.put("size", sourceSize);
         return source;
     }
@@ -290,9 +431,23 @@ public final class CompactCircularNbtGenerator {
         marker.putString("format", MARKER_FORMAT);
         marker.putInt("schema_version", MARKER_SCHEMA_VERSION);
         marker.putInt("geometry_version", MARKER_GEOMETRY_VERSION);
-        marker.putInt("source_width", CompactCircularNbtPlan.MAP_WIDTH);
-        marker.putInt("source_depth", CompactCircularNbtPlan.SOURCE_Z_SIZE);
+        marker.putInt("source_width", plan.mapWidth());
+        marker.putInt("source_depth", plan.sourceDepth());
         marker.putInt("maximum_extension", plan.maximumExtension());
+        if (plan.lightingEnabled()) {
+            marker.putInt(
+                "lighting_version",
+                MARKER_LIGHTING_VERSION
+            );
+            marker.putInt(
+                "minimum_surface_block_light",
+                plan.minimumGuaranteedSurfaceLight()
+            );
+            marker.putInt(
+                "end_rod_height_above_surface",
+                EndRodLightingPlan.HEIGHT_ABOVE_SURFACE
+            );
+        }
         root.put(MARKER_KEY, marker);
     }
 
@@ -310,6 +465,8 @@ public final class CompactCircularNbtGenerator {
             .orElseThrow(() -> fail("The compact marker has no source depth."));
         int maximumExtension = marker.getInt("maximum_extension")
             .orElseThrow(() -> fail("The compact marker has no maximum extension."));
+        Integer lightingVersion = marker.getInt("lighting_version")
+            .orElse(null);
 
         if (!MARKER_FORMAT.equals(format)) throw fail("The compact marker format is unsupported.");
         if (schemaVersion != MARKER_SCHEMA_VERSION) {
@@ -318,13 +475,21 @@ public final class CompactCircularNbtGenerator {
         if (geometryVersion != MARKER_GEOMETRY_VERSION) {
             throw fail("Unsupported compact geometry version " + geometryVersion + ".");
         }
-        if (sourceWidth != CompactCircularNbtPlan.MAP_WIDTH
-            || sourceDepth != CompactCircularNbtPlan.SOURCE_Z_SIZE) {
-            throw fail("The compact marker source dimensions are invalid.");
-        }
+        CompactCircularNbtPlan.dimensions(sourceWidth, sourceDepth);
         if (maximumExtension < 0
             || maximumExtension > CompactCircularNbtPlan.MAX_OUTSIDE_EXTENSION) {
             throw fail("The compact marker maximum extension is invalid.");
+        }
+        if (lightingVersion != null) {
+            if (lightingVersion != MARKER_LIGHTING_VERSION
+                || marker.getInt("minimum_surface_block_light")
+                    .orElse(-1)
+                    < EndRodLightingPlan.MINIMUM_SURFACE_LIGHT
+                || marker.getInt("end_rod_height_above_surface")
+                    .orElse(-1)
+                    != EndRodLightingPlan.HEIGHT_ABOVE_SURFACE) {
+                throw fail("The compact marker lighting contract is invalid.");
+            }
         }
     }
 
@@ -442,6 +607,58 @@ public final class CompactCircularNbtGenerator {
         }
     }
 
+    private static CompoundTag generatedBlockTag(
+        CompactCircularNbtPlan.GeneratedBlock generated
+    ) {
+        CompoundTag block = new CompoundTag();
+        ListTag position = new ListTag();
+        position.add(IntTag.valueOf(generated.position().x()));
+        position.add(IntTag.valueOf(generated.position().y()));
+        position.add(IntTag.valueOf(generated.position().z()));
+        block.put("pos", position);
+        block.putInt("state", generated.state());
+        return block;
+    }
+
+    private static boolean hasGeneratedLighting(CompoundTag root) {
+        ListTag blocks = requiredList(root, "blocks");
+        for (int index = 0; index < blocks.size(); index++) {
+            int blockIndex = index;
+            CompoundTag block = blocks.getCompound(index)
+                .orElseThrow(() -> fail(
+                    "Generated block " + blockIndex
+                        + " is not a compound."
+                ));
+            if (block.getBooleanOr(LIGHT_BLOCK_MARKER, false)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int uprightEndRodState(ListTag palette) {
+        for (int index = palette.size() - 1; index >= 0; index--) {
+            int paletteIndex = index;
+            CompoundTag entry = palette.getCompound(index)
+                .orElseThrow(() -> fail(
+                    "Palette entry " + paletteIndex
+                        + " is not a compound."
+                ));
+            if (!CompactCircularNbtPlan.END_ROD_NAME.equals(
+                entry.getStringOr("Name", "")
+            )) {
+                continue;
+            }
+            CompoundTag properties = entry.getCompound("Properties")
+                .orElse(null);
+            if (properties != null
+                && "up".equals(properties.getStringOr("facing", ""))) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
     private static List<String> readPaletteNames(ListTag palette) {
         List<String> names = new ArrayList<>(palette.size());
         for (int index = 0; index < palette.size(); index++) {
@@ -463,6 +680,12 @@ public final class CompactCircularNbtGenerator {
                 .orElseThrow(() -> fail("Block " + blockIndex + " is not a compound."));
             if (block.get("nbt") != null) {
                 throw fail("Block entities are not supported (block " + index + ").");
+            }
+            if (block.get(LIGHT_BLOCK_MARKER) != null) {
+                throw fail(
+                    "Source block " + index
+                        + " uses a reserved generated-light marker."
+                );
             }
             int state = block.getInt("state")
                 .orElseThrow(() -> fail("Block " + blockIndex + " has no state."));

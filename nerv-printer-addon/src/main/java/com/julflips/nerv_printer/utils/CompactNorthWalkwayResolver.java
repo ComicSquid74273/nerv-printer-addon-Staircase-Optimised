@@ -50,7 +50,7 @@ public final class CompactNorthWalkwayResolver {
     /**
      * Candidate heights are the intersection of every first-row support's
      * one-block walking range. World safety may be checked for only the active
-     * interval, but the candidate geometry always covers all 128 columns.
+     * interval, but the candidate geometry always covers the full map width.
      */
     public static Resolution resolve(
         int[] firstVisibleRowY,
@@ -60,22 +60,17 @@ public final class CompactNorthWalkwayResolver {
     ) {
         Objects.requireNonNull(firstVisibleRowY, "firstVisibleRowY");
         Objects.requireNonNull(probe, "probe");
-        if (firstVisibleRowY.length != CompactCircularNbtPlan.MAP_WIDTH) {
-            throw new IllegalArgumentException("Expected 128 first-row heights.");
+        if (firstVisibleRowY.length < 2) {
+            throw new IllegalArgumentException("Expected at least two first-row heights.");
         }
         if (minimumX < 0
-            || maximumX >= CompactCircularNbtPlan.MAP_WIDTH
+            || maximumX >= firstVisibleRowY.length
             || minimumX > maximumX) {
             throw new IllegalArgumentException("Invalid north-walkway X interval.");
         }
 
-        int minimumCandidate = Integer.MIN_VALUE;
-        int maximumCandidate = Integer.MAX_VALUE;
-        for (int firstY : firstVisibleRowY) {
-            minimumCandidate = Math.max(minimumCandidate, firstY - 1);
-            maximumCandidate = Math.min(maximumCandidate, firstY + 1);
-        }
-        if (minimumCandidate > maximumCandidate) {
+        List<Integer> candidates = candidateHeights(firstVisibleRowY);
+        if (candidates.isEmpty()) {
             return new Resolution(
                 Status.NO_WALKABLE_HEIGHT,
                 null,
@@ -84,11 +79,9 @@ public final class CompactNorthWalkwayResolver {
             );
         }
 
-        List<Integer> candidates = new ArrayList<>();
         List<Integer> safeRows = new ArrayList<>();
         boolean unavailable = false;
-        for (int relativeY = minimumCandidate; relativeY <= maximumCandidate; relativeY++) {
-            candidates.add(relativeY);
+        for (int relativeY : candidates) {
             boolean safe = true;
             for (int x = minimumX; x <= maximumX; x++) {
                 Cell cell = Objects.requireNonNull(
@@ -123,5 +116,27 @@ public final class CompactNorthWalkwayResolver {
             candidates,
             safeRows
         );
+    }
+
+    /** Returns every flat walkway height that stays within one block of the first visible row. */
+    public static List<Integer> candidateHeights(int[] firstVisibleRowY) {
+        Objects.requireNonNull(firstVisibleRowY, "firstVisibleRowY");
+        if (firstVisibleRowY.length < 2) {
+            throw new IllegalArgumentException("Expected at least two first-row heights.");
+        }
+        int minimumCandidate = Integer.MIN_VALUE;
+        int maximumCandidate = Integer.MAX_VALUE;
+        for (int firstY : firstVisibleRowY) {
+            minimumCandidate = Math.max(minimumCandidate, firstY - 1);
+            maximumCandidate = Math.min(maximumCandidate, firstY + 1);
+        }
+        if (minimumCandidate > maximumCandidate) return List.of();
+        ArrayList<Integer> candidates = new ArrayList<>();
+        for (int relativeY = minimumCandidate;
+             relativeY <= maximumCandidate;
+             relativeY++) {
+            candidates.add(relativeY);
+        }
+        return List.copyOf(candidates);
     }
 }

@@ -30,8 +30,8 @@ public final class MapAreaCache {
     }
 
     public static boolean isMapAreaClear() {
-        for (int x = 0; x < 128; x++) {
-            for (int z = 0; z < 128; z++) {
+        for (int x = minimumRelativeX; x <= maximumRelativeX; x++) {
+            for (int z = minimumRelativeZ; z <= maximumRelativeZ; z++) {
                 BlockState blockState = mc.level.getBlockState(mapCorner.offset(x, 0, z));
                 if (!blockState.isAir() || !blockState.getFluidState().isEmpty()) return false;
             }

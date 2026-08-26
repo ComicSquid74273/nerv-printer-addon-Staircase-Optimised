@@ -681,13 +681,17 @@ public final class SlaveSystem {
             return;
         }
         // Compact circular traversal owns columns in inseparable (even, odd)
-        // pairs. Distribute 64 pairs so no connector is split between bots.
+        // pairs. Use the active NBT width so a contiguous multi-map print can
+        // be split without leaving columns unassigned.
         ArrayList<String> participatingSlaves = new ArrayList<>();
         for (String slave : slaves) {
             if (!removedSlaves.contains(slave)) participatingSlaves.add(slave);
         }
         ArrayList<Tuple<Integer, Integer>> intervals = new ArrayList<>(
-            partitionCircularColumns(participatingSlaves.size() + 1)
+            partitionCircularColumns(
+                participatingSlaves.size() + 1,
+                printerModule.getMapWidth()
+            )
         );
         assignedIntervals.clear();
         acknowledgedIntervals.clear();
@@ -884,6 +888,9 @@ public final class SlaveSystem {
                 case "start":
                     printerModule.start();
                     break;
+                case "printingDone":
+                    printerModule.finishPrintingOnlyCycle();
+                    break;
                 case "remove":
                     String previousMaster = master;
                     master = null;
@@ -1060,24 +1067,35 @@ public final class SlaveSystem {
     }
 
     /**
-     * Splits all 64 inseparable U-pairs into exactly {@code botCount}
-     * non-empty, gap-free intervals. Integer boundary partitioning is
-     * important here: ceil-sized chunks can produce fewer chunks than bots
-     * for counts such as 9 or 12, leaving a configured slave unassigned.
+     * Splits the legacy 128 columns into exactly {@code botCount} non-empty,
+     * gap-free, pair-aligned intervals.
      */
     static List<Tuple<Integer, Integer>> partitionCircularColumns(
         int botCount
     ) {
-        if (botCount < 1 || botCount > 64) {
+        return partitionCircularColumns(botCount, 128);
+    }
+
+    static List<Tuple<Integer, Integer>> partitionCircularColumns(
+        int botCount,
+        int totalColumns
+    ) {
+        if (totalColumns < 2 || (totalColumns & 1) != 0) {
             throw new IllegalArgumentException(
-                "botCount must be between 1 and 64."
+                "totalColumns must be a positive even number."
+            );
+        }
+        int pairCount = totalColumns / 2;
+        if (botCount < 1 || botCount > pairCount) {
+            throw new IllegalArgumentException(
+                "botCount must be between 1 and " + pairCount + "."
             );
         }
         ArrayList<Tuple<Integer, Integer>> intervals =
             new ArrayList<>(botCount);
         for (int index = 0; index < botCount; index++) {
-            int startPair = index * 64 / botCount;
-            int endPair = (index + 1) * 64 / botCount - 1;
+            int startPair = index * pairCount / botCount;
+            int endPair = (index + 1) * pairCount / botCount - 1;
             intervals.add(
                 new Tuple<>(startPair * 2, endPair * 2 + 1)
             );

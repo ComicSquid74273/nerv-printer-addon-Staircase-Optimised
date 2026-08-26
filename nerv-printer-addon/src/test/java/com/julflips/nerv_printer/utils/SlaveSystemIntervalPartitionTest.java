@@ -45,4 +45,26 @@ class SlaveSystemIntervalPartitionTest {
             () -> SlaveSystem.partitionCircularColumns(65)
         );
     }
+
+    @Test
+    void partitionsAContiguousSixMapWideGridWithoutGaps() {
+        int totalColumns = 6 * MapGridLayout.TILE_SIZE;
+        List<Tuple<Integer, Integer>> intervals =
+            SlaveSystem.partitionCircularColumns(7, totalColumns);
+
+        assertEquals(7, intervals.size());
+        assertEquals(0, intervals.getFirst().getA());
+        assertEquals(totalColumns - 1, intervals.getLast().getB());
+        for (int index = 0; index < intervals.size(); index++) {
+            Tuple<Integer, Integer> interval = intervals.get(index);
+            assertEquals(0, interval.getA() % 2);
+            assertEquals(1, interval.getB() % 2);
+            if (index > 0) {
+                assertEquals(
+                    intervals.get(index - 1).getB() + 1,
+                    interval.getA()
+                );
+            }
+        }
+    }
 }

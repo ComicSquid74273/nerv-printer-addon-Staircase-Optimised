@@ -6,6 +6,11 @@ import com.julflips.nerv_printer.utils.Tuple;
 
 public interface MapPrinter {
 
+    /** Width of the active contiguous print in block columns. */
+    default int getMapWidth() {
+        return 128;
+    }
+
     void setInterval(Tuple<Integer, Integer> interval);
 
     void mineLine(int minedLines);
@@ -77,6 +82,11 @@ public interface MapPrinter {
 
     default void finishMiningCycle(long sessionId) {
         start();
+    }
+
+    /** Completes a coordinated build without starting any post-print work. */
+    default void finishPrintingOnlyCycle() {
+        pause();
     }
 
     default void slaveMiningCycleFinalized(String slave, long sessionId) {

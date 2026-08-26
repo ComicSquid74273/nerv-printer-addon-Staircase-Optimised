@@ -101,6 +101,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final String FILE_META_CONFIG_SHA256 = "configSha256";
     private static final String FILE_META_PLAN_SHA256 = "compactPlanSha256";
     private static final String FILE_META_CIRCULAR = "circularTraversal";
+    private static final String FILE_META_PRINTING_ONLY = "printingOnly";
+    private static final String FILE_META_MAP_COLUMNS = "mapColumns";
+    private static final String FILE_META_MAP_ROWS = "mapRows";
     private static final String FILE_META_SERVER = "server";
     private static final String FILE_META_DIMENSION = "dimension";
     private static final String FILE_META_MAP_CORNER = "mapCorner";
@@ -124,6 +127,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final Set<String> LOGISTICS_TRAVEL_ACTIONS = Set.of(
         "dump",
         "refill",
+        "registerShulker",
         "sleep",
         "mapMaterialChest",
         "cartographyTable",
@@ -165,8 +169,113 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final int CIRCULAR_BUILD_REJOIN_REPLAY_SUPPORTS = 3;
     private static final int TEARDOWN_PICKAXE_HOTBAR_COUNT = 2;
     private static final int TEARDOWN_AXE_HOTBAR_COUNT = 1;
+    private static final int AUTOMATIC_SHULKER_LINE_Y_RADIUS = 2;
+    private static final int AUTOMATIC_MAP_ANCHOR_HORIZONTAL_RADIUS = 192;
+    private static final int AUTOMATIC_MAP_ANCHOR_VERTICAL_RADIUS = 3;
+    private static final int AUTOMATIC_MAP_ANCHOR_DEPTH_RADIUS = 64;
+    private static final int AUTOMATIC_MAP_ANCHOR_RETRY_TICKS = 40;
     private static final int HOTBAR_SLOT_PENDING = -1;
     private static final int HOTBAR_ITEM_UNAVAILABLE = -2;
+
+    private int configuredMapWidthBlocks() {
+        return Math.multiplyExact(mapColumns.get(), MapGridLayout.TILE_SIZE);
+    }
+
+    private int configuredVisibleDepthBlocks() {
+        return Math.multiplyExact(mapRows.get(), MapGridLayout.TILE_SIZE);
+    }
+
+    private int activeMapWidthBlocks() {
+        return compactPlan == null
+            ? configuredMapWidthBlocks()
+            : compactPlan.mapWidth();
+    }
+
+    private int activeVisibleDepthBlocks() {
+        return compactPlan == null
+            ? configuredVisibleDepthBlocks()
+            : compactPlan.visibleRows();
+    }
+
+    private int activeSourceDepthBlocks() {
+        return activeVisibleDepthBlocks() + 1;
+    }
+
+    private boolean isSingleMapGrid() {
+        return activeMapWidthBlocks() == MapGridLayout.TILE_SIZE
+            && activeVisibleDepthBlocks() == MapGridLayout.TILE_SIZE;
+    }
+
+    private boolean isConfiguredSingleMapGrid() {
+        return mapColumns.get() == 1 && mapRows.get() == 1;
+    }
+
+    private void adoptDetectedMapGrid(MapGridLayout detected) {
+        if (detected.columns() > 64 || detected.rows() > 64) {
+            throw new IllegalArgumentException(
+                "Detected " + detected.columns() + "x" + detected.rows()
+                    + " map grid exceeds the supported 64x64 limit."
+            );
+        }
+        int previousWidth = configuredMapWidthBlocks();
+        boolean ownedWholePreviousGrid = workingInterval == null
+            || workingInterval.getA() == 0
+                && workingInterval.getB() == previousWidth - 1;
+        boolean changed = mapColumns.get() != detected.columns()
+            || mapRows.get() != detected.rows();
+        if (!changed) return;
+        mapColumns.set(detected.columns());
+        mapRows.set(detected.rows());
+        if (ownedWholePreviousGrid) {
+            setInterval(new Tuple<>(0, detected.visibleWidth() - 1));
+        } else if (workingInterval != null) {
+            setInterval(workingInterval);
+        }
+        info(
+            "Auto-detected a §a" + detected.columns() + "x"
+                + detected.rows()
+                + "§r contiguous map grid from the single NBT."
+        );
+    }
+
+    private boolean configuredCircularTraversal() {
+        return circularTraversal.get() && isConfiguredSingleMapGrid();
+    }
+
+    private boolean fileMapModeMatches(Map<String, String> metadata) {
+        return Boolean.toString(printingOnly.get()).equals(
+                metadata.get(FILE_META_PRINTING_ONLY)
+            )
+            && Integer.toString(mapColumns.get()).equals(
+                metadata.get(FILE_META_MAP_COLUMNS)
+            )
+            && Integer.toString(mapRows.get()).equals(
+                metadata.get(FILE_META_MAP_ROWS)
+            );
+    }
+
+    private boolean adoptAdvertisedFileMapGrid(
+        Map<String, String> metadata
+    ) {
+        if (!Boolean.toString(printingOnly.get()).equals(
+                metadata.get(FILE_META_PRINTING_ONLY)
+            )) {
+            return false;
+        }
+        if (!printingOnly.get()) return fileMapModeMatches(metadata);
+        try {
+            int columns = Integer.parseInt(
+                metadata.get(FILE_META_MAP_COLUMNS)
+            );
+            int rows = Integer.parseInt(
+                metadata.get(FILE_META_MAP_ROWS)
+            );
+            adoptDetectedMapGrid(new MapGridLayout(columns, rows));
+            return fileMapModeMatches(metadata);
+        } catch (RuntimeException invalidGrid) {
+            return false;
+        }
+    }
 
     private final CategorizedDebugLogLimiter debugLogLimiter =
         new CategorizedDebugLogLimiter();
@@ -233,6 +342,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Boolean> printingOnly = sgGeneral.add(new BoolSetting.Builder()
+        .name("printing-only")
+        .description("Stop after the map has been authoritatively printed and repaired. No map handoff, finished-map creation, teardown, NBT archival, or next-NBT selection is performed.")
+        .defaultValue(true)
+        .build()
+    );
+
     private final Setting<Boolean> thmInstantRepair = sgGeneral.add(new BoolSetting.Builder()
         .name("thm-instant-repair")
         .description("Temporarily configures Meteor Speed Mine like THM (Damage mode with instamine) only while repairing the active U, then restores its prior state.")
@@ -248,6 +364,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("thm-instant-teardown")
         .description("Temporarily configures Meteor Speed Mine for the one ordered teardown target owned by the U/column traversal, then restores its prior state.")
         .defaultValue(true)
+        .visible(() -> !printingOnly.get())
         .onChanged(enabled -> {
             if (!enabled) releaseTeardownSpeedMine();
         })
@@ -266,6 +383,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             .min(2)
             .max(3)
             .sliderRange(2, 3)
+            .visible(() -> !printingOnly.get())
             .build()
     );
 
@@ -275,6 +393,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .defaultValue(1)
         .min(0.5)
         .sliderRange(0.5, 2)
+        .visible(() -> !printingOnly.get())
         .build()
     );
 
@@ -319,6 +438,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
+    private final Setting<Integer> mapColumns = sgGeneral.add(new IntSetting.Builder()
+        .name("map-columns")
+        .description("Detected number of contiguous 128-block map columns in the source NBT. Loading a single NBT updates this value automatically.")
+        .defaultValue(1)
+        .min(1)
+        .max(64)
+        .sliderRange(1, 16)
+        .build()
+    );
+
+    private final Setting<Integer> mapRows = sgGeneral.add(new IntSetting.Builder()
+        .name("map-rows")
+        .description("Detected number of contiguous 128-block map rows in the source NBT. Loading a single NBT updates this value automatically.")
+        .defaultValue(1)
+        .min(1)
+        .max(64)
+        .sliderRange(1, 16)
+        .build()
+    );
+
     private final Setting<Boolean> customFolderPath = sgGeneral.add(new BoolSetting.Builder()
         .name("custom-folder-path")
         .description("Allows to set a custom path to the nbt folder.")
@@ -342,6 +481,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("use-default-config-file")
         .description("Load a config file when the module is enabled.")
         .defaultValue(false)
+        .visible(() -> !printingOnly.get())
         .build()
     );
 
@@ -351,7 +491,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .defaultValue("carpet-printer-config.json")
         .wide()
         .renderer(StarscriptTextBoxRenderer.class)
-        .visible(() -> useDefaultConfigFile.get())
+        .visible(() -> !printingOnly.get() && useDefaultConfigFile.get())
         .build()
     );
 
@@ -468,6 +608,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .name("move-to-finished-folder")
         .description("Moves finished NBT files into the finished-maps folder in the nerv-printer folder.")
         .defaultValue(true)
+        .visible(() -> !printingOnly.get())
         .build()
     );
 
@@ -501,12 +642,36 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private final Setting<Integer> restockRefillTimeout = sgAdvanced.add(new IntSetting.Builder()
         .name("restock-refill-timeout")
-        .description("How many ticks to wait without another inventory transfer while an exhausted registered material or tool chest is refilled before trying another chest. Zero disables waiting.")
+        .description("How many ticks to wait without another inventory transfer while a registered source is refilled before trying another source. Zero disables waiting.")
         .defaultValue(200)
         .min(0)
         .max(2400)
         .sliderRange(0, 1200)
         .build()
+    );
+
+    private final Setting<Integer> automaticShulkerScanRadius = sgAdvanced.add(
+        new IntSetting.Builder()
+            .name("automatic-shulker-scan-radius")
+            .description("Horizontal radius around the selected first shulker used to discover the rest of its supply line.")
+            .defaultValue(80)
+            .min(8)
+            .max(128)
+            .sliderRange(8, 80)
+            .visible(printingOnly::get)
+            .build()
+    );
+
+    private final Setting<Integer> shulkerReplacementTimeout = sgAdvanced.add(
+        new IntSetting.Builder()
+            .name("shulker-replacement-timeout")
+            .description("Maximum ticks allowed to break an emptied shulker and receive a replacement from its dispenser.")
+            .defaultValue(400)
+            .min(40)
+            .max(2400)
+            .sliderRange(40, 1200)
+            .visible(printingOnly::get)
+            .build()
     );
 
     private final Setting<Boolean> requireCompleteUInventory = sgAdvanced.add(new BoolSetting.Builder()
@@ -735,7 +900,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         new IntSetting.Builder()
             .name("recovery-margin-blocks")
             .description(
-                "Bots must be within this X/Z margin of the 128x128 map area before a coordinated start or recovery."
+                "Bots must be within this X/Z margin of the configured map grid before a coordinated start or recovery."
             )
             .defaultValue(32)
             .min(0)
@@ -840,7 +1005,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     State oldState;
     State debugPreviousState;
     State resumeAfterRestockState;
-    Tuple<Integer, Integer> workingInterval;     //Interval the bot should work in 0-127
+    Tuple<Integer, Integer> workingInterval;     //Inclusive column interval assigned to this bot
     Tuple<Integer, Integer> trueInterval;        //Stores the actual interval in case the old one is temporarily overwritten while repairing
     Tuple<Integer, Integer> pendingInterval;
     boolean fileCoordinatorRoleChangeRequested;
@@ -862,6 +1027,30 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     ClientboundContainerSetContentPacket toBeHandledInvPacket;
     HashMap<Integer, Tuple<Block, Integer>> blockPaletteDict;      //Maps palette block id to the Minecraft block and amount
     HashMap<Item, ArrayList<Tuple<BlockPos, Vec3>>> materialDict; //Maps block to the chest pos and the open position
+    LinkedHashMap<BlockPos, Tuple<BlockPos, Vec3>> automaticShulkerStations;
+    ArrayDeque<Tuple<BlockPos, Vec3>> automaticShulkerRegistrationQueue;
+    HashMap<Item, Integer> automaticRegisteredItemCounts;
+    HashMap<BlockPos, HashMap<Item, Integer>> automaticShulkerContentCounts;
+    HashMap<BlockPos, ArrayList<ItemStack>> automaticShulkerToolStacks;
+    HashSet<BlockPos> automaticShulkerInaccessibleWarnings;
+    BlockPos automaticShulkerLineAnchor;
+    BlockPos automaticShulkerRegistrationTarget;
+    boolean automaticShulkerRegistrationComplete;
+    long automaticShulkerNextRescanTick;
+    int automaticShulkerRescanPass;
+    int automaticShulkerLastLoadedChunkCount;
+    int automaticShulkerLastHorizontalRadius;
+    boolean automaticConfigPersistenceSuppressed;
+    BlockPos recyclingShulkerPos;
+    Vec3 recyclingShulkerOpenPos;
+    long recyclingShulkerBreakAfterSequence;
+    long recyclingShulkerAirSequence;
+    long recyclingShulkerPhaseStartedTick;
+    boolean recyclingShulkerDemandComplete;
+    boolean recyclingShulkerBreakAttempted;
+    boolean lastRestockContainerEmpty;
+    long lastRestockContainerSnapshotSequence;
+    int recyclingPickaxeHotbarSlot;
     HashMap<Item, Tuple<BlockPos, Vec3>> usedToolChests;          //Maps a used tool type to its single chest
     HashMap<BlockPos, Set<Item>> usedToolDepositPlan;
     HashMap<BlockPos, Set<Integer>> usedToolDepositSlotPlan;
@@ -882,6 +1071,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     Tuple<Block, Integer>[][] map;
     CompactCircularNbtPlan.Result compactPlan;
     Integer northWalkwayRelativeY;
+    LinkedHashSet<BlockPos> northWalkwayBuildTargets;
+    long automaticMapAreaNextScanTick;
+    boolean automaticMapAreaScanNoticeShown;
     LinkedHashMap<BlockPos, Block> buildTargets;
     ArrayList<BlockPos> orderedBuildTargets;
     HashMap<Item, Integer> plannedRepairToolDemand;
@@ -1021,6 +1213,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int maximumRelativeSupportY;
     HashSet<BlockPos> connectorTargets;
     HashSet<BlockPos> activeConnectorTargets;
+    HashSet<BlockPos> lightingTargets;
     HashMap<Integer, Boolean> circularPairModes;
     HashSet<Integer> reservedMiningLines;
     HashSet<Integer> currentMiningLines;
@@ -1161,6 +1354,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         startContinueActivationRequested = false;
         freezeForRecoveryClassification();
         cancelLogisticsDetour();
+        if (isPrintingOnlyPostPrintPhase(mapCyclePhase)
+            && refusePrintingOnlyPostPrintAction(
+                "resume the saved " + mapCyclePhase + " phase"
+            )) {
+            return;
+        }
         if (beginReconnectRecoveryIfPending()) return;
         if ((preserveForStartContinue
                 || !activationReset.get())
@@ -1178,6 +1377,32 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
         materialDict = new HashMap<>();
+        automaticShulkerStations = new LinkedHashMap<>();
+        automaticShulkerRegistrationQueue = new ArrayDeque<>();
+        automaticRegisteredItemCounts = new HashMap<>();
+        automaticShulkerContentCounts = new HashMap<>();
+        automaticShulkerToolStacks = new HashMap<>();
+        automaticShulkerInaccessibleWarnings = new HashSet<>();
+        automaticShulkerLineAnchor = null;
+        automaticShulkerRegistrationTarget = null;
+        automaticShulkerRegistrationComplete = false;
+        automaticShulkerNextRescanTick = -1L;
+        automaticShulkerRescanPass = 0;
+        automaticShulkerLastLoadedChunkCount = 0;
+        automaticShulkerLastHorizontalRadius = 0;
+        automaticConfigPersistenceSuppressed = false;
+        automaticMapAreaNextScanTick = -1L;
+        automaticMapAreaScanNoticeShown = false;
+        recyclingShulkerPos = null;
+        recyclingShulkerOpenPos = null;
+        recyclingShulkerBreakAfterSequence = -1L;
+        recyclingShulkerAirSequence = -1L;
+        recyclingShulkerPhaseStartedTick = -1L;
+        recyclingShulkerDemandComplete = false;
+        recyclingShulkerBreakAttempted = false;
+        lastRestockContainerEmpty = false;
+        lastRestockContainerSnapshotSequence = -1L;
+        recyclingPickaxeHotbarSlot = -1;
         usedToolChests = new HashMap<>();
         usedToolDepositPlan = new HashMap<>();
         usedToolDepositSlotPlan = new HashMap<>();
@@ -1190,6 +1415,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         restockInventorySnapshot =
             new ServerInventoryTransferSnapshot(36);
         restockSnapshotUpdateSequence = -1L;
+        lastRestockContainerEmpty = false;
+        lastRestockContainerSnapshotSequence = -1L;
         restockConfirmationPhase = RestockConfirmationPhase.NONE;
         restockRefillWaitState = Optional.empty();
         resetRestockTransferTracking();
@@ -1209,6 +1436,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         restockMandatoryTargets = new HashMap<>();
         knownErrors = new ArrayList<>();
         buildTargets = new LinkedHashMap<>();
+        northWalkwayBuildTargets = new LinkedHashSet<>();
         orderedBuildTargets = new ArrayList<>();
         plannedRepairToolDemand = new HashMap<>();
         plannedPrimaryMaterialDemand = new HashMap<>();
@@ -1325,6 +1553,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         maximumRelativeSupportY = Integer.MIN_VALUE;
         connectorTargets = new HashSet<>();
         activeConnectorTargets = new HashSet<>();
+        lightingTargets = new HashSet<>();
         circularPairModes = new HashMap<>();
         reservedMiningLines = new HashSet<>();
         currentMiningLines = new HashSet<>();
@@ -1355,7 +1584,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         buildRecoveryNeedsInventory = false;
         buildRecoveryRestockAfterEgress = false;
         buildingActive = false;
-        circularTraversalForCurrentMap = circularTraversal.get();
+        circularTraversalForCurrentMap =
+            configuredCircularTraversal();
         reconnectRecoveryPending = false;
         reconnectPlayerInventorySnapshotBaseline = -1L;
         inventoryLogisticsRecovery =
@@ -1483,7 +1713,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         fileCoordinatorRoleChangeReady = false;
         tempChestIsSingle = false;
 
-        setInterval(new Tuple<>(0, 127));
+        setInterval(new Tuple<>(0, configuredMapWidthBlocks() - 1));
         // Initialize Slave System settings
         SlaveSystem.setupSlaveSystem(this, commandDelay.get(), directMessageCommand.get(), senderPrefix.get(), senderSuffix.get(), randomSuffix.get());
 
@@ -1534,14 +1764,208 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         state = State.SelectingMapArea;
-        if (useDefaultConfigFile.get()) {
+        if (printingOnly.get()) {
+            beginAutomaticPrintingMapAreaDetection(true);
+        } else if (useDefaultConfigFile.get()) {
             File configFolder = new File(mapFolder, "_configs");
             if (!loadConfig(new File(configFolder, configFileName.get()))) {
-                info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
+                promptForMapAreaSelection();
             }
         } else {
-            info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
+            promptForMapAreaSelection();
         }
+    }
+
+    private void promptForMapAreaSelection() {
+        info(
+            "Select the §aMap Building Area ("
+                + activeMapWidthBlocks() + "x"
+                + activeVisibleDepthBlocks()
+                + "). (Right-click the north-west map edge from the inside)"
+        );
+    }
+
+    private void beginAutomaticPrintingMapAreaDetection(boolean reportFailure) {
+        state = State.SelectingMapArea;
+        stopMovement();
+        if (!tryDetectAutomaticPrintingMapArea(reportFailure)) {
+            automaticMapAreaNextScanTick = Math.addExact(
+                clientActionTick,
+                AUTOMATIC_MAP_ANCHOR_RETRY_TICKS
+            );
+            return;
+        }
+        continueAfterAutomaticPrintingMapAreaDetection();
+    }
+
+    private void continueAfterAutomaticPrintingMapAreaDetection() {
+        automaticMapAreaNextScanTick = -1L;
+        automaticMapAreaScanNoticeShown = false;
+        if (!tryLoadAutomaticPrintingConfig()) {
+            state = State.SelectingDumpStation;
+            info(
+                "Map area detected automatically. Throw an item into the "
+                    + "§aDump Station."
+            );
+        }
+    }
+
+    private boolean tryDetectAutomaticPrintingMapArea(boolean reportFailure) {
+        if (!printingOnly.get() || compactPlan == null
+            || mc.player == null || mc.level == null) {
+            return false;
+        }
+
+        BlockPos player = mc.player.blockPosition();
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locate(
+                compactPlan.mapWidth(),
+                player.getX(),
+                player.getY(),
+                player.getZ(),
+                AUTOMATIC_MAP_ANCHOR_HORIZONTAL_RADIUS,
+                AUTOMATIC_MAP_ANCHOR_VERTICAL_RADIUS,
+                AUTOMATIC_MAP_ANCHOR_DEPTH_RADIUS,
+                (x, y, z) -> {
+                    if (!mc.level.getChunkSource().hasChunk(
+                            x >> 4,
+                            z >> 4
+                        )) {
+                        return CenteredNorthWalkwayLocator.Cell.UNAVAILABLE;
+                    }
+                    BlockPos support = new BlockPos(x, y, z);
+                    boolean safe =
+                        mc.level.getBlockState(support).getBlock()
+                            == Blocks.COBBLESTONE
+                            && mc.level.getBlockState(support.above()).isAir()
+                            && mc.level.getBlockState(support.above(2)).isAir();
+                    return safe
+                        ? CenteredNorthWalkwayLocator.Cell.SAFE
+                        : CenteredNorthWalkwayLocator.Cell.UNSAFE;
+                }
+            );
+        if (!resolution.resolved()) {
+            if (reportFailure && !automaticMapAreaScanNoticeShown) {
+                automaticMapAreaScanNoticeShown = true;
+                String reason = switch (resolution.status()) {
+                    case UNAVAILABLE ->
+                        "part of the possible 128-block anchor is outside loaded chunks";
+                    case AMBIGUOUS ->
+                        "two equally near centered anchors were found";
+                    case NOT_FOUND ->
+                        "no complete aligned 128-block cobblestone anchor was found";
+                    case RESOLVED -> throw new IllegalStateException(
+                        "Resolved automatic map anchor has no anchor."
+                    );
+                };
+                warning(
+                    "Automatic map-area detection is waiting: " + reason
+                        + ". Stand near the player-built center north row. "
+                        + "It must be exactly 128 cobblestone supports at "
+                        + "map Z -1 with two air blocks above it; the printer "
+                        + "will retry automatically."
+                );
+            }
+            return false;
+        }
+
+        int[] firstVisibleRowY = new int[compactPlan.mapWidth()];
+        for (int x = 0; x < compactPlan.mapWidth(); x++) {
+            firstVisibleRowY[x] = compactPlan.targetSurfaceY(x, 1);
+        }
+        List<Integer> candidateRelativeYs =
+            CompactNorthWalkwayResolver.candidateHeights(
+                firstVisibleRowY
+            );
+        if (candidateRelativeYs.isEmpty()) {
+            error(
+                "The NBT first row has no common flat entry height for the "
+                    + "automatic north walkway."
+            );
+            return false;
+        }
+        int relativeY = candidateRelativeYs.stream()
+            .min(
+                Comparator
+                    .comparingInt((Integer candidate) ->
+                        Math.abs(candidate))
+                    .thenComparingInt(Integer::intValue)
+            )
+            .orElseThrow();
+        CenteredNorthWalkwayLocator.Anchor anchor = resolution.anchor();
+        mapCorner = new BlockPos(
+            anchor.mapCornerX(),
+            anchor.walkwayY() - relativeY,
+            anchor.mapCornerZ()
+        );
+        northWalkwayRelativeY = relativeY;
+        resetMapAreaCache();
+        installAutomaticNorthWalkwayBuildTargets();
+
+        MapGridLayout grid = new MapGridLayout(
+            compactPlan.mapColumns(),
+            compactPlan.mapRows()
+        );
+        info(
+            "Automatically detected the §a" + grid.columns() + "x"
+                + grid.rows() + "§r map at corner §a"
+                + mapCorner.toShortString() + "§r from the centered 128x1 "
+                + "cobblestone row at world Y " + anchor.walkwayY()
+                + ", Z " + anchor.walkwayZ() + "."
+        );
+        info(
+            "The north chest section is centered on world X=§a"
+                + (mapCorner.getX() + grid.stationCenterOffsetX())
+                + "§r; the printer will build the remaining "
+                + northWalkwayBuildTargets.size()
+                + " outer north-walkway block"
+                + (northWalkwayBuildTargets.size() == 1 ? "" : "s")
+                + "."
+        );
+        return true;
+    }
+
+    private void installAutomaticNorthWalkwayBuildTargets() {
+        if (compactPlan == null || northWalkwayRelativeY == null) {
+            throw new IllegalStateException(
+                "Cannot install an unresolved automatic north walkway."
+            );
+        }
+        int centerStart = automaticNorthWalkwayCenterStartX();
+        int centerEnd = centerStart
+            + CenteredNorthWalkwayLocator.ANCHOR_LENGTH - 1;
+        for (int x = 0; x < compactPlan.mapWidth(); x++) {
+            if (x >= centerStart && x <= centerEnd) continue;
+            BlockPos relative = new BlockPos(
+                x,
+                northWalkwayRelativeY,
+                -1
+            );
+            if (northWalkwayBuildTargets.contains(relative)) continue;
+            addRuntimeTarget(
+                relative,
+                compactPlan.cobblestoneState(),
+                false,
+                false
+            );
+            northWalkwayBuildTargets.add(relative);
+            minimumRelativeSupportY = Math.min(
+                minimumRelativeSupportY,
+                relative.getY()
+            );
+            maximumRelativeSupportY = Math.max(
+                maximumRelativeSupportY,
+                relative.getY()
+            );
+        }
+    }
+
+    private int automaticNorthWalkwayCenterStartX() {
+        if (compactPlan == null) {
+            throw new IllegalStateException("No compact NBT is loaded.");
+        }
+        return (compactPlan.mapWidth()
+            - CenteredNorthWalkwayLocator.ANCHOR_LENGTH) / 2;
     }
 
     private boolean beginReconnectRecoveryIfPending() {
@@ -1698,6 +2122,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (state == State.SelectingDumpStation && event.packet instanceof ServerboundPlayerActionPacket packet
             && packet.getAction() == ServerboundPlayerActionPacket.Action.DROP_ITEM) {
             dumpStation = new Tuple<>(mc.player.position(), new Tuple<>(mc.player.getYRot(), mc.player.getXRot()));
+            if (printingOnly.get()) {
+                if (sleep.get()) {
+                    state = State.SelectingBed;
+                    info("Dump Station selected. Select the §abed used for sleeping.");
+                } else {
+                    promptForAutomaticShulkerLineAnchor();
+                }
+                return;
+            }
             state = State.SelectingFinishedMapChest;
             info("Dump Station selected. Select the §aFinished Map Chest");
             return;
@@ -1705,14 +2138,39 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (!(event.packet instanceof ServerboundUseItemOnPacket packet) || state == null) return;
         switch (state) {
             case SelectingMapArea:
+                if (printingOnly.get()) {
+                    // Printing-only map registration is derived from the
+                    // centered 128x1 cobblestone north anchor.
+                    return;
+                }
                 BlockPos hitPos = packet.getHitResult().getBlockPos().relative(packet.getHitResult().getDirection());
                 int adjustedX = Utils.getIntervalStart(hitPos.getX());
                 int adjustedZ = Utils.getIntervalStart(hitPos.getZ());
                 mapCorner = new BlockPos(adjustedX, hitPos.getY(), adjustedZ);
                 northWalkwayRelativeY = null;
                 resetMapAreaCache();
-                state = State.SelectingTable;
-                info("Map Area selected. Select the §aCartography Table.");
+                MapGridLayout selectedGrid = new MapGridLayout(
+                    mapColumns.get(),
+                    mapRows.get()
+                );
+                int stationCenterX = Math.addExact(
+                    mapCorner.getX(),
+                    selectedGrid.stationCenterOffsetX()
+                );
+                info(
+                    "Map grid selected. Center the north chest section on world X="
+                        + stationCenterX
+                        + (selectedGrid.columns() % 2 == 0
+                            ? " (the seam between the two middle map columns)."
+                            : " (the middle map column).")
+                );
+                if (printingOnly.get()) {
+                    state = State.SelectingDumpStation;
+                    info("Map Area selected. Throw an item into the §aDump Station.");
+                } else {
+                    state = State.SelectingTable;
+                    info("Map Area selected. Select the §aCartography Table.");
+                }
                 break;
             case SelectingTable:
                 BlockPos blockPos = packet.getHitResult().getBlockPos();
@@ -1744,8 +2202,27 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 blockPos = packet.getHitResult().getBlockPos();
                 if (MapAreaCache.getCachedBlockState(blockPos).getBlock() instanceof BedBlock) {
                     bed = new Tuple<>(blockPos, mc.player.position());
-                    info("Bed selected. Select all §aMaterial-, Tool-, and Map-Chests.");
-                    state = State.SelectingChests;
+                    if (printingOnly.get()) {
+                        promptForAutomaticShulkerLineAnchor();
+                    } else {
+                        info("Bed selected. Select all §aMaterial-, Tool-, and Map-Chests.");
+                        state = State.SelectingChests;
+                    }
+                }
+                break;
+            case SelectingShulkerLineAnchor:
+                blockPos = packet.getHitResult().getBlockPos();
+                if (mc.level.getBlockState(blockPos).getBlock()
+                    instanceof ShulkerBoxBlock) {
+                    beginAutomaticShulkerRegistration(
+                        blockPos,
+                        mc.player.position()
+                    );
+                } else {
+                    warning(
+                        "Select the first shulker at either end of the supply "
+                            + "line."
+                    );
                 }
                 break;
             case SelectingChests:
@@ -1753,6 +2230,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     warning("No block selected as Start Block! Please select one in the settings.");
                 blockPos = packet.getHitResult().getBlockPos();
                 BlockState blockState = MapAreaCache.getCachedBlockState(blockPos);
+                if (printingOnly.get()) {
+                    if (startBlocks.get().contains(blockState.getBlock())) {
+                        if (!automaticShulkerRegistrationComplete) {
+                            info(
+                                "Start Block requested an immediate full "
+                                    + "shulker rescan."
+                            );
+                            triggerAutomaticShulkerRescan(true, true);
+                        } else if (validateStartRequirements()) {
+                            startBuilding();
+                        }
+                    }
+                    break;
+                }
                 Block block = blockState.getBlock();
                 if (block instanceof AnvilBlock) {
                     anvil = new Tuple<>(blockPos, mc.player.position());
@@ -1776,6 +2267,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private boolean validateStartRequirements() {
+        if (printingOnly.get()) {
+            if (!automaticShulkerRegistrationComplete) {
+                warning("Automatic shulker registration has not completed.");
+                return false;
+            }
+            return validateAutomaticShulkerCoverage(true);
+        }
         if (materialDict.isEmpty()) {
             warning("No Material Chests selected!");
             return false;
@@ -1864,6 +2362,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (state.equals(State.AwaitUsedToolRegistrationResponse)) {
             registerSelectedUsedToolChest(packet);
             continueAfterUsedToolChestSelection();
+            return;
+        }
+
+        if (state.equals(State.AwaitAutomaticShulkerResponse)) {
+            if (packet.containerId() == 0
+                || packet.items().size() <= 36
+                || mc.player.containerMenu == null
+                || mc.player.containerMenu.containerId
+                    != packet.containerId()) {
+                return;
+            }
+            interactTimeout = 0;
+            registerAutomaticShulkerContents(packet);
             return;
         }
 
@@ -3098,6 +3609,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 restockConfirmationPhase =
                     RestockConfirmationPhase.NONE;
                 resetRestockRefillWait();
+                if (beginAutomaticShulkerRecycle(true)) {
+                    return true;
+                }
                 closeNextInvPacket = true;
                 endRestocking();
                 return true;
@@ -3149,6 +3663,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + " observation"
             );
             resetRestockRefillWait();
+            if (beginAutomaticShulkerRecycle(true)) {
+                return true;
+            }
             closeNextInvPacket = true;
             endRestocking();
             return true;
@@ -3194,6 +3711,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 "no ready compatible source in any container slot;"
                     + " entering or continuing refill wait"
             );
+            if (beginAutomaticShulkerRecycle(false)) {
+                return true;
+            }
             return beginOrContinueRestockRefillWait(requestedItem);
         }
         resetRestockRefillWait();
@@ -3672,7 +4192,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ArrayList<ServerInventoryTransferSnapshot.SlotState> contents =
             new ArrayList<>(packet.items().size());
         int playerStart = packet.items().size() - 36;
+        lastRestockContainerEmpty = true;
         for (int slot = 0; slot < packet.items().size(); slot++) {
+            if (slot < playerStart && !packet.items().get(slot).isEmpty()) {
+                lastRestockContainerEmpty = false;
+            }
             contents.add(
                 restockSlotState(
                     requestedItem,
@@ -3737,6 +4261,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         restockInventorySnapshot.replace(packet.containerId(), contents);
         restockSnapshotUpdateSequence =
+            serverInventoryUpdateSequence;
+        lastRestockContainerSnapshotSequence =
             serverInventoryUpdateSequence;
         debugRestockSnapshot("stored full snapshot");
     }
@@ -3954,6 +4480,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             restockInventorySnapshot.clear();
         }
         restockSnapshotUpdateSequence = -1L;
+        lastRestockContainerEmpty = false;
+        lastRestockContainerSnapshotSequence = -1L;
         restockConfirmationPhase = RestockConfirmationPhase.NONE;
         resetRestockRefillWait();
         resetRestockTransferTracking();
@@ -3963,6 +4491,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         closeNextInvPacket = false;
         interactTimeout = 0;
         lastInteractedChest = null;
+        clearAutomaticShulkerRecycleState();
         if (!discardLogicalPlan) return;
         if (restockList != null) restockList.clear();
         if (restockMandatoryTargets != null) {
@@ -3972,6 +4501,297 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         resumeAfterRestockState = null;
         strictMiningRestockActive = false;
         strictMiningInventoryPlan = null;
+    }
+
+    private boolean beginAutomaticShulkerRecycle(
+        boolean demandComplete
+    ) {
+        if (!printingOnly.get()
+            || state != State.AwaitRestockResponse
+            || lastInteractedChest == null
+            || automaticShulkerStations == null
+            || !automaticShulkerStations.containsKey(lastInteractedChest)
+            || !lastRestockContainerEmpty
+            || lastRestockContainerSnapshotSequence < 0
+            || lastRestockContainerSnapshotSequence
+                != restockSnapshotUpdateSequence
+            || mc.player == null
+            || mc.level == null
+            || !(mc.level.getBlockState(lastInteractedChest).getBlock()
+                instanceof ShulkerBoxBlock)) {
+            return false;
+        }
+
+        int pickaxeSlot = bestUsableRecyclingPickaxeSlot();
+        if (pickaxeSlot < 0) {
+            error(
+                "An automatically registered shulker is empty, but no "
+                    + "usable pickaxe is available to recycle it."
+            );
+            stopBuildForAction();
+            toggle();
+            return true;
+        }
+
+        Tuple<BlockPos, Vec3> station =
+            automaticShulkerStations.get(lastInteractedChest);
+        recyclingShulkerPos = new BlockPos(lastInteractedChest);
+        recyclingShulkerOpenPos = station.getB();
+        recyclingShulkerDemandComplete = demandComplete;
+        recyclingShulkerBreakAfterSequence =
+            serverBlockUpdateSequence;
+        recyclingShulkerAirSequence = -1L;
+        recyclingShulkerPhaseStartedTick = clientActionTick;
+        recyclingShulkerBreakAttempted = false;
+        pendingRestockTransfer = null;
+        restockInventorySnapshot.clear();
+        restockSnapshotUpdateSequence = -1L;
+        lastRestockContainerEmpty = false;
+        lastRestockContainerSnapshotSequence = -1L;
+        restockConfirmationPhase = RestockConfirmationPhase.NONE;
+        resetRestockRefillWait();
+        resetRestockTransferTracking();
+        restockHandlerLeaseRecoveryAttempts = 0;
+        restockBacklogSlots.clear();
+        toBeHandledInvPacket = null;
+        closeNextInvPacket = false;
+        interactTimeout = 0;
+        timeoutTicks = 0;
+        closeCurrentContainerHandler();
+        stopMovement();
+        state = State.AwaitEmptyShulkerBreak;
+
+        if (pickaxeSlot < 9) {
+            recyclingPickaxeHotbarSlot = pickaxeSlot;
+            if (mc.player.getInventory().getSelectedSlot() != pickaxeSlot
+                && !InvUtils.swap(pickaxeSlot, false)) {
+                failAutomaticShulkerRecycle(
+                    "Could not select the pickaxe needed to recycle the "
+                        + "empty shulker."
+                );
+            }
+            return true;
+        }
+
+        int targetHotbarSlot = recyclingPickaxeDestinationSlot();
+        if (targetHotbarSlot < 0) {
+            failAutomaticShulkerRecycle(
+                "No managed hotbar slot is available for the empty-shulker "
+                    + "pickaxe."
+            );
+            return true;
+        }
+        Item expected = mc.player.getInventory().getItem(pickaxeSlot)
+            .getItem();
+        recyclingPickaxeHotbarSlot = targetHotbarSlot;
+        beginConfirmedBuildHotbarSwap(
+            pickaxeSlot,
+            targetHotbarSlot,
+            expected,
+            "empty-shulker pickaxe",
+            true
+        );
+        return true;
+    }
+
+    private int bestUsableRecyclingPickaxeSlot() {
+        if (mc.player == null) return -1;
+        int bestSlot = -1;
+        int bestDurability = -1;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (!stack.is(ItemTags.PICKAXES)
+                || !hasMinimumToolDurability(stack)) {
+                continue;
+            }
+            int durability = remainingToolDurability(stack);
+            boolean betterLocation = bestSlot < 0
+                || (slot < 9 && bestSlot >= 9);
+            if (betterLocation
+                || ((slot < 9) == (bestSlot < 9)
+                    && durability > bestDurability)) {
+                bestSlot = slot;
+                bestDurability = durability;
+            }
+        }
+        return bestSlot;
+    }
+
+    private int recyclingPickaxeDestinationSlot() {
+        if (plannedBuildToolHotbarSlot >= 0
+            && plannedBuildToolHotbarSlot < 9) {
+            return plannedBuildToolHotbarSlot;
+        }
+        if (availableHotBarSlots != null
+            && !availableHotBarSlots.isEmpty()) {
+            return availableHotBarSlots.getFirst();
+        }
+        return mc.player == null
+            ? -1
+            : mc.player.getInventory().getSelectedSlot();
+    }
+
+    private boolean tickAutomaticShulkerRecycle() {
+        if (state != State.AwaitEmptyShulkerBreak
+            && state != State.AwaitReplacementShulker) {
+            return false;
+        }
+        stopMovement();
+        if (mc.player == null
+            || mc.level == null
+            || recyclingShulkerPos == null) {
+            failAutomaticShulkerRecycle(
+                "The empty-shulker replacement state lost its station."
+            );
+            return true;
+        }
+        if (clientActionTick - recyclingShulkerPhaseStartedTick
+            > shulkerReplacementTimeout.get()) {
+            failAutomaticShulkerRecycle(
+                state == State.AwaitEmptyShulkerBreak
+                    ? "The empty shulker could not be broken before the "
+                        + "configured timeout."
+                    : "The dispenser did not place a replacement shulker at "
+                        + recyclingShulkerPos.toShortString()
+                        + " before the configured timeout."
+            );
+            return true;
+        }
+
+        ServerBlockObservation observation =
+            serverBlockObservations.get(recyclingShulkerPos);
+        ShulkerReplacementPolicy.ObservedBlock observedBlock =
+            observation == null
+                ? ShulkerReplacementPolicy.ObservedBlock.UNKNOWN
+                : observation.block() == Blocks.AIR
+                    ? ShulkerReplacementPolicy.ObservedBlock.AIR
+                    : observation.block() instanceof ShulkerBoxBlock
+                        ? ShulkerReplacementPolicy.ObservedBlock.SHULKER
+                        : ShulkerReplacementPolicy.ObservedBlock.OTHER;
+        ShulkerReplacementPolicy.Decision replacementDecision =
+            ShulkerReplacementPolicy.decide(
+                state == State.AwaitEmptyShulkerBreak
+                    ? ShulkerReplacementPolicy.Phase
+                        .BREAKING_EMPTY_BOX
+                    : ShulkerReplacementPolicy.Phase
+                        .WAITING_FOR_REPLACEMENT,
+                recyclingShulkerBreakAttempted,
+                state == State.AwaitEmptyShulkerBreak
+                    ? recyclingShulkerBreakAfterSequence
+                    : recyclingShulkerAirSequence,
+                observation == null ? -1L : observation.sequence(),
+                observedBlock
+            );
+        if (replacementDecision
+            == ShulkerReplacementPolicy.Decision.UNEXPECTED_BLOCK) {
+            failAutomaticShulkerRecycle(
+                "A non-shulker block appeared at the automatic replacement "
+                    + "station " + recyclingShulkerPos.toShortString() + "."
+            );
+            return true;
+        }
+        if (replacementDecision
+            == ShulkerReplacementPolicy.Decision
+                .REPLACEMENT_CONFIRMED) {
+            if (state == State.AwaitEmptyShulkerBreak) {
+                info(
+                    "The dispenser replaced the empty shulker within one "
+                        + "server update."
+                );
+            }
+            completeAutomaticShulkerReplacement();
+            return true;
+        }
+        if (replacementDecision
+            == ShulkerReplacementPolicy.Decision
+                .EMPTY_BOX_CONFIRMED) {
+            recyclingShulkerAirSequence = observation.sequence();
+            recyclingShulkerPhaseStartedTick = clientActionTick;
+            state = State.AwaitReplacementShulker;
+            info(
+                "Empty shulker removed; waiting for its dispenser "
+                    + "replacement."
+            );
+            return true;
+        }
+        if (state == State.AwaitEmptyShulkerBreak) {
+            if (!(mc.level.getBlockState(recyclingShulkerPos).getBlock()
+                instanceof ShulkerBoxBlock)) {
+                return true;
+            }
+            ItemStack selected = mc.player.getInventory().getItem(
+                recyclingPickaxeHotbarSlot
+            );
+            if (!selected.is(ItemTags.PICKAXES)
+                || !hasMinimumToolDurability(selected)
+                || (mc.player.getInventory().getSelectedSlot()
+                    != recyclingPickaxeHotbarSlot
+                    && !InvUtils.swap(
+                        recyclingPickaxeHotbarSlot,
+                        false
+                    ))) {
+                failAutomaticShulkerRecycle(
+                    "The confirmed recycling pickaxe is no longer usable."
+                );
+                return true;
+            }
+            double range = effectiveBuildInteractionRange();
+            if (mc.player.getEyePosition().distanceToSqr(
+                    Vec3.atCenterOf(recyclingShulkerPos)
+                ) > range * range) {
+                failAutomaticShulkerRecycle(
+                    "The registered shulker open position is outside breaking "
+                        + "reach."
+                );
+                return true;
+            }
+            ((IClientPlayerInteractionManager) mc.gameMode)
+                .setBlockBreakingCooldown(0);
+            recyclingShulkerBreakAttempted =
+                BlockUtils.breakBlock(recyclingShulkerPos, true)
+                    || recyclingShulkerBreakAttempted;
+            return true;
+        }
+        return true;
+    }
+
+    private void completeAutomaticShulkerReplacement() {
+        boolean completedDemand = recyclingShulkerDemandComplete;
+        BlockPos replacement = new BlockPos(recyclingShulkerPos);
+        clearAutomaticShulkerRecycleState();
+        info(
+            "Replacement shulker confirmed at "
+                + replacement.toShortString() + "."
+        );
+        if (completedDemand) {
+            endRestocking();
+        } else {
+            lastRestockContainerEmpty = false;
+            lastRestockContainerSnapshotSequence = -1L;
+            state = State.AwaitRestockResponse;
+            interactWithBlock(replacement);
+        }
+    }
+
+    private void clearAutomaticShulkerRecycleState() {
+        recyclingShulkerPos = null;
+        recyclingShulkerOpenPos = null;
+        recyclingShulkerBreakAfterSequence = -1L;
+        recyclingShulkerAirSequence = -1L;
+        recyclingShulkerPhaseStartedTick = -1L;
+        recyclingShulkerDemandComplete = false;
+        recyclingShulkerBreakAttempted = false;
+        recyclingPickaxeHotbarSlot = -1;
+    }
+
+    private void failAutomaticShulkerRecycle(String reason) {
+        clearAutomaticShulkerRecycleState();
+        confirmedBuildHotbarSwap.clear();
+        pendingBuildHotbarSwapMandatory = false;
+        clearPendingInventorySwapState();
+        error(reason);
+        stopBuildForAction();
+        toggle();
     }
 
     private int packetPlayerItemCount(
@@ -4063,7 +4883,997 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
     }
 
+    private boolean isPrintingOnlyPostPrintPhase(MapCyclePhase phase) {
+        return printingOnly.get()
+            && phase != null
+            && phase != MapCyclePhase.IDLE
+            && phase != MapCyclePhase.BUILDING;
+    }
+
+    private boolean refusePrintingOnlyPostPrintAction(String action) {
+        if (!printingOnly.get()) return false;
+        warning(
+            "Printing Only is enabled; refusing to " + action + ". "
+                + "Disable printing-only to resume the full post-print cycle."
+        );
+        cancelLogisticsDetour();
+        stopMovement();
+        releaseAnyOwnedSpeedMine();
+        resetTeardownMiningActionState();
+        if (isActive()) toggle();
+        return true;
+    }
+
+    private void promptForAutomaticShulkerLineAnchor() {
+        state = State.SelectingShulkerLineAnchor;
+        info(
+            "Select the §afirst shulker at either end of the supply line. "
+                + "The printer will discover the remaining shulkers within "
+                + automaticShulkerScanRadius.get()
+                + " blocks and Y ±" + AUTOMATIC_SHULKER_LINE_Y_RADIUS + "."
+        );
+    }
+
+    private boolean tryLoadAutomaticPrintingConfig() {
+        if (!printingOnly.get() || mapFolder == null
+            || mc.player == null || mc.level == null) {
+            return false;
+        }
+
+        final PrintingOnlyConfigStore store;
+        final Optional<PrintingOnlyConfigStore.Snapshot> saved;
+        try {
+            store = PrintingOnlyConfigStore.open(mapFolder.toPath());
+            saved = store.read();
+        } catch (IOException failure) {
+            warning(
+                "Could not read the saved Printing Only config: "
+                    + failure.getMessage()
+                    + " Use Reset Printing Config to discard it."
+            );
+            return false;
+        }
+        if (saved.isEmpty()) return false;
+
+        PrintingOnlyConfigStore.Snapshot snapshot = saved.get();
+        if (!PrintingOnlyConfigStore.matchesEnvironment(
+                snapshot,
+                currentServerIdentity(),
+                currentDimensionIdentity(),
+                mapColumns.get(),
+                mapRows.get()
+            )) {
+            warning(
+                "Ignored the saved Printing Only config because its server, "
+                    + "dimension, or " + snapshot.mapColumns() + "x"
+                    + snapshot.mapRows() + " map grid does not match this "
+                    + mapColumns.get() + "x" + mapRows.get() + " job."
+            );
+            return false;
+        }
+        if (sleep.get() && snapshot.bed() == null) {
+            warning(
+                "Ignored the saved Printing Only config because Sleep is "
+                    + "enabled but no bed was saved."
+            );
+            return false;
+        }
+
+        PrintingOnlyConfigStore.DumpStation savedDump =
+            snapshot.dumpStation();
+        dumpStation = new Tuple<>(
+            automaticConfigVec3(savedDump.position()),
+            new Tuple<>(savedDump.yaw(), savedDump.pitch())
+        );
+        bed = snapshot.bed() == null
+            ? null
+            : automaticConfigStation(snapshot.bed());
+        automaticShulkerLineAnchor = automaticConfigBlockPos(
+            snapshot.shulkerLineAnchor()
+        );
+        resetMapAreaCache();
+
+        materialDict.clear();
+        toolSet.clear();
+        registeredToolMinimumEfficiency.clear();
+        automaticShulkerStations.clear();
+        automaticShulkerRegistrationQueue.clear();
+        automaticRegisteredItemCounts.clear();
+        automaticShulkerContentCounts.clear();
+        automaticShulkerToolStacks.clear();
+        automaticShulkerInaccessibleWarnings.clear();
+        automaticShulkerRegistrationTarget = null;
+        automaticShulkerRegistrationComplete = false;
+        automaticShulkerNextRescanTick = -1L;
+        automaticShulkerRescanPass = 0;
+        registerCarriedAutomaticTools();
+
+        ArrayList<Tuple<BlockPos, Vec3>> remaining = new ArrayList<>();
+        for (PrintingOnlyConfigStore.Station savedStation
+            : snapshot.shulkerStations()) {
+            Tuple<BlockPos, Vec3> station =
+                automaticConfigStation(savedStation);
+            automaticShulkerStations.put(station.getA(), station);
+            remaining.add(station);
+        }
+        Vec3 cursor = mc.player.position();
+        while (!remaining.isEmpty()) {
+            Vec3 nearestFrom = cursor;
+            Tuple<BlockPos, Vec3> nearest = remaining.stream()
+                .min(Comparator.comparingDouble(candidate ->
+                    candidate.getB().distanceToSqr(nearestFrom)))
+                .orElseThrow();
+            remaining.remove(nearest);
+            automaticShulkerRegistrationQueue.addLast(nearest);
+            cursor = nearest.getB();
+        }
+
+        info(
+            "Loaded saved Printing Only config from §a"
+                + store.configFile().getFileName()
+                + "§r. Rechecking §a"
+                + automaticShulkerRegistrationQueue.size()
+                + "§r shulker station"
+                + (automaticShulkerRegistrationQueue.size() == 1
+                    ? "" : "s")
+                + " against the current NBT before printing."
+        );
+        if (snapshot.scanRadius() != automaticShulkerScanRadius.get()) {
+            info(
+                "The saved config used scan radius "
+                    + snapshot.scanRadius() + "; new discovery will use the "
+                    + "current radius " + automaticShulkerScanRadius.get()
+                    + "."
+            );
+        }
+        scheduleNextAutomaticShulkerRegistration();
+        return true;
+    }
+
+    private void saveAutomaticPrintingConfig() {
+        if (!printingOnly.get()
+            || automaticConfigPersistenceSuppressed
+            || !automaticShulkerRegistrationComplete
+            || mapFolder == null || mapCorner == null
+            || dumpStation == null || automaticShulkerLineAnchor == null
+            || automaticShulkerStations.isEmpty()) {
+            return;
+        }
+        String server = currentServerIdentity();
+        String dimension = currentDimensionIdentity();
+        if (server == null || dimension == null) {
+            warning(
+                "Automatic registration succeeded, but the Printing Only "
+                    + "config could not identify this server or dimension."
+            );
+            return;
+        }
+
+        ArrayList<PrintingOnlyConfigStore.Station> stations =
+            automaticShulkerStations.values().stream()
+                .map(this::automaticConfigStation)
+                .sorted(Comparator
+                    .comparingInt((PrintingOnlyConfigStore.Station station) ->
+                        station.block().x())
+                    .thenComparingInt(station -> station.block().y())
+                .thenComparingInt(station -> station.block().z()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        int savedScanRadius = stations.stream()
+            .mapToInt(station -> Math.max(
+                Math.abs(
+                    station.block().x()
+                        - automaticShulkerLineAnchor.getX()
+                ),
+                Math.abs(
+                    station.block().z()
+                        - automaticShulkerLineAnchor.getZ()
+                )
+            ))
+            .max()
+            .orElse(automaticShulkerScanRadius.get());
+        savedScanRadius = Math.max(
+            savedScanRadius,
+            automaticShulkerScanRadius.get()
+        );
+        PrintingOnlyConfigStore.Snapshot snapshot =
+            new PrintingOnlyConfigStore.Snapshot(
+                PrintingOnlyConfigStore.SCHEMA_VERSION,
+                server,
+                dimension,
+                mapColumns.get(),
+                mapRows.get(),
+                savedScanRadius,
+                automaticConfigPosition(mapCorner),
+                new PrintingOnlyConfigStore.DumpStation(
+                    automaticConfigPoint(dumpStation.getA()),
+                    dumpStation.getB().getA(),
+                    dumpStation.getB().getB()
+                ),
+                bed == null ? null : automaticConfigStation(bed),
+                automaticConfigPosition(automaticShulkerLineAnchor),
+                stations,
+                System.currentTimeMillis()
+            );
+        try {
+            PrintingOnlyConfigStore store =
+                PrintingOnlyConfigStore.open(mapFolder.toPath());
+            store.save(snapshot);
+            info(
+                "Saved the verified Printing Only setup to §a"
+                    + store.configFile().getFileName()
+                    + "§r for the next matching map."
+            );
+        } catch (IOException failure) {
+            warning(
+                "Automatic registration succeeded, but the Printing Only "
+                    + "config could not be saved: " + failure.getMessage()
+            );
+        }
+    }
+
+    private void resetAutomaticPrintingConfig() {
+        File configuredMapFolder = mapFolder;
+        if (configuredMapFolder == null) {
+            configuredMapFolder = customFolderPath.get()
+                ? new File(mapPrinterFolderPath.get())
+                : new File(
+                    Utils.getMinecraftDirectory(),
+                    "nerv-printer"
+                );
+        }
+        try {
+            PrintingOnlyConfigStore store =
+                PrintingOnlyConfigStore.open(
+                    configuredMapFolder.toPath()
+                );
+            store.clear();
+            automaticConfigPersistenceSuppressed = isActive();
+            info(
+                "Reset the saved Printing Only config. The current live "
+                    + "registration is unchanged; the next activation will "
+                    + "detect the map automatically, then ask for the dump "
+                    + "station, bed, and first shulker."
+            );
+        } catch (IOException failure) {
+            error(
+                "Could not reset the Printing Only config: "
+                    + failure.getMessage()
+            );
+        }
+    }
+
+    private static PrintingOnlyConfigStore.Position
+        automaticConfigPosition(BlockPos position) {
+        return new PrintingOnlyConfigStore.Position(
+            position.getX(),
+            position.getY(),
+            position.getZ()
+        );
+    }
+
+    private static BlockPos automaticConfigBlockPos(
+        PrintingOnlyConfigStore.Position position
+    ) {
+        return new BlockPos(position.x(), position.y(), position.z());
+    }
+
+    private static PrintingOnlyConfigStore.Point automaticConfigPoint(
+        Vec3 position
+    ) {
+        return new PrintingOnlyConfigStore.Point(
+            position.x,
+            position.y,
+            position.z
+        );
+    }
+
+    private static Vec3 automaticConfigVec3(
+        PrintingOnlyConfigStore.Point position
+    ) {
+        return new Vec3(position.x(), position.y(), position.z());
+    }
+
+    private PrintingOnlyConfigStore.Station automaticConfigStation(
+        Tuple<BlockPos, Vec3> station
+    ) {
+        return new PrintingOnlyConfigStore.Station(
+            automaticConfigPosition(station.getA()),
+            automaticConfigPoint(station.getB())
+        );
+    }
+
+    private static Tuple<BlockPos, Vec3> automaticConfigStation(
+        PrintingOnlyConfigStore.Station station
+    ) {
+        return new Tuple<>(
+            automaticConfigBlockPos(station.block()),
+            automaticConfigVec3(station.openPosition())
+        );
+    }
+
+    private void beginAutomaticShulkerRegistration(
+        BlockPos anchor,
+        Vec3 anchorOpenPosition
+    ) {
+        if (!printingOnly.get() || mc.player == null || mc.level == null
+            || dumpStation == null || blockPaletteDict == null
+            || anchor == null
+            || !(mc.level.getBlockState(anchor).getBlock()
+                instanceof ShulkerBoxBlock)) {
+            error("Automatic shulker discovery is not ready.");
+            stopMovement();
+            toggle();
+            return;
+        }
+        materialDict.clear();
+        toolSet.clear();
+        registeredToolMinimumEfficiency.clear();
+        automaticShulkerStations.clear();
+        automaticShulkerRegistrationQueue.clear();
+        automaticRegisteredItemCounts.clear();
+        automaticShulkerContentCounts.clear();
+        automaticShulkerToolStacks.clear();
+        automaticShulkerInaccessibleWarnings.clear();
+        automaticShulkerLineAnchor = new BlockPos(anchor);
+        automaticShulkerRegistrationTarget = new BlockPos(anchor);
+        automaticShulkerRegistrationComplete = false;
+        automaticShulkerNextRescanTick = -1L;
+        automaticShulkerRescanPass = 0;
+        registerCarriedAutomaticTools();
+
+        Tuple<BlockPos, Vec3> anchorStation = new Tuple<>(
+            new BlockPos(anchor),
+            anchorOpenPosition
+        );
+        automaticShulkerStations.put(
+            new BlockPos(anchor),
+            anchorStation
+        );
+        int discovered = discoverLoadedAutomaticShulkers(false);
+        lastInteractedChest = new BlockPos(anchor);
+        interactTimeout = retryInteractTimer.get();
+        state = State.AwaitAutomaticShulkerResponse;
+        info(
+            "Registered the shulker-line anchor and found §a" + discovered
+                + "§r additional loaded shulker"
+                + (discovered == 1 ? "" : "s")
+                + " within radius " + automaticShulkerScanRadius.get()
+                + " and Y ±" + AUTOMATIC_SHULKER_LINE_Y_RADIUS + "."
+        );
+    }
+
+    private int discoverLoadedAutomaticShulkers(
+        boolean includeKnownStations
+    ) {
+        if (mc.player == null || mc.level == null
+            || automaticShulkerLineAnchor == null) {
+            return 0;
+        }
+        removeVanishedAutomaticShulkerStations();
+        BlockPos center = automaticShulkerLineAnchor;
+        int radius = automaticShulkerScanRadius.get();
+        int minimumX = center.getX() - radius;
+        int maximumX = center.getX() + radius;
+        int minimumZ = center.getZ() - radius;
+        int maximumZ = center.getZ() + radius;
+        ArrayList<Tuple<BlockPos, Vec3>> discovered = new ArrayList<>();
+        int loadedChunks = 0;
+
+        for (int chunkX = minimumX >> 4;
+             chunkX <= maximumX >> 4;
+             chunkX++) {
+            for (int chunkZ = minimumZ >> 4;
+                 chunkZ <= maximumZ >> 4;
+                 chunkZ++) {
+                if (!mc.level.getChunkSource().hasChunk(chunkX, chunkZ)) {
+                    continue;
+                }
+                loadedChunks++;
+                for (BlockPos shulker : mc.level
+                    .getChunk(chunkX, chunkZ)
+                    .getBlockEntities().keySet()) {
+                            if (shulker.getX() < minimumX
+                                || shulker.getX() > maximumX
+                                || shulker.getZ() < minimumZ
+                                || shulker.getZ() > maximumZ
+                                || shulker.getY()
+                                    < center.getY()
+                                        - AUTOMATIC_SHULKER_LINE_Y_RADIUS
+                                || shulker.getY()
+                                    > center.getY()
+                                        + AUTOMATIC_SHULKER_LINE_Y_RADIUS) {
+                                continue;
+                            }
+                            if (!(mc.level.getBlockState(shulker).getBlock()
+                                instanceof ShulkerBoxBlock)) {
+                                continue;
+                            }
+                            boolean known = automaticShulkerStations
+                                .containsKey(shulker);
+                            if (known && !includeKnownStations) continue;
+                            if (automaticShulkerRegistrationTarget != null
+                                && automaticShulkerRegistrationTarget.equals(
+                                    shulker
+                                )) {
+                                continue;
+                            }
+                            if (automaticShulkerRegistrationQueue.stream()
+                                .anyMatch(queued ->
+                                    queued.getA().equals(shulker))) {
+                                continue;
+                            }
+                            Vec3 openPosition =
+                                automaticShulkerOpenPosition(shulker);
+                            if (openPosition == null) {
+                                if (automaticShulkerInaccessibleWarnings.add(
+                                        new BlockPos(shulker)
+                                    )) {
+                                    warning(
+                                        "Cannot inspect shulker at "
+                                            + shulker.toShortString()
+                                            + ": it needs a reachable nearby "
+                                            + "standing cell with a solid "
+                                            + "floor and two air blocks."
+                                    );
+                                }
+                                continue;
+                            }
+                            Tuple<BlockPos, Vec3> station = new Tuple<>(
+                                new BlockPos(shulker),
+                                openPosition
+                            );
+                            automaticShulkerStations.put(
+                                new BlockPos(shulker),
+                                station
+                            );
+                            automaticShulkerInaccessibleWarnings.remove(
+                                shulker
+                            );
+                            discovered.add(station);
+                }
+            }
+        }
+        automaticShulkerLastLoadedChunkCount = loadedChunks;
+        automaticShulkerLastHorizontalRadius = radius;
+
+        Vec3 cursor = mc.player.position();
+        while (!discovered.isEmpty()) {
+            Vec3 nearestFrom = cursor;
+            Tuple<BlockPos, Vec3> next = discovered.stream()
+                .min(Comparator.comparingDouble(candidate ->
+                    candidate.getB().distanceToSqr(nearestFrom)))
+                .orElseThrow();
+            discovered.remove(next);
+            automaticShulkerRegistrationQueue.addLast(next);
+            cursor = next.getB();
+        }
+        return automaticShulkerRegistrationQueue.size();
+    }
+
+    private void removeVanishedAutomaticShulkerStations() {
+        ArrayList<BlockPos> vanished = new ArrayList<>();
+        for (BlockPos shulker : automaticShulkerStations.keySet()) {
+            if (!mc.level.getChunkSource().hasChunk(
+                    shulker.getX() >> 4,
+                    shulker.getZ() >> 4
+                )) {
+                continue;
+            }
+            if (!(mc.level.getBlockState(shulker).getBlock()
+                instanceof ShulkerBoxBlock)) {
+                vanished.add(shulker);
+            }
+        }
+        for (BlockPos shulker : vanished) {
+            removeAutomaticShulkerRegistration(shulker);
+            warning(
+                "Removed vanished automatic shulker station at "
+                    + shulker.toShortString() + "."
+            );
+        }
+    }
+
+    private Vec3 automaticShulkerOpenPosition(BlockPos shulker) {
+        Vec3 best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            BlockPos feet = shulker.relative(direction);
+            Vec3 candidate = automaticShulkerStandingPosition(
+                shulker,
+                feet
+            );
+            if (candidate == null) continue;
+            double distance = candidate.distanceToSqr(dumpStation.getA());
+            if (best == null || distance < bestDistance) {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+        if (best != null) return best;
+
+        // A dispenser bank or vertically stacked supply can occupy every
+        // immediately adjacent cell even though the box remains reachable
+        // from a nearby lane. Search a small, bounded standing volume before
+        // classifying the placed shulker as inaccessible.
+        for (int radius = 2; radius <= 4; radius++) {
+            for (int x = shulker.getX() - radius;
+                 x <= shulker.getX() + radius;
+                 x++) {
+                for (int z = shulker.getZ() - radius;
+                     z <= shulker.getZ() + radius;
+                     z++) {
+                    if (Math.max(
+                            Math.abs(x - shulker.getX()),
+                            Math.abs(z - shulker.getZ())
+                        ) != radius) {
+                        continue;
+                    }
+                    for (int y = shulker.getY() - 3;
+                         y <= shulker.getY() + 2;
+                         y++) {
+                        Vec3 candidate = automaticShulkerStandingPosition(
+                            shulker,
+                            new BlockPos(x, y, z)
+                        );
+                        if (candidate == null) continue;
+                        double distance = candidate.distanceToSqr(
+                            dumpStation.getA()
+                        );
+                        if (best == null || distance < bestDistance) {
+                            best = candidate;
+                            bestDistance = distance;
+                        }
+                    }
+                }
+            }
+            if (best != null) return best;
+        }
+        return best;
+    }
+
+    private Vec3 automaticShulkerStandingPosition(
+        BlockPos shulker,
+        BlockPos feet
+    ) {
+        if (!isAutomaticShulkerStandingCell(feet)) return null;
+        Vec3 candidate = new Vec3(
+            feet.getX() + 0.5,
+            feet.getY(),
+            feet.getZ() + 0.5
+        );
+        Vec3 candidateEyes = candidate.add(
+            0,
+            mc.player.getEyeHeight(),
+            0
+        );
+        double range = effectiveBuildInteractionRange();
+        return candidateEyes.distanceToSqr(Vec3.atCenterOf(shulker))
+                <= range * range
+            ? candidate
+            : null;
+    }
+
+    private boolean isAutomaticShulkerStandingCell(BlockPos feet) {
+        if (mc.player == null || mc.level == null) return false;
+        LogisticsDetourPlanner.Point horizontal =
+            new LogisticsDetourPlanner.Point(feet.getX(), feet.getZ());
+        if (isProtectedMapCell(horizontal)
+            || !mc.level.getChunkSource().hasChunk(
+                feet.getX() >> 4,
+                feet.getZ() >> 4
+            )) {
+            return false;
+        }
+        BlockState support = mc.level.getBlockState(feet.below());
+        if (support.getCollisionShape(mc.level, feet.below()).isEmpty()
+            || !support.getFluidState().isEmpty()) {
+            return false;
+        }
+        if (!mc.level.getBlockState(feet).getCollisionShape(
+                mc.level,
+                feet
+            ).isEmpty()
+            || !mc.level.getBlockState(feet.above()).getCollisionShape(
+                mc.level,
+                feet.above()
+            ).isEmpty()) {
+            return false;
+        }
+        return mc.level.noCollision(
+            mc.player,
+            mc.player.getBoundingBox().move(
+                feet.getX() + 0.5 - mc.player.getX(),
+                feet.getY() - mc.player.getY(),
+                feet.getZ() + 0.5 - mc.player.getZ()
+            )
+        );
+    }
+
+    private void scheduleNextAutomaticShulkerRegistration() {
+        automaticShulkerRegistrationTarget = null;
+        while (!automaticShulkerRegistrationQueue.isEmpty()) {
+            Tuple<BlockPos, Vec3> station =
+                automaticShulkerRegistrationQueue.removeFirst();
+            if (MapAreaCache.hasBlockData(station.getA())
+                && !(MapAreaCache.getCachedBlockState(
+                        station.getA()
+                    ).getBlock() instanceof ShulkerBoxBlock)) {
+                warning(
+                    "A saved or discovered shulker disappeared before "
+                        + "inspection at "
+                        + station.getA().toShortString() + "."
+                );
+                removeAutomaticShulkerRegistration(station.getA());
+                continue;
+            }
+            checkpoints.add(new Tuple<>(
+                station.getB(),
+                new Tuple<>("registerShulker", station.getA())
+            ));
+            state = State.Walking;
+            return;
+        }
+        boolean complete = validateAutomaticShulkerCoverage(false);
+        if (!complete) {
+            int newlyVisible = discoverLoadedAutomaticShulkers(false);
+            if (newlyVisible > 0) {
+                info(
+                    "Found §a" + newlyVisible
+                        + "§r additional shulker station"
+                        + (newlyVisible == 1 ? "" : "s")
+                        + " after loading more nearby chunks. Inspecting "
+                        + "them now."
+                );
+                scheduleNextAutomaticShulkerRegistration();
+                return;
+            }
+        }
+        automaticShulkerRegistrationComplete = complete;
+        activeConfigSha256 = complete
+            ? automaticShulkerConfigurationFingerprint()
+            : null;
+        if (complete) saveAutomaticPrintingConfig();
+        state = State.SelectingChests;
+        validateAutomaticShulkerCoverage(true);
+        if (complete) {
+            automaticShulkerNextRescanTick = -1L;
+            automaticShulkerRescanPass = 0;
+            info(
+                "Automatic shulker registration complete. Interact with a "
+                    + "configured Start Block to begin printing."
+            );
+        } else {
+            automaticShulkerNextRescanTick =
+                AutomaticShulkerRescanPolicy.nextRetryTick(
+                    clientActionTick
+                );
+            warning(
+                "Automatic shulker registration is incomplete. The printer "
+                    + "will rescan loaded shulkers every "
+                    + AutomaticShulkerRescanPolicy.RETRY_INTERVAL_TICKS
+                    + " ticks; no module "
+                    + "restart is required. Click a Start Block to rescan "
+                    + "immediately. Last pass checked "
+                    + automaticShulkerLastLoadedChunkCount
+                    + " loaded chunks within ±"
+                    + automaticShulkerLastHorizontalRadius
+                    + " horizontal blocks and Y ±"
+                    + AUTOMATIC_SHULKER_LINE_Y_RADIUS
+                    + " around the selected line anchor."
+            );
+        }
+    }
+
+    private boolean tickAutomaticShulkerRescan() {
+        if (!printingOnly.get()
+            || state != State.SelectingChests
+            || automaticShulkerRegistrationComplete
+            || automaticShulkerNextRescanTick < 0) {
+            return false;
+        }
+        stopMovement();
+        if (clientActionTick < automaticShulkerNextRescanTick) {
+            return true;
+        }
+        automaticShulkerRescanPass++;
+        boolean reinspectKnown = AutomaticShulkerRescanPolicy
+            .shouldReinspectKnownStations(automaticShulkerRescanPass);
+        return triggerAutomaticShulkerRescan(reinspectKnown, false);
+    }
+
+    private boolean triggerAutomaticShulkerRescan(
+        boolean reinspectKnown,
+        boolean announceEmptyPass
+    ) {
+        if (!printingOnly.get()
+            || mc.player == null
+            || mc.level == null
+            || automaticShulkerRegistrationTarget != null
+            || !automaticShulkerRegistrationQueue.isEmpty()) {
+            return false;
+        }
+        int queued = discoverLoadedAutomaticShulkers(reinspectKnown);
+        if (queued > 0) {
+            automaticShulkerRegistrationComplete = false;
+            automaticShulkerNextRescanTick = -1L;
+            info(
+                (reinspectKnown ? "Rechecking §a" : "Discovered §a")
+                    + queued + "§r automatic shulker station"
+                    + (queued == 1 ? "" : "s") + "."
+            );
+            scheduleNextAutomaticShulkerRegistration();
+            return true;
+        }
+        automaticShulkerNextRescanTick =
+            AutomaticShulkerRescanPolicy.nextRetryTick(clientActionTick);
+        if (announceEmptyPass) {
+            warning(
+                "No additional accessible shulker was visible in the "
+                    + automaticShulkerLastLoadedChunkCount
+                    + " loaded chunks inside the configured scan box. "
+                    + "The retry covered ±"
+                    + automaticShulkerLastHorizontalRadius
+                    + " horizontal blocks and Y ±"
+                    + AUTOMATIC_SHULKER_LINE_Y_RADIUS
+                    + " around the selected line anchor. Rescanning "
+                    + "will continue automatically."
+            );
+        }
+        return true;
+    }
+
+    private void registerAutomaticShulkerContents(
+        ClientboundContainerSetContentPacket packet
+    ) {
+        BlockPos shulker = automaticShulkerRegistrationTarget;
+        Tuple<BlockPos, Vec3> station = shulker == null
+            ? null
+            : automaticShulkerStations.get(shulker);
+        if (shulker == null || station == null
+            || !shulker.equals(lastInteractedChest)) {
+            error("Automatic shulker inspection lost its exact source position.");
+            stopMovement();
+            toggle();
+            return;
+        }
+        int containerSlots = packet.items().size() - 36;
+        LinkedHashSet<Item> foundItems = new LinkedHashSet<>();
+        HashMap<Item, Integer> stationCounts = new HashMap<>();
+        ArrayList<ItemStack> stationTools = new ArrayList<>();
+        Set<Item> requiredMaterials = automaticRequiredMaterialCounts().keySet();
+        clearAutomaticShulkerContents(shulker);
+        for (int slot = 0; slot < containerSlots; slot++) {
+            ItemStack stack = packet.items().get(slot);
+            if (stack.isEmpty()) continue;
+            Item item = stack.getItem();
+            foundItems.add(item);
+            stationCounts.merge(item, stack.getCount(), Math::addExact);
+            automaticRegisteredItemCounts.merge(
+                item,
+                stack.getCount(),
+                Math::addExact
+            );
+            if (ToolUtils.isTool(stack)) {
+                stationTools.add(stack.copy());
+            }
+            if (requiredMaterials.contains(item)
+                || ToolUtils.isTool(stack)
+                || isAcceptedGoldenApple(item)) {
+                ArrayList<Tuple<BlockPos, Vec3>> sources =
+                    materialDict.computeIfAbsent(
+                        item,
+                        ignored -> new ArrayList<>()
+                    );
+                if (sources.stream().noneMatch(source ->
+                    source.getA().equals(shulker))) {
+                    sources.add(station);
+                }
+            }
+        }
+        automaticShulkerContentCounts.put(
+            new BlockPos(shulker),
+            stationCounts
+        );
+        automaticShulkerToolStacks.put(
+            new BlockPos(shulker),
+            stationTools
+        );
+        rebuildAutomaticToolRegistry();
+        if (foundItems.isEmpty()) {
+            warning("Ignored empty shulker at " + shulker.toShortString() + ".");
+        } else {
+            info(
+                "Registered shulker " + shulker.toShortString() + ": §a"
+                    + foundItems.stream()
+                        .map(Utils::itemName)
+                        .collect(Collectors.joining(", "))
+            );
+        }
+        mc.player.closeContainer();
+        closeNextInvPacket = false;
+        automaticShulkerRegistrationTarget = null;
+        scheduleNextAutomaticShulkerRegistration();
+    }
+
+    private void clearAutomaticShulkerContents(BlockPos shulker) {
+        HashMap<Item, Integer> previous =
+            automaticShulkerContentCounts.remove(shulker);
+        if (previous != null) {
+            for (Map.Entry<Item, Integer> entry : previous.entrySet()) {
+                int remaining = automaticRegisteredItemCounts.getOrDefault(
+                    entry.getKey(),
+                    0
+                ) - entry.getValue();
+                if (remaining > 0) {
+                    automaticRegisteredItemCounts.put(
+                        entry.getKey(),
+                        remaining
+                    );
+                } else {
+                    automaticRegisteredItemCounts.remove(entry.getKey());
+                }
+            }
+        }
+        automaticShulkerToolStacks.remove(shulker);
+        Iterator<Map.Entry<Item, ArrayList<Tuple<BlockPos, Vec3>>>>
+            iterator = materialDict.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Item, ArrayList<Tuple<BlockPos, Vec3>>> entry =
+                iterator.next();
+            entry.getValue().removeIf(source ->
+                source.getA().equals(shulker));
+            if (entry.getValue().isEmpty()) iterator.remove();
+        }
+    }
+
+    private void removeAutomaticShulkerRegistration(BlockPos shulker) {
+        clearAutomaticShulkerContents(shulker);
+        automaticShulkerStations.remove(shulker);
+        automaticShulkerRegistrationQueue.removeIf(station ->
+            station.getA().equals(shulker));
+        automaticShulkerInaccessibleWarnings.remove(shulker);
+        rebuildAutomaticToolRegistry();
+    }
+
+    private void rebuildAutomaticToolRegistry() {
+        toolSet.clear();
+        registeredToolMinimumEfficiency.clear();
+        registerCarriedAutomaticTools();
+        for (ArrayList<ItemStack> stacks :
+            automaticShulkerToolStacks.values()) {
+            for (ItemStack stack : stacks) {
+                toolSet.add(stack.copy());
+                registeredToolMinimumEfficiency.merge(
+                    stack.getItem(),
+                    getEfficiencyLevel(stack),
+                    Math::max
+                );
+            }
+        }
+    }
+
+    private void registerCarriedAutomaticTools() {
+        if (mc.player == null) return;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (!ToolUtils.isTool(stack)) continue;
+            toolSet.add(stack.copy());
+            registeredToolMinimumEfficiency.merge(
+                stack.getItem(),
+                getEfficiencyLevel(stack),
+                Math::max
+            );
+        }
+    }
+
+    private HashMap<Item, Integer> automaticRequiredMaterialCounts() {
+        HashMap<Item, Integer> required = new HashMap<>();
+        for (Tuple<Block, Integer> palette : blockPaletteDict.values()) {
+            if (palette.getB() <= 0) continue;
+            Item item = palette.getA().asItem();
+            if (item == Items.AIR) continue;
+            required.merge(item, palette.getB(), Math::addExact);
+        }
+        return required;
+    }
+
+    private boolean validateAutomaticShulkerCoverage(boolean emitMessages) {
+        registerCarriedAutomaticTools();
+        HashMap<Item, Integer> required = automaticRequiredMaterialCounts();
+        ArrayList<Item> missing = required.keySet().stream()
+            .filter(item -> !materialDict.containsKey(item)
+                || materialDict.get(item).isEmpty())
+            .sorted(Comparator.comparing(item ->
+                BuiltInRegistries.ITEM.getKey(item).toString()))
+            .collect(Collectors.toCollection(ArrayList::new));
+        boolean pickaxe = toolSet.stream().anyMatch(stack ->
+            stack.is(ItemTags.PICKAXES) && hasMinimumToolDurability(stack));
+        boolean axe = toolSet.stream().anyMatch(stack ->
+            stack.is(ItemTags.AXES) && hasMinimumToolDurability(stack));
+        boolean goldenApple = hasRegisteredOrCarriedGoldenApple();
+        if (emitMessages) {
+            for (Item item : required.keySet().stream()
+                .sorted(Comparator.comparing(material ->
+                    BuiltInRegistries.ITEM.getKey(material).toString()))
+                .toList()) {
+                info(
+                    "NBT source §a" + Utils.itemName(item) + "§r: required="
+                        + required.get(item) + ", visible-now="
+                        + automaticRegisteredItemCounts.getOrDefault(item, 0)
+                        + ", stations="
+                        + materialDict.getOrDefault(item, new ArrayList<>()).size()
+                );
+            }
+            if (!missing.isEmpty()) {
+                error(
+                    "Missing shulker sources for NBT materials: "
+                        + missing.stream().map(Utils::itemName)
+                            .collect(Collectors.joining(", "))
+                );
+            }
+            if (!pickaxe) error("No usable pickaxe was carried or found in a shulker.");
+            if (!axe) error("No usable axe was carried or found in a shulker.");
+            if (!goldenApple) {
+                error(
+                    "No golden apple or enchanted golden apple was carried "
+                        + "or found in a shulker."
+                );
+            }
+            if (missing.isEmpty() && pickaxe && axe && goldenApple) {
+                info(
+                    "All required NBT material types, end rods, pickaxe, "
+                        + "axe, and an accepted golden apple are available. "
+                        + "Counts above "
+                        + "describe currently visible boxes; dispenser backups "
+                        + "are consumed as stations cycle."
+                );
+            }
+        }
+        return missing.isEmpty() && pickaxe && axe && goldenApple;
+    }
+
+    private boolean hasRegisteredOrCarriedGoldenApple() {
+        return automaticRegisteredItemCounts.getOrDefault(
+                Items.GOLDEN_APPLE,
+                0
+            ) > 0
+            || automaticRegisteredItemCounts.getOrDefault(
+                Items.ENCHANTED_GOLDEN_APPLE,
+                0
+            ) > 0
+            || playerItemCount(Items.GOLDEN_APPLE) > 0
+            || playerItemCount(Items.ENCHANTED_GOLDEN_APPLE) > 0;
+    }
+
+    private static boolean isAcceptedGoldenApple(Item item) {
+        return item == Items.GOLDEN_APPLE
+            || item == Items.ENCHANTED_GOLDEN_APPLE;
+    }
+
+    private String automaticShulkerConfigurationFingerprint() {
+        ArrayList<String> identity = new ArrayList<>();
+        identity.add("map=" + mapCorner);
+        identity.add("dump=" + dumpStation.getA());
+        identity.add("bed=" + (bed == null ? "none" : bed.getA()));
+        identity.add("shulkerAnchor=" + automaticShulkerLineAnchor);
+        materialDict.forEach((item, stations) -> stations.forEach(station ->
+            identity.add(
+                BuiltInRegistries.ITEM.getKey(item) + "@" + station.getA()
+                    + "/" + station.getB()
+            )
+        ));
+        Collections.sort(identity);
+        return FileFingerprint.sha256(
+            String.join("\n", identity).getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
     private void completeMapDeposit() {
+        if (refusePrintingOnlyPostPrintAction(
+            "complete the finished-map handoff or start teardown"
+        )) {
+            return;
+        }
         mapHandoffStage = MapHandoffStage.DEPOSITED;
         mapCyclePhase = MapCyclePhase.MAP_DEPOSITED;
         if (!persistFileCoordinationCheckpoint("map-deposited-confirmed")) {
@@ -4294,6 +6104,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private void resumeMapHandoffFromCheckpoint() {
+        if (refusePrintingOnlyPostPrintAction(
+            "resume the finished-map handoff"
+        )) {
+            return;
+        }
         releaseTransientBuildOwners();
         resetTeardownMiningActionState();
         abandonRestockSession(true);
@@ -5062,6 +6877,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        if (state != null
+            && isPrintingOnlyPostPrintPhase(mapCyclePhase)
+            && refusePrintingOnlyPostPrintAction(
+                "continue the " + mapCyclePhase + " phase"
+            )) {
+            return;
+        }
         drainReceivedPackets();
         if (state == null) return;
         clientActionTick++;
@@ -5176,6 +6998,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 "changed " + previousState + " -> " + state
             );
         }
+
+        if (state == State.SelectingMapArea && printingOnly.get()) {
+            stopMovement();
+            if (automaticMapAreaNextScanTick < 0
+                || clientActionTick >= automaticMapAreaNextScanTick) {
+                beginAutomaticPrintingMapAreaDetection(false);
+            }
+            return;
+        }
+
+        if (tickAutomaticShulkerRescan()) return;
 
         if (state == State.AwaitNbtArchive) {
             if (timeoutTicks > 0) {
@@ -5352,6 +7185,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         if (handleConfirmedMiningHotbarSwap()) return;
         if (handleConfirmedBuildHotbarSwap()) return;
+        if (tickAutomaticShulkerRecycle()) return;
 
         if (tickPendingRestockTransferDispatch()) return;
 
@@ -5606,6 +7440,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (tickMapHandoffConfirmation()) return;
 
         // Main Loop for Building & Mining
+
+        if (state == State.Walking
+            && !checkpoints.isEmpty()
+            && checkpoints.getFirst().getB().getA()
+                .equals("buildNorthWalkwayStep")
+            && holdForNorthWalkwayConstructionStep(
+                checkpoints.getFirst()
+            )) {
+            return;
+        }
 
         if (state == State.Walking
             && circularBuildPhase == CircularBuildPhase.REJOIN) {
@@ -6544,6 +8388,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         return;
                     }
                     return;
+                case "buildNorthWalkwayStep":
+                    // Safety and authoritative placement confirmation are
+                    // enforced before movement toward this checkpoint.
+                    break;
                 case "logisticsDetour":
                     logisticsProgressWatchdog.reset();
                     mc.player.setSprinting(false);
@@ -6559,6 +8407,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     interactWithBlock(bed.getA());
                     interactTimeout = 0;
                     mc.getConnection().send(new ServerboundPlayerCommandPacket(mc.player, ServerboundPlayerCommandPacket.Action.STOP_SLEEPING));
+                    return;
+                case "registerShulker":
+                    automaticShulkerRegistrationTarget =
+                        new BlockPos(checkpointAction.getB());
+                    if (!(MapAreaCache.getCachedBlockState(
+                            automaticShulkerRegistrationTarget
+                        ).getBlock() instanceof ShulkerBoxBlock)) {
+                        warning(
+                            "Shulker disappeared before inspection at "
+                                + automaticShulkerRegistrationTarget
+                                    .toShortString() + "."
+                        );
+                        automaticShulkerRegistrationTarget = null;
+                        scheduleNextAutomaticShulkerRegistration();
+                        return;
+                    }
+                    state = State.AwaitAutomaticShulkerResponse;
+                    interactWithBlock(automaticShulkerRegistrationTarget);
                     return;
                 case "refill":
                     debugRestock(
@@ -6853,6 +8719,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || nextAction.equals("preparePair")
             || nextAction.equals("uBuildOutboundEnd")
             || nextAction.equals("independentColumnEnd")
+            || nextAction.equals("buildNorthWalkwayStep")
             || nextAction.equals("finishPair"))
             && sprinting.get() != SprintMode.Always) {
             mc.player.setSprinting(false);
@@ -7084,6 +8951,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         //Determine closest restock chest for material in restock list
         if (restockList.isEmpty()) return;
         double smallestDistance = Double.MAX_VALUE;
+        int smallestPriority = Integer.MAX_VALUE;
+        boolean needsRecyclingPickaxe = printingOnly.get()
+            && bestUsableRecyclingPickaxeSlot() < 0;
         RestockDemand<Item> closestEntry = null;
         Tuple<BlockPos, Vec3> restockPos = null;
         for (RestockDemand<Item> entry : restockList) {
@@ -7098,6 +8968,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 return;
             }
             double chestDistance = PlayerUtils.distanceTo(bestRestockPos.getB());
+            int priority = needsRecyclingPickaxe
+                && entry.item().getDefaultInstance().is(ItemTags.PICKAXES)
+                    ? 0
+                    : needsRecyclingPickaxe ? 1 : 0;
             debugRestock(
                 "checkpoint candidate item="
                     + BuiltInRegistries.ITEM.getKey(entry.item())
@@ -7106,7 +8980,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         + bestRestockPos.getA().toShortString()
                     + " distance=" + chestDistance
             );
-            if (chestDistance < smallestDistance) {
+            if (priority < smallestPriority
+                || (priority == smallestPriority
+                    && chestDistance < smallestDistance)) {
+                smallestPriority = priority;
                 smallestDistance = chestDistance;
                 closestEntry = entry;
                 restockPos = bestRestockPos;
@@ -7142,6 +9019,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         pendingRestockTransfer = null;
         restockInventorySnapshot.clear();
         restockSnapshotUpdateSequence = -1L;
+        lastRestockContainerEmpty = false;
+        lastRestockContainerSnapshotSequence = -1L;
         restockConfirmationPhase = RestockConfirmationPhase.NONE;
         resetRestockRefillWait();
         resetRestockTransferTracking();
@@ -9108,9 +10987,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             firstUnconfirmed++;
         }
         activeCircularPlacementCursor = firstUnconfirmed;
-        return List.copyOf(
-            pairTargets.subList(0, endIndexExclusive)
-        );
+        return List.copyOf(circularPairBuildTargets(route));
     }
 
     private boolean backOffWrongActiveUSupport(
@@ -10537,7 +12414,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private Item preferredBuildRepairTool(
         CompactCircularNbtPlan.PairRoute route
     ) {
-        for (BlockPos relative : circularPairTargets(route)) {
+        for (BlockPos relative : circularPairBuildTargets(route)) {
             Block expected = buildTargets.get(relative);
             BlockState current =
                 MapAreaCache.getCachedBlockState(
@@ -10997,7 +12874,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         CompactCircularNbtPlan.PairRoute route =
             activeCircularBuildRoute();
         if (route != null) {
-            for (BlockPos relative : circularPairTargets(route)) {
+            for (BlockPos relative : circularPairBuildTargets(route)) {
                 Block expected = buildTargets.get(relative);
                 if (expected != null) priority.add(expected.asItem());
             }
@@ -11024,7 +12901,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         CompactCircularNbtPlan.PairRoute route =
             activeCircularBuildRoute();
         return route != null
-            && circularPairTargets(route).contains(
+            && circularPairBuildTargets(route).contains(
                 world.subtract(mapCorner)
             );
     }
@@ -11407,8 +13284,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         if (relativeX < 0 || relativeX >= map.length) return null;
         for (int x = relativeX; x <= relativeX; x++) {
-            for (int z = 0; z < 128; z++) {
-                int adjustedZ = 127 - z;
+            for (int z = 0; z < map[x].length; z++) {
+                int adjustedZ = map[x].length - 1 - z;
                 BlockPos blockPos = mapCorner.offset(x, map[x][adjustedZ].getB(), adjustedZ);
                 BlockState blockState = MapAreaCache.getCachedBlockState(blockPos);
                 if (!blockState.isAir()) return blockPos;
@@ -11427,7 +13304,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             // outbound endpoint, but placement must not rotate around a later
             // connector turn.
             endIndexExclusive = Math.min(
-                CompactCircularNbtPlan.VISIBLE_ROWS + 1,
+                compactPlan.visibleRows() + 1,
                 pairTargets.size()
             );
         } else if (circularBuildPhase == CircularBuildPhase.CONNECTOR) {
@@ -11435,7 +13312,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             // cursor. This prevents rotate-place from steering toward a later
             // helix turn or the return leg.
             endIndexExclusive = Math.min(
-                CompactCircularNbtPlan.VISIBLE_ROWS
+                compactPlan.visibleRows()
                     + activeCircularConnectorIndex
                     + 1,
                 pairTargets.size()
@@ -11477,6 +13354,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         activeCircularRecoveryTargets = List.of();
         checkpoints.clear();
         refreshCircularTraversalOptimization();
+        addNorthWalkwayConstructionPath();
         for (CompactCircularNbtPlan.PairRoute route : compactPlan.pairRoutes()) {
             if (route.outboundX() < workingInterval.getA()
                 || route.returnX() > workingInterval.getB()) {
@@ -11558,7 +13436,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
             ArrayList<BlockPos> missing = new ArrayList<>();
             boolean containsWrong = false;
-            for (BlockPos relative : circularPairTargets(route)) {
+            for (BlockPos relative : circularPairBuildTargets(route)) {
                 Block expected = buildTargets.get(relative);
                 Block current = latestKnownBuildBlock(
                     mapCorner.offset(relative)
@@ -11570,7 +13448,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     containsWrong = true;
                 }
             }
-            for (BlockPos relative : circularPairTargets(route)) {
+            for (BlockPos relative : circularPairBuildTargets(route)) {
                 BlockPos world = mapCorner.offset(relative);
                 if (!MapAreaCache.getCachedBlockState(
                         world.above()
@@ -12478,10 +14356,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         int firstTargetSupportIndex = 2;
         int outboundEndSupportIndex =
             firstTargetSupportIndex
-                + CompactCircularNbtPlan.VISIBLE_ROWS - 1;
+                + compactPlan.visibleRows() - 1;
         int returnStartSupportIndex =
             firstTargetSupportIndex
-                + CompactCircularNbtPlan.VISIBLE_ROWS
+                + compactPlan.visibleRows()
                 + route.relativeInterior().size();
         int lastTargetSupportIndex = orderedSupports.size() - 3;
         int firstEligibleSupportIndex;
@@ -12645,7 +14523,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 circularBuildCheckpointPlan(route);
             activeCircularConnectorSteps =
                 connectorPlan.connectorTraversalSteps();
-            int connectorStart = CompactCircularNbtPlan.VISIBLE_ROWS;
+            int connectorStart = compactPlan.visibleRows();
             activeCircularConnectorIndex = Math.max(
                 0,
                 targetIndex - connectorStart
@@ -12808,13 +14686,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         BlockPos expectedOutboundEnd = mapCorner.offset(
             surfaceRuntimePosition(
                 route.outboundX(),
-                CompactCircularNbtPlan.FAR_Z
+                compactPlan.visibleRows()
             )
         );
         BlockPos expectedReturnEnd = mapCorner.offset(
             surfaceRuntimePosition(
                 route.returnX(),
-                CompactCircularNbtPlan.FAR_Z
+                compactPlan.visibleRows()
             )
         );
         if (!connectorPath.getFirst().equals(expectedOutboundEnd)
@@ -12831,7 +14709,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private boolean isCircularSurfaceLegComplete(int x) {
-        for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
+        for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
             BlockPos relative = surfaceRuntimePosition(x, nbtZ);
             BlockPos world = mapCorner.offset(relative);
             if (latestKnownBuildBlock(world)
@@ -12843,7 +14721,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private BlockPos firstUnexpectedCircularSurfaceBlock(int x) {
-        for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
+        for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
             BlockPos relative = surfaceRuntimePosition(x, nbtZ);
             BlockPos world = mapCorner.offset(relative);
             Block current = latestKnownBuildBlock(world);
@@ -13091,7 +14969,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         int targetIndex
     ) {
         int connectorStart =
-            CompactCircularNbtPlan.VISIBLE_ROWS;
+            compactPlan.visibleRows();
         int returnStart =
             connectorStart + route.relativeInterior().size();
         if (targetIndex < 0
@@ -13533,9 +15411,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void addIndependentColumnPath(int x) {
         boolean lineFinished = true;
-        for (int z = 0; z < 128; z++) {
-            BlockPos relative = new BlockPos(x, map[x][z].getB(), z);
-            if (MapAreaCache.getCachedBlockState(mapCorner.offset(relative)).isAir()) {
+        for (int z = 0; z < map[x].length; z++) {
+            BlockPos surface = new BlockPos(x, map[x][z].getB(), z);
+            BlockPos lighting = surface.above(
+                EndRodLightingPlan.HEIGHT_ABOVE_SURFACE
+            );
+            boolean missingSurface = MapAreaCache.getCachedBlockState(
+                mapCorner.offset(surface)
+            ).isAir();
+            boolean missingLighting = lightingTargets.contains(lighting)
+                && MapAreaCache.getCachedBlockState(
+                    mapCorner.offset(lighting)
+                ).isAir();
+            if (missingSurface || missingLighting) {
                 lineFinished = false;
                 break;
             }
@@ -13543,13 +15431,172 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (lineFinished) return;
 
         BlockPos startWalkway = northWalkwaySupport(x);
-        BlockPos farEnd = mapCorner.offset(x, map[x][127].getB(), 127);
+        int farZ = map[x].length - 1;
+        BlockPos farEnd = mapCorner.offset(x, map[x][farZ].getB(), farZ);
         checkpoints.add(new Tuple<>(walkingPosition(startWalkway), new Tuple<>("", null)));
         checkpoints.add(new Tuple<>(walkingPosition(farEnd), new Tuple<>("", null)));
         checkpoints.add(new Tuple<>(
             walkingPosition(startWalkway),
             new Tuple<>("independentColumnEnd", null)
         ));
+    }
+
+    private void addNorthWalkwayConstructionPath() {
+        if (northWalkwayBuildTargets.isEmpty()
+            || northWalkwayRelativeY == null) {
+            return;
+        }
+        int centerStart = automaticNorthWalkwayCenterStartX();
+        int centerEnd = centerStart
+            + CenteredNorthWalkwayLocator.ANCHOR_LENGTH - 1;
+        boolean westMissing = false;
+        for (int x = centerStart - 1; x >= 0; x--) {
+            BlockPos relative = new BlockPos(
+                x,
+                northWalkwayRelativeY,
+                -1
+            );
+            if (northWalkwayBuildTargets.contains(relative)
+                && isInWorkingInterval(relative)
+                && northWalkwayTargetMissing(relative)) {
+                westMissing = true;
+                break;
+            }
+        }
+        boolean eastMissing = false;
+        for (int x = centerEnd + 1;
+             x < compactPlan.mapWidth();
+             x++) {
+            BlockPos relative = new BlockPos(
+                x,
+                northWalkwayRelativeY,
+                -1
+            );
+            if (northWalkwayBuildTargets.contains(relative)
+                && isInWorkingInterval(relative)
+                && northWalkwayTargetMissing(relative)) {
+                eastMissing = true;
+                break;
+            }
+        }
+        if (!westMissing && !eastMissing) return;
+
+        if (westMissing) {
+            addNorthWalkwayStepCheckpoint(centerStart);
+            for (int x = centerStart - 1; x >= 0; x--) {
+                BlockPos relative = new BlockPos(
+                    x,
+                    northWalkwayRelativeY,
+                    -1
+                );
+                if (northWalkwayBuildTargets.contains(relative)
+                    && isInWorkingInterval(relative)) {
+                    addNorthWalkwayStepCheckpoint(x);
+                }
+            }
+        }
+        if (eastMissing) {
+            // The center anchor is already safe, so this also provides a
+            // verified return route after completing the west extension.
+            addNorthWalkwayStepCheckpoint(centerEnd);
+            for (int x = centerEnd + 1;
+                 x < compactPlan.mapWidth();
+                 x++) {
+                BlockPos relative = new BlockPos(
+                    x,
+                    northWalkwayRelativeY,
+                    -1
+                );
+                if (northWalkwayBuildTargets.contains(relative)
+                    && isInWorkingInterval(relative)) {
+                    addNorthWalkwayStepCheckpoint(x);
+                }
+            }
+        }
+    }
+
+    private boolean northWalkwayTargetMissing(BlockPos relative) {
+        BlockPos world = mapCorner.offset(relative);
+        return !MapAreaCache.hasBlockData(world)
+            || MapAreaCache.getCachedBlockState(world).getBlock()
+                != Blocks.COBBLESTONE;
+    }
+
+    private void addNorthWalkwayStepCheckpoint(int x) {
+        BlockPos support = northWalkwaySupport(x);
+        checkpoints.add(
+            new Tuple<>(
+                walkingPosition(support),
+                new Tuple<>("buildNorthWalkwayStep", support)
+            )
+        );
+    }
+
+    private boolean holdForNorthWalkwayConstructionStep(
+        Tuple<Vec3, Tuple<String, BlockPos>> checkpoint
+    ) {
+        BlockPos support = checkpoint.getB().getB();
+        if (support == null
+            || !support.equals(
+                supportBelowCheckpoint(checkpoint.getA())
+            )) {
+            error("The automatic north-walkway path lost its support target.");
+            stopMovement();
+            toggle();
+            return true;
+        }
+        BlockPos relative = support.subtract(mapCorner);
+        boolean centerAnchor = relative.getZ() == -1
+            && relative.getY() == northWalkwayRelativeY
+            && relative.getX() >= automaticNorthWalkwayCenterStartX()
+            && relative.getX() < automaticNorthWalkwayCenterStartX()
+                + CenteredNorthWalkwayLocator.ANCHOR_LENGTH;
+        boolean plannedExtension =
+            northWalkwayBuildTargets.contains(relative);
+        if (!centerAnchor && !plannedExtension) {
+            error(
+                "The automatic north-walkway path references an unknown "
+                    + "support at " + support.toShortString() + "."
+            );
+            stopMovement();
+            toggle();
+            return true;
+        }
+        if (!MapAreaCache.hasBlockData(support)) {
+            stopMovement();
+            return true;
+        }
+        BlockState state = MapAreaCache.getCachedBlockState(support);
+        boolean clearHeadroom =
+            MapAreaCache.getCachedBlockState(support.above()).isAir()
+                && MapAreaCache.getCachedBlockState(support.above(2)).isAir();
+        if (state.getBlock() == Blocks.COBBLESTONE && clearHeadroom) {
+            return false;
+        }
+        if (centerAnchor) {
+            error(
+                "The player-built centered north-walkway anchor changed at "
+                    + support.toShortString() + "."
+            );
+            stopMovement();
+            toggle();
+            return true;
+        }
+        if (!state.isAir() || !clearHeadroom) {
+            error(
+                "The automatic outer north-walkway extension is blocked at "
+                    + support.toShortString() + "."
+            );
+            stopMovement();
+            toggle();
+            return true;
+        }
+
+        // Never step toward air. The normal server-confirmed placement
+        // scheduler owns this exact next target while movement is held.
+        stopMovement();
+        runBuildActionScheduler();
+        return true;
     }
 
     private Vec3 walkingPosition(BlockPos supportingBlock) {
@@ -14092,11 +16139,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (mapCorner == null) return false;
         int relativeX = cell.x() - mapCorner.getX();
         int relativeZ = cell.z() - mapCorner.getZ();
-        int maximumRelativeZ = compactPlan == null
-            ? 127
-            : compactPlan.sizeZ() - 2;
+        int maximumRelativeZ = compactPlan != null
+            && circularTraversalForCurrentMap
+            ? compactPlan.sizeZ() - 2
+            : activeVisibleDepthBlocks() - 1;
         return relativeX >= -1
-            && relativeX <= 128
+            && relativeX <= activeMapWidthBlocks()
             && relativeZ >= -2
             && relativeZ <= maximumRelativeZ + 1;
     }
@@ -14156,10 +16204,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private void resetMapAreaCache() {
-        int maximumRelativeZ = compactPlan == null
-            ? 127
-            : compactPlan.sizeZ() - 2;
-        MapAreaCache.reset(mapCorner, 0, 127, -1, maximumRelativeZ);
+        int maximumRelativeZ = compactPlan != null
+            && circularTraversalForCurrentMap
+            ? compactPlan.sizeZ() - 2
+            : activeVisibleDepthBlocks() - 1;
+        MapAreaCache.reset(
+            mapCorner,
+            0,
+            activeMapWidthBlocks() - 1,
+            -1,
+            maximumRelativeZ
+        );
     }
 
     private boolean calculateIndependentMiningPath(int line) {
@@ -14798,7 +16853,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private boolean isSafeNorthWalkway(int x) {
         if (northWalkwayRelativeY == null
             || x < 0
-            || x >= CompactCircularNbtPlan.MAP_WIDTH) {
+            || x >= activeMapWidthBlocks()) {
             return false;
         }
         BlockPos walkway = northWalkwaySupport(x);
@@ -18057,7 +20112,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 warning(
                     "File-coordinated printing is waiting because this bot is "
                         + "outside the configured map-area margin or the "
-                        + "full 128x128 map area has not loaded yet."
+                        + "full configured map grid has not loaded yet."
                 );
             }
             return;
@@ -18094,7 +20149,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         if (availableSlots.isEmpty() && !setupSlots()) return;
         applyPendingInterval();
-        circularTraversalForCurrentMap = circularTraversal.get();
+        circularTraversalForCurrentMap =
+            circularTraversal.get() && isSingleMapGrid();
+        if (circularTraversal.get() && !isSingleMapGrid()) {
+            info(
+                "Contiguous " + mapColumns.get() + "x" + mapRows.get()
+                    + " map printing uses restock-safe independent columns; "
+                    + "compact U traversal is limited to 1x1 maps."
+            );
+        }
         buildingActive = true;
         resetBuildActionState();
         buildRecoveryPending = false;
@@ -18163,6 +20226,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             boolean assignedToThisBot = route.outboundX() >= workingInterval.getA()
                 && route.returnX() <= workingInterval.getB();
             boolean pairFits = assignedToThisBot
+                && circularTraversalForCurrentMap
                 && pairFitsUsableInventory(route);
             boolean useCircular = assignedToThisBot
                 && CircularBuildAssignmentPolicy.useCircular(
@@ -18189,13 +20253,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void rebuildActiveBuildTargets() {
         orderedBuildTargets.clear();
         activeConnectorTargets.clear();
+        addActiveNorthWalkwayBuildTargets();
         for (CompactCircularNbtPlan.PairRoute route : compactPlan.pairRoutes()) {
             boolean assignedToThisBot = route.outboundX() >= workingInterval.getA()
                 && route.returnX() <= workingInterval.getB();
             if (!assignedToThisBot) continue;
 
-            for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
-                addActiveSurfaceTarget(route.outboundX(), nbtZ);
+            for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
+                addActiveSurfaceAndLightingTargets(
+                    route.outboundX(),
+                    nbtZ
+                );
             }
             if (circularPairModes.getOrDefault(route.pairIndex(), false)) {
                 for (CompactCircularNbtPlan.Position connector : route.relativeInterior()) {
@@ -18203,12 +20271,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     addActiveBuildTarget(relative);
                     activeConnectorTargets.add(relative);
                 }
-                for (int nbtZ = CompactCircularNbtPlan.FAR_Z; nbtZ >= 1; nbtZ--) {
-                    addActiveSurfaceTarget(route.returnX(), nbtZ);
+                for (int nbtZ = compactPlan.visibleRows(); nbtZ >= 1; nbtZ--) {
+                    addActiveSurfaceAndLightingTargets(
+                        route.returnX(),
+                        nbtZ
+                    );
                 }
             } else {
-                for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
-                    addActiveSurfaceTarget(route.returnX(), nbtZ);
+                for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
+                    addActiveSurfaceAndLightingTargets(
+                        route.returnX(),
+                        nbtZ
+                    );
                 }
             }
         }
@@ -18235,7 +20309,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return false;
         }
         if (repairCurrentUPair.get()) {
-            for (BlockPos relative : circularPairTargets(route)) {
+            for (BlockPos relative : circularPairBuildTargets(route)) {
                 Block expected = buildTargets.get(relative);
                 BlockState current = MapAreaCache.getCachedBlockState(
                     mapCorner.offset(relative)
@@ -18742,7 +20816,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         HashSet<BlockPos> clearOnlyRepairTargets =
             new HashSet<>();
 
-        for (BlockPos relative : circularPairTargets(route)) {
+        for (BlockPos relative : circularPairBuildTargets(route)) {
             Block expected = buildTargets.get(relative);
             if (expected == null) {
                 throw new IllegalStateException(
@@ -18796,7 +20870,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
 
-        if (repairCurrentUPair.get()) {
+        if (repairCurrentUPair.get() || printingOnly.get()) {
             addBaselineRepairToolRequirements(requiredRepairTools);
         }
 
@@ -18955,17 +21029,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void addBaselineRepairToolRequirements(
         Set<Item> requiredItems
     ) {
-        toolSet.stream()
-            .filter(registered ->
-                registered.getMaxDamage() > 1
-                    && (registered.is(ItemTags.PICKAXES)
-                        || registered.is(ItemTags.AXES))
-            )
-            .sorted(Comparator.comparing(registered ->
-                BuiltInRegistries.ITEM.getKey(registered.getItem()).toString()
-            ))
-            .map(ItemStack::getItem)
-            .forEach(requiredItems::add);
+        ItemStack pickaxe = preferredRegisteredTeardownTool(ItemTags.PICKAXES);
+        ItemStack axe = preferredRegisteredTeardownTool(ItemTags.AXES);
+        if (pickaxe != null) requiredItems.add(pickaxe.getItem());
+        if (axe != null) requiredItems.add(axe.getItem());
     }
 
     private boolean addRepairToolRequirement(
@@ -19016,7 +21083,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 activeRoute.returnX(),
                 workingInterval.getA(),
                 workingInterval.getB(),
-                CompactCircularNbtPlan.MAP_WIDTH
+                compactPlan.mapWidth()
             )
         );
         CircularBuildReachTopology.RoutePlan routePlan =
@@ -19153,7 +21220,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             deferredMandatoryTargets,
             "deferredMandatoryTargets"
         );
-        ArrayList<BlockPos> targets = circularPairTargets(route);
+        ArrayList<BlockPos> targets = circularPairBuildTargets(route);
         HashSet<BlockPos> seen = new HashSet<>(targets);
         for (BlockPos relative : deferredMandatoryTargets) {
             BlockPos candidate =
@@ -19195,21 +21262,108 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private ArrayList<BlockPos> circularPairTargets(CompactCircularNbtPlan.PairRoute route) {
-        ArrayList<BlockPos> targets = new ArrayList<>(256 + route.relativeInterior().size());
-        for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
+        ArrayList<BlockPos> targets = new ArrayList<>(
+            compactPlan.visibleRows() * 2 + route.relativeInterior().size()
+        );
+        for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
             targets.add(surfaceRuntimePosition(route.outboundX(), nbtZ));
         }
         for (CompactCircularNbtPlan.Position connector : route.relativeInterior()) {
             targets.add(connectorRuntimePosition(connector));
         }
-        for (int nbtZ = CompactCircularNbtPlan.FAR_Z; nbtZ >= 1; nbtZ--) {
+        for (int nbtZ = compactPlan.visibleRows(); nbtZ >= 1; nbtZ--) {
             targets.add(surfaceRuntimePosition(route.returnX(), nbtZ));
         }
         return targets;
     }
 
+    private ArrayList<BlockPos> circularPairBuildTargets(
+        CompactCircularNbtPlan.PairRoute route
+    ) {
+        ArrayList<BlockPos> targets = new ArrayList<>(
+            compactPlan.visibleRows() * 2
+                + route.relativeInterior().size()
+                + lightingTargets.size()
+                    / Math.max(1, compactPlan.pairCount())
+        );
+        for (int nbtZ = 1; nbtZ <= compactPlan.visibleRows(); nbtZ++) {
+            addSurfaceAndLightingTargets(
+                targets,
+                route.outboundX(),
+                nbtZ
+            );
+        }
+        for (CompactCircularNbtPlan.Position connector
+            : route.relativeInterior()) {
+            targets.add(connectorRuntimePosition(connector));
+        }
+        for (int nbtZ = compactPlan.visibleRows(); nbtZ >= 1; nbtZ--) {
+            addSurfaceAndLightingTargets(
+                targets,
+                route.returnX(),
+                nbtZ
+            );
+        }
+        return targets;
+    }
+
+    private void addSurfaceAndLightingTargets(
+        List<BlockPos> targets,
+        int x,
+        int nbtZ
+    ) {
+        BlockPos surface = surfaceRuntimePosition(x, nbtZ);
+        targets.add(surface);
+        BlockPos lighting = surface.above(
+            EndRodLightingPlan.HEIGHT_ABOVE_SURFACE
+        );
+        if (lightingTargets.contains(lighting)) targets.add(lighting);
+    }
+
     private void addActiveSurfaceTarget(int x, int nbtZ) {
         addActiveBuildTarget(surfaceRuntimePosition(x, nbtZ));
+    }
+
+    private void addActiveSurfaceAndLightingTargets(int x, int nbtZ) {
+        BlockPos surface = surfaceRuntimePosition(x, nbtZ);
+        addActiveBuildTarget(surface);
+        BlockPos lighting = surface.above(
+            EndRodLightingPlan.HEIGHT_ABOVE_SURFACE
+        );
+        if (lightingTargets.contains(lighting)) {
+            addActiveBuildTarget(lighting);
+        }
+    }
+
+    private void addActiveNorthWalkwayBuildTargets() {
+        if (northWalkwayBuildTargets.isEmpty()) return;
+        int centerStart = automaticNorthWalkwayCenterStartX();
+        int centerEnd = centerStart
+            + CenteredNorthWalkwayLocator.ANCHOR_LENGTH - 1;
+        for (int x = centerStart - 1; x >= 0; x--) {
+            BlockPos relative = new BlockPos(
+                x,
+                northWalkwayRelativeY,
+                -1
+            );
+            if (northWalkwayBuildTargets.contains(relative)
+                && isInWorkingInterval(relative)) {
+                addActiveBuildTarget(relative);
+            }
+        }
+        for (int x = centerEnd + 1;
+             x < compactPlan.mapWidth();
+             x++) {
+            BlockPos relative = new BlockPos(
+                x,
+                northWalkwayRelativeY,
+                -1
+            );
+            if (northWalkwayBuildTargets.contains(relative)
+                && isInWorkingInterval(relative)) {
+                addActiveBuildTarget(relative);
+            }
+        }
     }
 
     private void addActiveBuildTarget(BlockPos relative) {
@@ -19234,16 +21388,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return false;
         }
 
-        int[] firstVisibleRowY = new int[CompactCircularNbtPlan.MAP_WIDTH];
-        for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
+        int[] firstVisibleRowY = new int[compactPlan.mapWidth()];
+        for (int x = 0; x < compactPlan.mapWidth(); x++) {
             firstVisibleRowY[x] = compactPlan.targetSurfaceY(x, 1);
         }
 
         CompactNorthWalkwayResolver.Resolution resolution =
             CompactNorthWalkwayResolver.resolve(
                 firstVisibleRowY,
-                0,
-                CompactCircularNbtPlan.MAP_WIDTH - 1,
+                printingOnly.get()
+                    ? automaticNorthWalkwayCenterStartX()
+                    : 0,
+                printingOnly.get()
+                    ? automaticNorthWalkwayCenterStartX()
+                        + CenteredNorthWalkwayLocator.ANCHOR_LENGTH - 1
+                    : compactPlan.mapWidth() - 1,
                 (x, relativeY) -> {
                     BlockPos support = mapCorner.offset(x, relativeY, -1);
                     if (!MapAreaCache.hasBlockData(support)) {
@@ -19296,7 +21455,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + " on candidate world Y layer"
                     + (resolution.candidates().size() == 1 ? " " : "s ")
                     + candidateWorldYs
-                    + ". It must be a complete cobblestone row with two blocks of headroom."
+                    + (printingOnly.get()
+                        ? ". The centered 128-block cobblestone anchor must be complete with two blocks of headroom."
+                        : ". It must be a complete cobblestone row with two blocks of headroom.")
             );
             case RESOLVED -> throw new IllegalStateException(
                 "Resolved north walkway has no relative Y."
@@ -19423,10 +21584,27 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
         for (int x = workingInterval.getA(); x <= workingInterval.getB(); x++) {
             BlockPos walkway = northWalkwaySupport(x);
-            if (!isSafeNorthWalkway(x)) {
+            if (isSafeNorthWalkway(x)) continue;
+            BlockPos relative = walkway.subtract(mapCorner);
+            boolean plannedExtension =
+                northWalkwayBuildTargets.contains(relative);
+            if (plannedExtension
+                && !MapAreaCache.hasBlockData(walkway)) {
+                continue;
+            }
+            BlockState support =
+                MapAreaCache.getCachedBlockState(walkway);
+            boolean buildableExtension = plannedExtension
+                && support.isAir()
+                && MapAreaCache.getCachedBlockState(walkway.above()).isAir()
+                && MapAreaCache.getCachedBlockState(walkway.above(2)).isAir();
+            if (!buildableExtension) {
                 error(
-                    "Compact north walkway is no longer safe at "
-                        + walkway.toShortString() + "."
+                    plannedExtension
+                        ? "The planned outer north-walkway extension is blocked at "
+                            + walkway.toShortString() + "."
+                        : "The centered 128-block north-walkway anchor is no longer safe at "
+                            + walkway.toShortString() + "."
                 );
                 return false;
             }
@@ -19439,6 +21617,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
             if (circularPairModes.getOrDefault(route.pairIndex(), false)) {
                 if (!validateCircularPairWorkspace(route, true)) return false;
+            } else if (!isSingleMapGrid()) {
+                // Multi-map printing deliberately has no compact connectors:
+                // every retained column is built independently from the one
+                // global north walkway.
+                continue;
             } else if (hasPartialConnector(route)) {
                 error(
                     "Pair " + route.pairIndex()
@@ -19597,6 +21780,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + confirmedRepairBreaks + "/" + repairBreakAttempts
                 + " repair-break confirmations)."
         );
+        if (printingOnly.get()) {
+            completePrintingOnlyCycle(true);
+            // Both endBuilding callers use false to stop the current tick.
+            // A successful print-only completion deactivates the module and
+            // deliberately leaves no checkpoint or next-NBT transition.
+            return false;
+        }
         applyPendingInterval();
         buildingActive = false;
         mapCyclePhase = MapCyclePhase.MAP_HANDOFF;
@@ -19633,6 +21823,79 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         checkpoints.add(new Tuple(dumpStation.getA(), new Tuple("dump", null)));
         checkpoints.add(new Tuple(bestChest.getB(), new Tuple("mapMaterialChest", bestChest.getA())));
         return true;
+    }
+
+    @Override
+    public void finishPrintingOnlyCycle() {
+        if (!printingOnly.get()) {
+            warning(
+                "Ignored printing-only completion because this bot does not "
+                    + "have printing-only enabled."
+            );
+            return;
+        }
+        completePrintingOnlyCycle(false);
+    }
+
+    private void completePrintingOnlyCycle(boolean notifySlaves) {
+        applyPendingInterval();
+        cancelLogisticsDetour();
+        stopMovement();
+        buildingActive = false;
+        miningAssignmentsActive = false;
+        buildRecoveryPending = false;
+        buildRecoveryNeedsInventory = false;
+        buildRecoveryRestockAfterEgress = false;
+        miningRecoveryPending = false;
+        miningRecoveryNeedsTools = false;
+        strictMiningRestockActive = false;
+        releaseTransientBuildOwners();
+        resetTeardownMiningActionState();
+        abandonRestockSession(true);
+        pendingDumpTransfer = null;
+        pendingUsedToolDeposit = null;
+        repairToolShadows.clear();
+        activeCircularBuildPair = -1;
+        activeCircularConnectorIndex = -1;
+        circularBuildRecoveryDirection = 0;
+        circularBuildRejoinSupportIndex = -1;
+        circularBuildRejoinResumePhase = CircularBuildPhase.NONE;
+        circularBuildPhase = CircularBuildPhase.NONE;
+        clearCircularBuildInventoryPlan();
+        workActionBudget.reset();
+        checkpoints.clear();
+        currentMiningLines.clear();
+        pendingIndependentMiningLines.clear();
+        activeMiningLine = -1;
+        miningPos = null;
+        currentMiningPaired = false;
+        currentSlaveMiningTaskId = -1;
+        pendingSlaveMiningCompletion = null;
+        mapCyclePhase = MapCyclePhase.IDLE;
+        mapHandoffStage = MapHandoffStage.NONE;
+        handoffSourceMapId = null;
+        handoffLockedMapId = null;
+        state = State.AwaitNBTFile;
+        workingInterval = trueInterval;
+        knownErrors.clear();
+        printingComplete = true;
+
+        if (notifySlaves) {
+            SlaveSystem.sendToAllSlaves("printingDone");
+        }
+        if (!clearLocalCycleCheckpoint("printing-only-complete")) return;
+        if (!persistFileCoordinationCheckpoint(
+            "printing-only-complete"
+        )) {
+            return;
+        }
+
+        info(
+            "Printing-only cycle complete. The built structure and source "
+                + "NBT were left in place; map handoff, teardown, archival, "
+                + "and next-NBT selection were skipped."
+        );
+        if (isActive()) toggle();
     }
 
     private boolean recordCurrentCycleTiming() {
@@ -19819,6 +22082,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean refillTools,
         boolean recoveringExistingMining
     ) {
+        if (refusePrintingOnlyPostPrintAction(
+            recoveringExistingMining
+                ? "recover teardown"
+                : "start teardown"
+        )) {
+            return;
+        }
         if (availableSlots.isEmpty() && !setupSlots()) return;
         buildingActive = false;
         buildRecoveryPending = false;
@@ -20841,6 +23111,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private boolean setupSlots() {
         availableSlots = Utils.getAvailableSlots(materialDict);
+        if (printingOnly.get()) {
+            for (int slot = 0; slot < 36; slot++) {
+                if (ToolUtils.isTool(
+                        mc.player.getInventory().getItem(slot)
+                    ) && !availableSlots.contains(slot)) {
+                    availableSlots.add(slot);
+                }
+            }
+            Collections.sort(availableSlots);
+        }
         availableHotBarSlots.clear();
         for (int slot : availableSlots) {
             if (slot < 9) {
@@ -20987,7 +23267,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private HashMap<Item, Integer> getRequiredRestockItems() {
-        return getRequiredItems();
+        HashMap<Item, Integer> required =
+            new HashMap<>(getRequiredItems());
+        addPrintingOnlyCarryToolCounts(required);
+        return required;
+    }
+
+    private void addPrintingOnlyCarryToolCounts(
+        HashMap<Item, Integer> required
+    ) {
+        if (!printingOnly.get()) return;
+        ItemStack pickaxe = preferredRegisteredTeardownTool(
+            ItemTags.PICKAXES
+        );
+        ItemStack axe = preferredRegisteredTeardownTool(ItemTags.AXES);
+        if (pickaxe != null) {
+            required.merge(pickaxe.getItem(), 1, Math::max);
+        }
+        if (axe != null) {
+            required.merge(axe.getItem(), 1, Math::max);
+        }
     }
 
     private HashMap<Item, Integer>
@@ -20997,7 +23296,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || compactPlan == null
             || plannedCircularBuildPair
                 >= compactPlan.pairRoutes().size()) {
-            return getRequiredItems();
+            HashMap<Item, Integer> required =
+                new HashMap<>(getRequiredItems());
+            addPrintingOnlyCarryToolCounts(required);
+            return required;
         }
 
         HashMap<Item, Integer> required =
@@ -21025,12 +23327,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     // MapPrinter Interface for Slave Logic
 
+    @Override
+    public int getMapWidth() {
+        return activeMapWidthBlocks();
+    }
+
     public void setInterval(Tuple<Integer, Integer> interval) {
         int left = Math.max(0, interval.getA());
-        int right = Math.min(127, interval.getB());
+        int maximumColumn = activeMapWidthBlocks() - 1;
+        int right = Math.min(maximumColumn, interval.getB());
         if ((left & 1) != 0) left--;
         if ((right & 1) == 0) right++;
-        Tuple<Integer, Integer> pairAligned = new Tuple<>(left, Math.min(127, right));
+        Tuple<Integer, Integer> pairAligned =
+            new Tuple<>(left, Math.min(maximumColumn, right));
         if (buildingActive) {
             pendingInterval = pairAligned;
             info(
@@ -21109,6 +23418,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     @Override
     public void finishMiningCycle(long sessionId) {
+        if (refusePrintingOnlyPostPrintAction(
+            "run post-teardown cleanup"
+        )) {
+            return;
+        }
         if (sessionId < lastFinalizedMiningSessionId) return;
         if (sessionId == lastFinalizedMiningSessionId) {
             if (pendingMiningFinalizationAck != sessionId) {
@@ -21313,6 +23627,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         long recoveryToken
     ) {
         if (!SlaveSystem.isFileSlave() || recoveryToken < 1) return;
+        if (phase != MapCyclePhase.IDLE
+            && phase != MapCyclePhase.BUILDING
+            && refusePrintingOnlyPostPrintAction(
+                "prepare recovery for the " + phase + " phase"
+            )) {
+            return;
+        }
         if (recoveryToken == lastPreparedFileRecoveryToken) {
             SlaveSystem.queueMasterDM(
                 "recoveryAck:" + recoveryToken
@@ -21402,11 +23723,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     public void skipBuilding() {
+        if (refusePrintingOnlyPostPrintAction(
+            "skip printing and enter the post-print cycle"
+        )) {
+            return;
+        }
         if (availableSlots.isEmpty()) setupSlots();
         if (cycleStartedAtMs < 0) {
             cycleStartedAtMs = System.currentTimeMillis();
         }
-        circularTraversalForCurrentMap = circularTraversal.get();
+        circularTraversalForCurrentMap =
+            circularTraversal.get() && isSingleMapGrid();
         releaseTransientBuildOwners();
         resetTeardownMiningActionState();
         abandonRestockSession(true);
@@ -21513,6 +23840,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean pairedTraversal,
         boolean reserveWholePair
     ) {
+        if (refusePrintingOnlyPostPrintAction(
+            "accept a teardown assignment"
+        )) {
+            return;
+        }
         if (line < 0 || line >= map.length) {
             error("Rejected invalid mining line " + line + ".");
             toggle();
@@ -21556,6 +23888,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boolean reserveWholePair,
         long taskId
     ) {
+        if (refusePrintingOnlyPostPrintAction(
+            "accept teardown task " + taskId
+        )) {
+            return;
+        }
         if (taskId < highestSlaveMiningTaskId) {
             warning("Ignored stale mining task " + taskId + ".");
             return;
@@ -21666,6 +24003,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private boolean adoptProvableUncheckpointedTeardown() {
+        if (printingOnly.get()) return false;
         if (SlaveSystem.isFileMode()
             || localCycleCheckpointStore == null
             || mapCyclePhase != MapCyclePhase.IDLE
@@ -22366,6 +24704,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             publishedCircular
         );
         SlaveSystem.setFileMetadata(
+            FILE_META_PRINTING_ONLY,
+            Boolean.toString(printingOnly.get())
+        );
+        SlaveSystem.setFileMetadata(
+            FILE_META_MAP_COLUMNS,
+            Integer.toString(mapColumns.get())
+        );
+        SlaveSystem.setFileMetadata(
+            FILE_META_MAP_ROWS,
+            Integer.toString(mapRows.get())
+        );
+        SlaveSystem.setFileMetadata(
             FILE_META_SERVER,
             publishedServer
         );
@@ -22684,6 +25034,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && Boolean.toString(circularTraversalForCurrentMap).equals(
                 masterMetadata.get(FILE_META_CIRCULAR)
             )
+            && fileMapModeMatches(masterMetadata)
             && coordinationIdentityMatches(masterMetadata)
             && metadataPositionWithinMapZone(masterMetadata)
             && "true".equalsIgnoreCase(
@@ -22721,6 +25072,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private boolean isPrinterConfigurationReady() {
+        if (printingOnly.get()) {
+            return dumpStation != null
+                && mapCorner != null
+                && (!sleep.get() || bed != null)
+                && automaticShulkerRegistrationComplete
+                && materialDict != null
+                && !materialDict.isEmpty()
+                && toolSet != null
+                && !toolSet.isEmpty()
+                && (!SlaveSystem.isFileMode()
+                    || activeConfigSha256 != null);
+        }
         return cartographyTable != null
             && finishedMapChest != null
             && usedToolChest != null
@@ -22771,6 +25134,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 || !Boolean.toString(
                     circularTraversalForCurrentMap
                 ).equals(metadata.get(FILE_META_CIRCULAR))
+                || !fileMapModeMatches(metadata)
                 || !coordinationIdentityMatches(metadata)
                 || !metadataPositionWithinMapZone(metadata)
                 || !"true".equalsIgnoreCase(
@@ -22851,19 +25215,34 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mapCorner.getY() + maximumRelativeSupportY;
         int verticalMargin = 4;
         return x >= mapCorner.getX() - margin
-            && x <= mapCorner.getX() + 127 + margin
+            && x <= mapCorner.getX() + activeMapWidthBlocks() - 1 + margin
             && y >= minimumSupportY + 1 - verticalMargin
             && y <= maximumSupportY + 1 + verticalMargin
             && z >= mapCorner.getZ() - margin
-            && z <= mapCorner.getZ() + 127 + margin;
+            && z <= mapCorner.getZ() + activeVisibleDepthBlocks() - 1 + margin;
     }
 
     private boolean isMapAreaDataLoaded() {
         if (mc.level == null || mapCorner == null) return false;
-        int minimumChunkX = mapCorner.getX() >> 4;
-        int maximumChunkX = (mapCorner.getX() + 127) >> 4;
-        int minimumChunkZ = mapCorner.getZ() >> 4;
-        int maximumChunkZ = (mapCorner.getZ() + 127) >> 4;
+        int minimumColumn = workingInterval == null
+            ? 0
+            : Math.max(0, workingInterval.getA());
+        int maximumColumn = workingInterval == null
+            ? activeMapWidthBlocks() - 1
+            : Math.min(
+                activeMapWidthBlocks() - 1,
+                workingInterval.getB()
+            );
+        int minimumChunkX =
+            (mapCorner.getX() + minimumColumn) >> 4;
+        int maximumChunkX =
+            (mapCorner.getX() + maximumColumn) >> 4;
+        int minimumChunkZ = (mapCorner.getZ() - 1) >> 4;
+        int requiredDepth = printingOnly.get() && !isSingleMapGrid()
+            ? Math.min(16, activeVisibleDepthBlocks())
+            : activeVisibleDepthBlocks();
+        int maximumChunkZ =
+            (mapCorner.getZ() + requiredDepth - 1) >> 4;
         for (int chunkX = minimumChunkX;
              chunkX <= maximumChunkX;
              chunkX++) {
@@ -22959,15 +25338,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         String sourceSha256 = metadata.get(FILE_META_SOURCE_SHA256);
         String planSha256 = metadata.get(FILE_META_PLAN_SHA256);
         String masterCircular = metadata.get(FILE_META_CIRCULAR);
+        if (!adoptAdvertisedFileMapGrid(metadata)) {
+            publishFileCoordinationState();
+            return;
+        }
         if (!isUuid(jobId)
             || generation == null
             || generation < 1
             || !isSafeSharedFileName(sourceName)
             || !FileFingerprint.isSha256(sourceSha256)
             || !FileFingerprint.isSha256(planSha256)
-            || !Boolean.toString(circularTraversal.get()).equals(
+            || !Boolean.toString(configuredCircularTraversal()).equals(
                 masterCircular
-            )) {
+            )
+            || !fileMapModeMatches(metadata)) {
             publishFileCoordinationState();
             return;
         }
@@ -23417,7 +25801,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             )
             && Objects.equals(
                 fileMasterRecoveredCircular,
-                Boolean.toString(circularTraversal.get())
+                Boolean.toString(configuredCircularTraversal())
             );
         if (matches) return true;
 
@@ -23434,6 +25818,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void resumeRecoveredFileMasterCycle() {
         if (!fileMasterRecoveryLoaded || fileMasterRecoveredPhase == null) {
             state = State.SelectingChests;
+            return;
+        }
+        if (fileMasterRecoveredPhase != MapCyclePhase.IDLE
+            && fileMasterRecoveredPhase != MapCyclePhase.BUILDING
+            && refusePrintingOnlyPostPrintAction(
+                "recover the saved " + fileMasterRecoveredPhase + " phase"
+            )) {
             return;
         }
         if (!recoveredFileIdentityMatchesLoadedState()) return;
@@ -23625,6 +26016,22 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 CompactCircularNbtGenerator.loadOrGenerate(nbt);
             CompactCircularNbtGenerator.GeneratedNbt generated = loaded.generated();
             compactPlan = generated.plan();
+            MapGridLayout gridLayout = new MapGridLayout(
+                compactPlan.mapColumns(),
+                compactPlan.mapRows()
+            );
+            adoptDetectedMapGrid(gridLayout);
+            if (!printingOnly.get()
+                && (gridLayout.columns() != 1
+                    || gridLayout.rows() != 1)) {
+                throw new IllegalArgumentException(
+                    "Contiguous multi-map NBTs require printing-only because "
+                        + "map handoff and teardown are intentionally disabled "
+                        + "for retained mosaics."
+                );
+            }
+            circularTraversalForCurrentMap =
+                circularTraversal.get() && isSingleMapGrid();
 
             ListTag paletteList = generated.root().getList("palette")
                 .orElseThrow(() -> new IllegalArgumentException("Generated compact NBT has no palette."));
@@ -23632,8 +26039,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             map = generateMapArray(compactPlan);
             generateRuntimeBuildPlan(compactPlan);
             activeCompactPlanSha256 = compactPlanFingerprint();
-            loadOrCompileCircularBuildReachTopology();
-            loadOrCompileCircularTeardownReachTopology();
+            if (circularTraversalForCurrentMap) {
+                loadOrCompileCircularBuildReachTopology();
+            }
+            if (!printingOnly.get() && isSingleMapGrid()) {
+                loadOrCompileCircularTeardownReachTopology();
+            }
 
             boolean sourceAlreadyArchived = mapFile.getParentFile() != null
                 && mapFile.getParentFile().getName().equals(
@@ -23677,16 +26088,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
 
             info(
-                "Compact plan validated: §a64 pairs, "
+                "Compact plan validated: §a" + compactPlan.mapColumns()
+                    + "x" + compactPlan.mapRows() + " maps, "
+                    + compactPlan.pairCount() + " column pairs, "
                     + compactPlan.connectorBlocks().size()
                     + " connector blocks, "
+                    + compactPlan.lightingBlocks().size()
+                    + " end rods (minimum guaranteed surface block light "
+                    + compactPlan.minimumGuaranteedSurfaceLight() + "), "
                     + compactPlan.sizeX() + "x" + compactPlan.sizeY() + "x" + compactPlan.sizeZ()
             );
             return true;
         } catch (Exception e) {
             activeSourceSha256 = null;
             activeCompactPlanSha256 = null;
-            warning("Compact NBT rejected: " + e.getMessage());
+            warning("Map-grid NBT rejected: " + e.getMessage());
             e.printStackTrace();
             return false;
         }
@@ -23824,11 +26240,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                             position.getZ()
                         ))
                         .toList();
+                List<BlockReachWindow.Cell> targetCells =
+                    circularPairBuildTargets(route).stream()
+                        .map(position -> new BlockReachWindow.Cell(
+                            position.getX(),
+                            position.getY(),
+                            position.getZ()
+                        ))
+                        .toList();
                 routes.add(
                     new CircularBuildReachTopology.Route(
                         route.pairIndex(),
                         routeCells,
-                        routeCells
+                        targetCells
                     )
                 );
             }
@@ -23847,7 +26271,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             new HashMap<>();
         for (CompactCircularNbtPlan.PairRoute route
             : compactPlan.pairRoutes()) {
-            ArrayList<BlockPos> targets = circularPairTargets(route);
+            ArrayList<BlockPos> targets = circularPairBuildTargets(route);
             for (int targetIndex = 0;
                  targetIndex < targets.size();
                  targetIndex++) {
@@ -24044,9 +26468,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     }
 
     private Tuple<Block, Integer>[][] generateMapArray(CompactCircularNbtPlan.Result plan) {
-        Tuple<Block, Integer>[][] smoothedHeightMap = new Tuple[128][128];
-        for (int x = 0; x < CompactCircularNbtPlan.MAP_WIDTH; x++) {
-            for (int nbtZ = 1; nbtZ < CompactCircularNbtPlan.SOURCE_Z_SIZE; nbtZ++) {
+        Tuple<Block, Integer>[][] smoothedHeightMap =
+            new Tuple[plan.mapWidth()][plan.visibleRows()];
+        for (int x = 0; x < plan.mapWidth(); x++) {
+            for (int nbtZ = 1; nbtZ < plan.sourceDepth(); nbtZ++) {
                 int state = plan.sourceTopState(x, nbtZ);
                 Tuple<Block, Integer> paletteEntry = blockPaletteDict.get(state);
                 if (paletteEntry == null) {
@@ -24063,12 +26488,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void generateRuntimeBuildPlan(CompactCircularNbtPlan.Result plan) {
         buildTargets.clear();
+        northWalkwayBuildTargets.clear();
         orderedBuildTargets.clear();
         minimumRelativeSupportY = Integer.MAX_VALUE;
         maximumRelativeSupportY = Integer.MIN_VALUE;
         connectorTargets.clear();
         activeConnectorTargets.clear();
+        lightingTargets.clear();
         circularPairModes.clear();
+        if (printingOnly.get()) {
+            for (CompactCircularNbtPlan.GeneratedBlock light
+                : plan.lightingBlocks()) {
+                lightingTargets.add(
+                    new BlockPos(
+                        light.position().x(),
+                        light.position().y() - plan.globalYShift(),
+                        light.position().z() - 1
+                    )
+                );
+            }
+        }
 
         for (Integer state : new ArrayList<>(blockPaletteDict.keySet())) {
             Tuple<Block, Integer> entry = blockPaletteDict.get(state);
@@ -24079,8 +26518,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             int firstX = route.outboundX();
             int secondX = route.returnX();
 
-            for (int nbtZ = 1; nbtZ <= CompactCircularNbtPlan.FAR_Z; nbtZ++) {
+            for (int nbtZ = 1; nbtZ <= plan.visibleRows(); nbtZ++) {
                 addRuntimeSurfaceTarget(plan, firstX, nbtZ);
+                addRuntimeLightingTarget(plan, firstX, nbtZ);
             }
             for (CompactCircularNbtPlan.Position connector : route.relativeInterior()) {
                 BlockPos relative = new BlockPos(
@@ -24088,14 +26528,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     connector.y(),
                     connector.z() - 1
                 );
-                addRuntimeTarget(relative, plan.cobblestoneState(), true);
+                addRuntimeTarget(
+                    relative,
+                    plan.cobblestoneState(),
+                    true,
+                    false
+                );
             }
-            for (int nbtZ = CompactCircularNbtPlan.FAR_Z; nbtZ >= 1; nbtZ--) {
+            for (int nbtZ = plan.visibleRows(); nbtZ >= 1; nbtZ--) {
                 addRuntimeSurfaceTarget(plan, secondX, nbtZ);
+                addRuntimeLightingTarget(plan, secondX, nbtZ);
             }
         }
 
-        int expectedTargets = 128 * 128 + plan.connectorBlocks().size();
+        int expectedTargets = Math.addExact(
+            Math.addExact(
+                Math.multiplyExact(plan.mapWidth(), plan.visibleRows()),
+                plan.connectorBlocks().size()
+            ),
+            lightingTargets.size()
+        );
         if (buildTargets.size() != expectedTargets || orderedBuildTargets.size() != expectedTargets) {
             throw new IllegalArgumentException(
                 "Runtime compact plan has " + buildTargets.size()
@@ -24120,10 +26572,35 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             plan.targetSurfaceY(x, nbtZ),
             nbtZ - 1
         );
-        addRuntimeTarget(relative, plan.sourceTopState(x, nbtZ), false);
+        addRuntimeTarget(
+            relative,
+            plan.sourceTopState(x, nbtZ),
+            false,
+            false
+        );
     }
 
-    private void addRuntimeTarget(BlockPos relative, int state, boolean connector) {
+    private void addRuntimeLightingTarget(
+        CompactCircularNbtPlan.Result plan,
+        int x,
+        int nbtZ
+    ) {
+        BlockPos relative = new BlockPos(
+            x,
+            plan.targetSurfaceY(x, nbtZ)
+                + EndRodLightingPlan.HEIGHT_ABOVE_SURFACE,
+            nbtZ - 1
+        );
+        if (!lightingTargets.contains(relative)) return;
+        addRuntimeTarget(relative, plan.endRodState(), false, true);
+    }
+
+    private void addRuntimeTarget(
+        BlockPos relative,
+        int state,
+        boolean connector,
+        boolean lighting
+    ) {
         Tuple<Block, Integer> paletteEntry = blockPaletteDict.get(state);
         if (paletteEntry == null) {
             throw new IllegalArgumentException("Build target references missing palette state " + state + ".");
@@ -24133,6 +26610,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
         orderedBuildTargets.add(relative);
         if (connector) connectorTargets.add(relative);
+        if (lighting) lightingTargets.add(relative);
         blockPaletteDict.put(
             state,
             new Tuple<>(paletteEntry.getA(), paletteEntry.getB() + 1)
@@ -24164,34 +26642,48 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
         }
         File configFolder = new File(widgetMapFolder, "_configs");
-        if (!configFolder.exists()) return list;
+        if (printingOnly.get()) {
+            table.add(theme.label("Saved Printing Setup: "));
+            WButton resetButton =
+                table.add(theme.button("Reset Printing Config")).widget();
+            resetButton.action = this::resetAutomaticPrintingConfig;
+            table.row();
+        } else if (configFolder.exists()) {
+            table.add(theme.label("Configurations: "));
+            // ---- Save config button ----
+            WButton saveButton =
+                table.add(theme.button("Save Config")).widget();
+            saveButton.action = () -> {
+                String path = TinyFileDialogs.tinyfd_saveFileDialog(
+                    "Save Config",
+                    new File(
+                        configFolder,
+                        "staircased-printer-config.json"
+                    ).getAbsolutePath(),
+                    null,
+                    null
+                );
+                if (path != null) saveConfig(new File(path));
+            };
 
-        table.add(theme.label("Configurations: "));
-        // ---- Save config button ----
-        WButton saveButton = table.add(theme.button("Save Config")).widget();
-        saveButton.action = () -> {
-            String path = TinyFileDialogs.tinyfd_saveFileDialog(
-                "Save Config",
-                new File(configFolder, "staircased-printer-config.json").getAbsolutePath(),
-                null,
-                null
-            );
-            if (path != null) saveConfig(new File(path));
-        };
-
-        // ---- Load config button ----
-        WButton loadButton = table.add(theme.button("Load Config")).widget();
-        loadButton.action = () -> {
-            String path = TinyFileDialogs.tinyfd_openFileDialog(
-                "Load Config",
-                new File(configFolder, "staircased-printer-config.json").getAbsolutePath(),
-                null,
-                null,
-                false
-            );
-            if (path != null) loadConfig(new File(path));
-        };
-        table.row();
+            // ---- Load config button ----
+            WButton loadButton =
+                table.add(theme.button("Load Config")).widget();
+            loadButton.action = () -> {
+                String path = TinyFileDialogs.tinyfd_openFileDialog(
+                    "Load Config",
+                    new File(
+                        configFolder,
+                        "staircased-printer-config.json"
+                    ).getAbsolutePath(),
+                    null,
+                    null,
+                    false
+                );
+                if (path != null) loadConfig(new File(path));
+            };
+            table.row();
+        }
 
         WTable slaveTable = new WTable();
         list.add(slaveTable);
@@ -24218,12 +26710,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private void onRender(Render3DEvent event) {
         if (mapCorner == null || !render.get()) return;
 
-        int renderedDepth = compactPlan == null ? 128 : compactPlan.sizeZ() - 1;
+        int renderedDepth = activeVisibleDepthBlocks();
         event.renderer.box(
             mapCorner.getX(),
             mapCorner.getY(),
             mapCorner.getZ(),
-            mapCorner.getX() + 128,
+            mapCorner.getX() + activeMapWidthBlocks(),
             mapCorner.getY(),
             mapCorner.getZ() + renderedDepth,
             color.get(),
@@ -24763,10 +27255,14 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         SelectingDumpStation,
         SelectingFinishedMapChest,
         SelectingBed,
+        SelectingShulkerLineAnchor,
         SelectingChests,
         AwaitRegisterResponse,
+        AwaitAutomaticShulkerResponse,
         AwaitUsedToolRegistrationResponse,
         AwaitRestockResponse,
+        AwaitEmptyShulkerBreak,
+        AwaitReplacementShulker,
         AwaitMapChestResponse,
         AwaitMapSuppliesConfirmation,
         AwaitMapHotbarSwapConfirmation,

@@ -113,4 +113,15 @@ class CompactNorthWalkwayResolverTest {
         );
         assertNull(resolution.relativeY());
     }
+
+    @Test
+    void exposesCandidateHeightsForAutomaticWorldOriginSelection() {
+        int[] firstRow = new int[CompactCircularNbtPlan.MAP_WIDTH];
+        Arrays.fill(firstRow, 0);
+
+        assertEquals(
+            java.util.List.of(-1, 0, 1),
+            CompactNorthWalkwayResolver.candidateHeights(firstRow)
+        );
+    }
 }

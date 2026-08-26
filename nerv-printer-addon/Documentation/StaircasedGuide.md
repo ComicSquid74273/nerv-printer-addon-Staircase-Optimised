@@ -1,8 +1,7 @@
 # Fullblock Printer
 
-The Fullblock Printer builds flat & staircased fullblock maps line by line without any user interaction.
-The bot mines all placed blocks again to recycle all used materials.
-The printer uses a mapart platform to collect all mined blocks and feeds them into an item sorter on the north side of the map.
+The Fullblock Printer builds flat and staircased fullblock maps line by line without user interaction.
+The default printing-only workflow leaves the completed map in place. The old map-item handoff and teardown cycle is available only when **printing-only** is disabled.
 This module will not work on servers where placing blocks in the air is disabled.
 
 Blocks that require support blocks (e.g., carpets) are not supported by the printer.
@@ -23,13 +22,29 @@ You can design your own platform as long as it fulfills the following criteria:
     - Minimum Y-level: `-60 + 129 = 69`
     - Maximum Y-level: `320 - 129 = 191`
     - You will likely need to dig a perimeter to clear enough space.
-- The common row immediately north of the visible map must be a single, flat cobblestone walkway with two blocks of headroom. It does not have to share the NBT's virtual `Z=0` Y, but it must be within one walkable step of every first visible block. The add-on resolves this physical row without shifting the rendered map.
+- In printing-only mode, build only the centered `128x1` section of the cobblestone row immediately north of the visible map (`relative Z=-1`) and leave two air blocks above it. Stand near this safe-platform row when enabling the module. Its map-aligned position identifies the complete map area automatically: odd grids center it on the middle map tile, while even grids center it across the middle seam. The bot extends this row to the complete NBT width before entering outer columns. The resolved flat height must remain within one walkable step of every first visible block. Legacy mode still requires its complete north walkway.
 - Keep three rows south of the visible map clear. Compact circular connectors use at most these three rows.
 - Components should be connected by flat, walkable lanes. With **logistics-obstacle-detours** enabled, a small wall or similar obstruction may be bypassed locally. If a complete local bypass cannot rejoin the route, the bot makes one safety-checked one- or two-block sidestep left or right and retries the destination; this is not a general long-distance pathfinder.
 
 ---
 
 ## Platform Components
+
+### Default printing-only setup
+
+Only the DumpStation, optional bed, and one shulker-line anchor are selected manually. The map area is detected from the centered `128x1` north cobblestone anchor; right-click map-area registration is disabled in printing-only mode. The shulker anchor is simply the first shulker at either end of the placed supply line. Cartography tables, finished-map chests, map-material chests, used-tool chests, anvils, ender chests, crafting tables, and every remaining material/tool shulker are not manually registered.
+
+After the DumpStation and optional bed are selected, click the first shulker at either end of the supply line. That click both registers the anchor box and centers discovery. The bot searches loaded chunks within **automatic-shulker-scan-radius** of that anchor and strictly from anchor `Y-2` through `Y+2`; it never performs an all-height scan. The default radius is `80`, and it can be set to `64` when the line is shorter. It finds the other placed shulkers from loaded block-entity data, walks down the line, opens every accessible station, and automatically registers only supplies relevant to the loaded NBT: required build items, tools, end rods, and golden apples. Either a normal golden apple or an enchanted golden apple satisfies the apple requirement. If a required source is still missing, the same bounded scan repeats every 40 ticks, and known stations are periodically reopened to refresh changed contents. Clicking a configured Start Block while registration is incomplete forces that bounded rescan immediately. The diagnostic reports loaded-chunk coverage and exact inaccessible shulker coordinates. At the end, the bot reports required and currently visible counts and refuses to start if a required material type, usable pickaxe, usable axe, or either accepted golden-apple variant was not found. Stock hidden inside a dispenser cannot be counted, so the initial check proves source types rather than the total quantity held by dispenser backups.
+
+Once that complete check succeeds, the bot atomically saves the detected map corner, DumpStation, optional bed, shulker-line anchor, and every discovered shulker/open position to `<map folder>/_configs/printing-only-shulker-line.json`. On every activation it redetects the current map corner and height from the centered cobblestone anchor; with the same server, dimension, and map-grid dimensions it then loads the saved logistics positions and revisits every saved shulker to rebuild the item/tool registry from current server container snapshots. Old item counts are never trusted, so emptied or replaced boxes are detected before a new NBT starts. If the server, dimension, or grid size differs, the bot asks only for the unsaved logistics selections after automatic map detection. Use **Reset Printing Config** in the module widget to delete the saved setup; an active session remains usable, but the next activation automatically detects the map and then asks for the dump station, optional bed, and first shulker again.
+
+Keep one replaceable supply type per shulker station. A material may have multiple stations. The bot always keeps one usable registered pickaxe and one usable registered axe in its printing inventory, obtaining either from its shulker source when absent. A pickaxe or axe below **minimum-tool-durability** is not considered usable.
+
+Each replaceable station may have a dispenser arranged to place its next full shulker at exactly the same coordinate. After a server-authoritative inventory snapshot proves that the current shulker is completely empty, the bot closes it, equips its usable pickaxe, breaks the empty box, and waits up to **shulker-replacement-timeout** ticks for a server block update confirming the replacement. It then reopens that exact station and continues refilling. The dispenser/redstone mechanism must trigger from the break and must not move the replacement to another coordinate. The bot never breaks a mixed or partially filled shulker merely because one requested item is absent.
+
+### Legacy handoff/teardown components
+
+The components below are used only when **printing-only** is disabled.
 
 ### DumpStation
 The bot throws all blocks it no longer needs at this position.
@@ -81,17 +96,42 @@ Used by bots when starting a new map to avoid phantom spawning.
 ## Loading NBT Files
 
 When the module is started for the first time, a `nerv-printer` folder is created in your Minecraft directory.
-Place as many `1×1` NBT files as you like into this folder.
+Place one combined NBT to print in this folder. The printer detects its complete grid and updates **map-columns** and **map-rows** automatically; the settings no longer need to be matched manually before loading.
 
-The input must be a complete MapArtCraft-style `128×height×129` structure:
+The input must be one complete, contiguous structure. For a grid with `C` map columns and `R` map rows, its declared size can be either the exact visible footprint or the legacy MapArtCraft reference-row form:
 
-- `Z=0` is the northern reference row.
-- `Z=1..128` contains the visible map.
+- X/width: `128 × C`
+- Exact Z/depth: `128 × R`
+- Legacy Z/depth: `128 × R + 1`, containing one shared northern reference row
+- For example, a `2×2` single NBT can be `256×height×256` or `256×height×257`; a `5×5` single NBT can be `640×height×640` or `640×height×641`.
+
+- In exact-size input, every row is visible; the loader preserves the first row and synthesizes a copy as the internal northern reference row.
+- In legacy input, `Z=0` is the northern reference row and `Z=1..(128 × R)` is the visible mosaic.
 - Every X/Z shaft must contain a surface block.
 
 The type of staircasing used in the converter (`Valley` / `Classic`) does not matter. The add-on validates the complete input, normalizes every height difference to `-1`, `0`, or `+1`, and generates the compact circular layout itself.
 
-Columns are analyzed in pairs: `(0,1), (2,3), ... (126,127)`. The generated compact NBT contains the exact minimum-edge connector for every pair. Large endpoint differences use a two-column circular helix extending no more than three blocks south of the map.
+For `1×1`, columns are analyzed in pairs and may use compact U connectors. A multi-map mosaic is retained after printing, so it uses restock-safe independent columns from the common north walkway and requires **printing-only**.
+
+### Printing-only and station alignment
+
+**printing-only** is enabled by default. After the final authoritative print/repair check, the bot stops and disables itself. It does not create or lock a map item, deposit a finished map, tear down the structure, archive the NBT, or select the next NBT. The source NBT remains in the input folder; move it manually before enabling the module again if it should not be selected again.
+
+The bot derives the north-west edge of the entire contiguous mosaic from the centered `128x1` cobblestone anchor. Center the north chest/station section at:
+
+`station world X = detected north-west map X + (128 × map-columns) / 2`
+
+Every individual map tile is always `128×128`; the division by two is used only to find the center of the complete chest-facing edge.
+
+For an odd width such as `5×7`, this is the center of the middle map column. For an even width such as `6×10`, this is the seam between the two middle map columns. The automatic-detection message reports the exact world X. Chest contents, material/tool registration, restocking, dumping, and repair inventory behavior are otherwise unchanged.
+
+### Suspended end-rod lighting
+
+Every generated compact/U-traversal schematic includes upright end rods suspended exactly three blocks above their local map-surface block. In the default **printing-only** workflow, these rods are normal required build targets: they are included in material demand, shulker restocking, authoritative placement confirmation, and the final repair scan. Provide an automatically discoverable end-rod shulker station before starting the print. As with the other map blocks, the server must permit the add-on's direct placement into air.
+
+End rods emit block light level `14`. On flat terrain, the generator uses an `11×11`-block spacing pattern, which accounts for the two-block vertical light path from each suspended rod to the spawn-space block directly above the map. Staircases and cliffs can make a simple horizontal grid unsafe, so the generator tests a clear three-dimensional air path to every one of the map's `128×128` cells per tile and inserts extra rods only where needed. Generation then exhaustively rejects the plan unless every surface spawn-space cell is guaranteed to receive at least block light level `1`; no cell is allowed to remain at block light `0`.
+
+This prevents ordinary darkness-dependent hostile spawning on the map surface. It does not change spawning rules for entities that ignore block light, and nearby outside structures can still need their own spawn-proofing.
 
 With **save-compact-nbt** enabled, a raw source is transformed and the exact printable structure is written to `_generated_compact`. It is first written to a temporary file, reloaded, and compared against the validated plan before publication. The status display shows this compact output while the raw file remains the queue identity. When **move-to-finished-folder** is enabled, the original and its exact generated compact NBT are moved together into `_finished_maps`; existing finished files are preserved with a shared numeric suffix. Completion waits and retries if this paired move fails, so the source cannot silently be selected again. A generated compact NBT can also be selected directly: it is recognized, reconstructed, and compared against canonical geometry instead of being transformed a second time. Invalid, incomplete, entity-containing, block-entity-containing, colliding, or obstructed structures are rejected instead of being printed.
 
@@ -100,6 +140,8 @@ NBT files are processed in alphabetical order.
 ---
 
 ## Workflow
+
+With the default **printing-only** mode, only Steps 1 and 2 run. Disable it only for the legacy `1×1` handoff-and-teardown workflow.
 
 Follow these four steps:
 
@@ -112,7 +154,9 @@ Follow these four steps:
 
 ### 1. Register Important Blocks
 
-The module prompts you to interact with all special blocks. Chests only need to be selected once, even if the rendered box highlights only half of the chest.
+In the default printing-only mode, stand near the centered `128x1` north cobblestone anchor and enable the module. The bot detects the full map area without a click. Throw an item at the DumpStation prompt, select the bed only if sleeping is enabled, and click the first shulker at either end of the supply line. That is the only shulker selected manually; the bot discovers, visits, opens, and registers the rest of the line automatically. Do not register a cartography table, map chest, finished-map chest, used-tool chest, anvil, or individual material chest. When the scan reports complete coverage, interact with a configured start block (all buttons by default) to begin.
+
+In legacy mode, the module prompts you to interact with its special blocks and chests as before.
 
 When finished, interact with one of the start blocks specified in the **start-blocks** setting (default: all buttons) to begin printing.
 Inventory slots containing nothing, a registered material, or a compatible registered repair tool are marked for the managed printing inventory.
@@ -128,7 +172,7 @@ With the default **require-complete-u-inventory** setting, the printer stops saf
 
 Printing and ordered teardown share a real-time action policy controlled by **max-block-actions-per-second** (maximum `30`). With **scale-block-rate-with-tps** enabled, the ceiling is multiplied by measured server TPS divided by `20`; for example, `15 TPS` permits at most `22.5` new block-action attempts per second over time. Printing, in-route repair, and ordered teardown pause below **minimum-block-action-tps**, on invalid TPS, or when the latest server tick is more than 1.5 seconds old. The limit covers placement plus new/retried repair and teardown break dispatches. The scheduler can submit up to three actions after a delayed client tick so short client-tick jitter does not discard valid real-time credit; it still cannot exceed the TPS-scaled rate over time or accumulate an unbounded burst. Confirmed BPS can be lower when fewer independently placeable targets are inside the five-block reach or the server has not accepted them.
 
-The server remains authoritative. A placement is not considered complete until a newer block update confirms the expected block. During printing, managed hotbar swaps and chest transfers deliberately request a complete authoritative inventory resynchronization; the printer does not use the result until that newer server snapshot confirms it. Swap confirmation compares canonical item/component snapshots structurally, with count and monotonic tool damage checked separately, so equivalent component maps received in different packets cannot turn a successful exchange into a false conflict. Transfers are performed one at a time and recalculated after each confirmation. As in the original addon, every container slot is rescanned and partial stackable sources are left alone while the sorter finishes filling them; source selection rotates across ready full-stack or non-stackable slots instead of letting one replenished low-numbered slot starve the rest of the chest. Restock progress is confirmed from the compatible item count that actually reached the managed player inventory, so a sorter refilling the clicked chest slot to the same count cannot make a successful withdrawal look rejected. If no source slot is ready, the bot waits without issuing another inventory click, observes live slot updates, and periodically reopens that exact registered chest with only one probe in flight. The advanced **restock-refill-timeout** setting controls this bounded wait before another registered chest is tried; `0` disables waiting.
+The server remains authoritative. A placement is not considered complete until a newer block update confirms the expected block. During printing, managed hotbar swaps and container transfers deliberately request a complete authoritative inventory resynchronization; the printer does not use the result until that newer server snapshot confirms it. Swap confirmation compares canonical item/component snapshots structurally, with count and monotonic tool damage checked separately, so equivalent component maps received in different packets cannot turn a successful exchange into a false conflict. Transfers are performed one at a time and recalculated after each confirmation. Every shulker slot is rescanned and partial stackable sources are left alone while the supplier finishes filling them; source selection rotates across ready full-stack or non-stackable slots. Restock progress is confirmed from the compatible item count that actually reached the managed player inventory. A completely empty auto-registered shulker enters the break-and-replacement sequence described above. If the box is not empty but no requested source slot is ready, the bot waits without another inventory click, observes live slot updates, and periodically reopens that exact station with only one probe in flight. The advanced **restock-refill-timeout** setting controls this bounded wait before another registered source is tried; `0` disables waiting.
 
 Printing requires all nine managed hotbar slots. Before the refill trip, the frozen plan reserves the ordered U demand and any earlier sparse-U targets assigned to this traversal, then fills remaining managed inventory capacity with forward work. Its first eight ordered material-stack units are assigned to the material hotbar slots; additional planned stacks remain in their exact main-inventory slots until the acknowledged silent-swap controller needs them. The ninth hotbar slot is reserved exclusively for a compatible pickaxe or axe; when no repair tool is required, inventory capacity still reserves the empty tool slot. At the pair-entry checkpoint, the bot preserves already-correct stacks and performs only the planned main-inventory-to-hotbar `SWAP` packets. These preparation swaps do not change the visibly selected slot, and each exchange must be confirmed by a newer authoritative inventory snapshot before the next exchange is sent. The selected slot changes only when the corresponding planned material or repair tool is actually used. Switching between a pickaxe and axe exchanges the required tool into the reserved tool slot and returns the previous tool to that exact source inventory slot. Material replacement never targets the tool slot. A missing planned source detected in the authoritative entry snapshot prepends the complete dump/restock transaction and retries preparation instead of evicting an arbitrary hotbar item or stopping the module.
 
@@ -239,6 +283,8 @@ Demo video:
 ## Optional Features
 
 ### Save and Load Configurations
+
+In the default printing-only workflow, setup is saved automatically after the complete NBT material/tool check. Use **Reset Printing Config** to discard it. The manual controls below are for the legacy workflow when **printing-only** is disabled.
 
 To save a configuration:
 1. Register blocks as usual.
