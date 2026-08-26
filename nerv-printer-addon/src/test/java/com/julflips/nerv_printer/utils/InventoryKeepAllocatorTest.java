@@ -173,6 +173,48 @@ class InventoryKeepAllocatorTest {
     }
 
     @Test
+    void fragmentedMaterialsAreEvictedBeforeReservedToolSlotsOverflow() {
+        LinkedHashMap<String, Integer> demand = new LinkedHashMap<>();
+        LinkedHashMap<String, Integer> stackSizes = new LinkedHashMap<>();
+        demand.put("fragmented", 64);
+        stackSizes.put("fragmented", 64);
+        java.util.ArrayList<InventoryKeepAllocator.StackEntry<String>>
+            inventory = new java.util.ArrayList<>();
+        inventory.add(
+            new InventoryKeepAllocator.StackEntry<>(0, "fragmented", 32)
+        );
+        inventory.add(
+            new InventoryKeepAllocator.StackEntry<>(1, "fragmented", 32)
+        );
+        for (int slot = 2; slot < 35; slot++) {
+            String material = "material-" + slot;
+            demand.put(material, 64);
+            stackSizes.put(material, 64);
+            inventory.add(
+                new InventoryKeepAllocator.StackEntry<>(
+                    slot,
+                    material,
+                    64
+                )
+            );
+        }
+        inventory.add(
+            new InventoryKeepAllocator.StackEntry<>(35, "surplus", 64)
+        );
+
+        InventoryKeepAllocator.Allocation<String> allocation =
+            InventoryKeepAllocator.allocate(
+                demand,
+                stackSizes,
+                inventory
+            );
+
+        assertEquals(33, allocation.keptSlots().size());
+        assertEquals(List.of(0, 1, 35), allocation.dumpSlots());
+        assertEquals(64, allocation.missingDemand().get("fragmented"));
+    }
+
+    @Test
     void restockAllocationRetainsMostItemsWhenSlotCostTies() {
         InventoryKeepAllocator.Allocation<String> allocation =
             InventoryKeepAllocator.allocate(

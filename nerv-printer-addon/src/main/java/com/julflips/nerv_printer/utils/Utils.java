@@ -114,8 +114,16 @@ public final class Utils {
                 )
             );
         }
+        HashMap<Item, Integer> maximumStackSizes = new HashMap<>();
+        for (Item item : requiredItems.keySet()) {
+            maximumStackSizes.put(item, maximumStackSize(item));
+        }
         InventoryKeepAllocator.Allocation<Item> allocation =
-            InventoryKeepAllocator.allocate(requiredItems, inventoryStacks);
+            InventoryKeepAllocator.allocate(
+                requiredItems,
+                maximumStackSizes,
+                inventoryStacks
+            );
         requiredItems.clear();
         requiredItems.putAll(allocation.missingDemand());
         return new Tuple<>(
