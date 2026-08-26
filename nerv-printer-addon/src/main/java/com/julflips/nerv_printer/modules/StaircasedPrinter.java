@@ -1049,6 +1049,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     long recyclingShulkerPhaseStartedTick;
     boolean recyclingShulkerDemandComplete;
     boolean recyclingShulkerBreakAttempted;
+    boolean recyclingShulkerBreakByHand;
+    boolean releaseRetainedEmptyShulkerForRestockCapacity;
     boolean lastRestockContainerEmpty;
     long lastRestockContainerSnapshotSequence;
     int recyclingPickaxeHotbarSlot;
@@ -1410,6 +1412,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         recyclingShulkerPhaseStartedTick = -1L;
         recyclingShulkerDemandComplete = false;
         recyclingShulkerBreakAttempted = false;
+        recyclingShulkerBreakByHand = false;
+        releaseRetainedEmptyShulkerForRestockCapacity = false;
         lastRestockContainerEmpty = false;
         lastRestockContainerSnapshotSequence = -1L;
         recyclingPickaxeHotbarSlot = -1;
@@ -3203,6 +3207,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + pending.playerSlot() + " is clear"
             );
             pendingDumpTransfer = null;
+            releaseRetainedEmptyShulkerForRestockCapacity = false;
             timeoutTicks = invActionDelay.get();
             return;
         }
@@ -3811,6 +3816,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + "; consolidating the active-line inventory plan."
             );
             pendingRestockTransfer = null;
+            releaseRetainedEmptyShulkerForRestockCapacity = true;
             closeNextInvPacket = true;
             checkpoints.add(
                 0,
@@ -4605,6 +4611,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 + " deferredPacket=" + (toBeHandledInvPacket != null)
         );
         pendingRestockTransfer = null;
+        releaseRetainedEmptyShulkerForRestockCapacity = false;
         if (restockInventorySnapshot != null) {
             restockInventorySnapshot.clear();
         }
@@ -4652,16 +4659,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         int pickaxeSlot = bestUsableRecyclingPickaxeSlot();
-        if (pickaxeSlot < 0) {
-            error(
-                "An automatically registered shulker is empty, but no "
-                    + "usable pickaxe is available to recycle it."
-            );
-            stopBuildForAction();
-            toggle();
-            return true;
-        }
-
         Tuple<BlockPos, Vec3> station =
             automaticShulkerStations.get(lastInteractedChest);
         recyclingShulkerPos = new BlockPos(lastInteractedChest);
@@ -4672,6 +4669,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         recyclingShulkerAirSequence = -1L;
         recyclingShulkerPhaseStartedTick = clientActionTick;
         recyclingShulkerBreakAttempted = false;
+        recyclingShulkerBreakByHand = pickaxeSlot < 0;
         pendingRestockTransfer = null;
         restockInventorySnapshot.clear();
         restockSnapshotUpdateSequence = -1L;
@@ -4689,6 +4687,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         closeCurrentContainerHandler();
         stopMovement();
         state = State.AwaitEmptyShulkerBreak;
+
+        if (recyclingShulkerBreakByHand) {
+            recyclingPickaxeHotbarSlot = -1;
+            warning(
+                "No usable pickaxe is available; breaking the empty shulker "
+                    + "by hand so its dispenser can replace it."
+            );
+            return true;
+        }
 
         if (pickaxeSlot < 9) {
             recyclingPickaxeHotbarSlot = pickaxeSlot;
@@ -4848,21 +4855,25 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 instanceof ShulkerBoxBlock)) {
                 return true;
             }
-            ItemStack selected = mc.player.getInventory().getItem(
-                recyclingPickaxeHotbarSlot
-            );
-            if (!selected.is(ItemTags.PICKAXES)
-                || !hasMinimumToolDurability(selected)
-                || (mc.player.getInventory().getSelectedSlot()
-                    != recyclingPickaxeHotbarSlot
-                    && !InvUtils.swap(
-                        recyclingPickaxeHotbarSlot,
-                        false
-                    ))) {
-                failAutomaticShulkerRecycle(
-                    "The confirmed recycling pickaxe is no longer usable."
+            if (!recyclingShulkerBreakByHand) {
+                ItemStack selected = mc.player.getInventory().getItem(
+                    recyclingPickaxeHotbarSlot
                 );
-                return true;
+                if (!selected.is(ItemTags.PICKAXES)
+                    || !hasMinimumToolDurability(selected)
+                    || (mc.player.getInventory().getSelectedSlot()
+                        != recyclingPickaxeHotbarSlot
+                        && !InvUtils.swap(
+                            recyclingPickaxeHotbarSlot,
+                            false
+                        ))) {
+                    recyclingShulkerBreakByHand = true;
+                    recyclingPickaxeHotbarSlot = -1;
+                    warning(
+                        "The recycling pickaxe is no longer usable; continuing "
+                            + "to break the empty shulker by hand."
+                    );
+                }
             }
             double range = effectiveBuildInteractionRange();
             if (mc.player.getEyePosition().distanceToSqr(
@@ -4910,6 +4921,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         recyclingShulkerPhaseStartedTick = -1L;
         recyclingShulkerDemandComplete = false;
         recyclingShulkerBreakAttempted = false;
+        recyclingShulkerBreakByHand = false;
         recyclingPickaxeHotbarSlot = -1;
     }
 
@@ -24231,12 +24243,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (buildingActive && plannedCircularBuildPair >= 0) {
             InventoryKeepAllocator.Allocation<Item> allocation =
                 currentCircularMaterialAllocation();
-            for (int slot : allocation.dumpSlots()) {
-                ItemStack stack =
-                    mc.player.getInventory().getItem(slot);
-                if (!ToolUtils.isTool(stack)) return slot;
-            }
-            return -1;
+            return selectRetainedShulkerAwareDumpSlot(
+                allocation.dumpSlots(),
+                false
+            );
         }
         HashMap<Item, Integer> requiredItems = getRequiredItems();
         Tuple<ArrayList<Integer>, HashMap<Item, Integer>> invInformation = Utils.getInvInformation(requiredItems, availableSlots);
@@ -24247,7 +24257,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mapCyclePhase == MapCyclePhase.MAP_HANDOFF
                 && mapHandoffStage
                     != MapHandoffStage.PREPARE_INVENTORY;
-        for (int slot : invInformation.getA()) {
+        return selectRetainedShulkerAwareDumpSlot(
+            invInformation.getA(),
+            protectHandoffItems
+        );
+    }
+
+    private int selectRetainedShulkerAwareDumpSlot(
+        Iterable<Integer> candidateSlots,
+        boolean protectHandoffItems
+    ) {
+        ArrayList<EmptyShulkerRetentionPolicy.Candidate> candidates =
+            new ArrayList<>();
+        for (int slot : candidateSlots) {
             ItemStack stack =
                 mc.player.getInventory().getItem(slot);
             if (ToolUtils.isTool(stack)) continue;
@@ -24258,9 +24280,28 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     || item == Items.GLASS_PANE)) {
                 continue;
             }
-            return slot;
+            candidates.add(
+                new EmptyShulkerRetentionPolicy.Candidate(
+                    slot,
+                    isEmptyShulkerBoxItem(stack)
+                )
+            );
         }
-        return -1;
+        return EmptyShulkerRetentionPolicy.selectDumpSlot(
+            candidates,
+            releaseRetainedEmptyShulkerForRestockCapacity
+        );
+    }
+
+    private boolean isEmptyShulkerBoxItem(ItemStack stack) {
+        if (!(stack.getItem() instanceof BlockItem blockItem)
+            || !(blockItem.getBlock() instanceof ShulkerBoxBlock)
+            || stack.get(DataComponents.CONTAINER_LOOT) != null) {
+            return false;
+        }
+        var contents = stack.get(DataComponents.CONTAINER);
+        return contents == null
+            || !contents.nonEmptyItems().iterator().hasNext();
     }
 
     private InventoryKeepAllocator.Allocation<Item>
