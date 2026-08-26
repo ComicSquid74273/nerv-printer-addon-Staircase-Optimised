@@ -1319,6 +1319,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int rasterRestockDiscardAttempts;
     int rasterRestockDiscardedStacks;
     long rasterRestockDiscardSubmittedTick = -1000L;
+    long rasterRestockDiscardSubmittedSequence = -1L;
     boolean rasterReturningToParkedBoat;
     int rasterRestockBoatCountBefore;
     long rasterRestockBoatBreakLastAttemptTick = -1000L;
@@ -21457,14 +21458,19 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         double supportPlaneY
     ) {
         Vec3d previous = start;
+        int index = 0;
         for (Vec3d waypoint : route) {
             if (previous.distanceTo(waypoint) > 0.10
                 && !isRasterBoatLandingSegmentClear(
                     boat, previous, waypoint, supportPlaneY
-                )) {
+                ) && !(index == 0
+                    && isRasterBoatExteriorSeparatingLiftClear(
+                        boat, previous, waypoint
+                    ))) {
                 return false;
             }
             previous = waypoint;
+            index++;
         }
         return true;
     }
@@ -21613,26 +21619,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return RasterSetPathStatus.FAILED;
         }
         if (rasterBoatPath.isEmpty()) {
-            double arrivalTolerance = retryOnStall
-                ? RASTER_EXTERIOR_WAYPOINT_TOLERANCE
-                : RASTER_ROUTE_WAYPOINT_TOLERANCE;
-            boolean arrived = rasterBoatPathTarget != null && (
-                retryOnStall
-                    ? RasterSideLanePlanner.arrived(
-                        boat.getX(),
-                        boat.getY(),
-                        boat.getZ(),
-                        rasterBoatPathTarget.x,
-                        rasterBoatPathTarget.y,
-                        rasterBoatPathTarget.z
-                    )
-                    : Math.abs(boat.getX() - rasterBoatPathTarget.x)
-                        <= arrivalTolerance
-                        && Math.abs(boat.getY() - rasterBoatPathTarget.y)
-                        <= arrivalTolerance
-                        && Math.abs(boat.getZ() - rasterBoatPathTarget.z)
-                        <= arrivalTolerance
-            );
+            boolean arrived = rasterBoatPathTarget != null
+                && rasterFixedPathArrived(
+                    boat, rasterBoatPathTarget, retryOnStall
+                );
             if (arrived) {
                 boatFlyAdapter.stop();
                 rasterBoatPathSupportPlaneY = Double.NaN;
@@ -23223,7 +23213,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             || rasterBoatPathTarget.squaredDistanceTo(finalTarget) > 0.02;
         boolean routeMissing = !targetChanged
             && rasterBoatPath.isEmpty()
-            && boat.getEntityPos().distanceTo(finalTarget) > 0.75;
+            && !rasterFixedPathArrived(boat, finalTarget, retryOnStall);
         if (targetChanged || routeMissing) {
             cancelRasterEntryRouteSearch();
             rasterBoatPath.clear();
@@ -23287,6 +23277,25 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             resetRasterBoatPathProgress();
         }
         return followRasterSetPath(boat, mode, movingStatus, retryOnStall);
+    }
+
+    private boolean rasterFixedPathArrived(
+        AbstractBoatEntity boat,
+        Vec3d target,
+        boolean strict
+    ) {
+        if (strict) {
+            return RasterSideLanePlanner.arrived(
+                boat.getX(), boat.getY(), boat.getZ(),
+                target.x, target.y, target.z
+            );
+        }
+        return Math.abs(boat.getX() - target.x)
+                <= RASTER_ROUTE_WAYPOINT_TOLERANCE
+            && Math.abs(boat.getY() - target.y)
+                <= RASTER_ROUTE_WAYPOINT_TOLERANCE
+            && Math.abs(boat.getZ() - target.z)
+                <= RASTER_ROUTE_WAYPOINT_TOLERANCE;
     }
 
     private double rasterExteriorCruiseY() {
@@ -24101,6 +24110,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         rasterRestockDiscardAttempts = 0;
         rasterRestockDiscardedStacks = 0;
         rasterRestockDiscardSubmittedTick = -1000L;
+        rasterRestockDiscardSubmittedSequence = -1L;
     }
 
     private Vec3d selectRasterRestockLanding(AbstractBoatEntity boat) {
@@ -24435,6 +24445,15 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 List<RasterBuildRoutePlan.Point<BlockPos>> forward =
                     rasterBuildRoutePlan.forwardEgressAlongRoute(retained);
                 if (forward.isEmpty()) {
+                    if (rasterBuildRoutePlan.isExteriorIndex(retained)) {
+                        rasterBoatPath.clear();
+                        rasterBoatPathTarget = null;
+                        resetRasterBoatPathProgress();
+                        rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
+                        rasterPhaseStartedTick = clientActionTick;
+                        rasterStatus = "already at exterior logistics checkpoint";
+                        return;
+                    }
                     failBoatRaster(
                         "forward row egress produced no exterior logistics checkpoint"
                     );
@@ -25062,13 +25081,17 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             ItemStack observed = mc.player.getInventory().getStack(
                 rasterRestockDiscardPendingSlot
             );
-            if (observed.isEmpty()
+            boolean authoritativeUpdate =
+                serverPlayerInventorySnapshotSequence
+                    > rasterRestockDiscardSubmittedSequence;
+            if (authoritativeUpdate && (observed.isEmpty()
                 || observed.getItem() != rasterRestockDiscardPendingItem
-                || observed.getCount() < rasterRestockDiscardPendingCount) {
+                || observed.getCount() < rasterRestockDiscardPendingCount)) {
                 rasterRestockDiscardPendingSlot = -1;
                 rasterRestockDiscardPendingItem = null;
                 rasterRestockDiscardPendingCount = 0;
                 rasterRestockDiscardAttempts = 0;
+                rasterRestockDiscardSubmittedSequence = -1L;
                 rasterRestockDiscardedStacks++;
                 rasterStatus = "confirmed discarded surplus map-material stack";
                 return false;
@@ -25084,8 +25107,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 );
                 return false;
             }
-            InvUtils.drop().slot(rasterRestockDiscardPendingSlot);
-            rasterRestockDiscardSubmittedTick = clientActionTick;
+            submitRasterRestockDiscard(rasterRestockDiscardPendingSlot);
             rasterStatus = "retrying paced surplus-stack disposal";
             return false;
         }
@@ -25131,11 +25153,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         rasterRestockDiscardPendingSlot = slot;
         rasterRestockDiscardPendingItem = stack.getItem();
         rasterRestockDiscardPendingCount = stack.getCount();
-        rasterRestockDiscardSubmittedTick = clientActionTick;
-        InvUtils.drop().slot(slot);
+        String discardedName = stack.getItem().getName().getString();
+        submitRasterRestockDiscard(slot);
         rasterStatus = "discarding surplus "
-            + stack.getItem().getName().getString();
+            + discardedName;
         return false;
+    }
+
+    private void submitRasterRestockDiscard(int playerSlot) {
+        int handlerSlot = playerSlot < 9 ? 36 + playerSlot : playerSlot;
+        rasterRestockDiscardSubmittedTick = clientActionTick;
+        rasterRestockDiscardSubmittedSequence =
+            serverPlayerInventorySnapshotSequence;
+        Utils.performAuthoritativeInventoryClick(
+            0,
+            handlerSlot,
+            1,
+            SlotActionType.THROW
+        );
     }
 
     private Map<Item, Integer> rasterRestockProtectedMaterialCounts(
