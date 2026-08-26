@@ -21353,42 +21353,39 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return "fixed route rejected without a reproducible unsafe leg";
     }
 
-    private List<Vec3d> createRasterExteriorEgressPath(
+    private List<Vec3d> createRasterDirectAerialLogisticsPath(
         AbstractBoatEntity boat,
-        Vec3d northAccess,
-        Vec3d southwestLanding
+        Vec3d start,
+        Vec3d destination
     ) {
-        RasterExteriorIngressPlan.Bounds worldBounds =
-            new RasterExteriorIngressPlan.Bounds(
-                mapCorner.getX() + rasterBuildRoutePlan.minimumX(),
-                mapCorner.getX() + rasterBuildRoutePlan.maximumX() + 1.0,
-                mapCorner.getZ() + rasterBuildRoutePlan.minimumZ(),
-                mapCorner.getZ() + rasterBuildRoutePlan.maximumZ() + 1.0
-            );
-        RasterExteriorIngressPlan.Candidate candidate =
-            RasterExteriorIngressPlan.flatWestExterior(
-                new RasterExteriorIngressPlan.Point(
-                    northAccess.x, northAccess.y, northAccess.z
-                ),
-                new RasterExteriorIngressPlan.Point(
-                    southwestLanding.x,
-                    southwestLanding.y,
-                    southwestLanding.z
-                ),
-                worldBounds,
-                rasterBuildRoutePlan.exteriorMargin()
-            );
-        List<Vec3d> route = candidate.waypoints().stream()
+        double cruiseY = Math.max(
+            Math.max(start.y, destination.y)
+                + RASTER_INGRESS_ESCAPE_RISE,
+            rasterExteriorCruiseY() + 0.5
+        );
+        List<Vec3d> route = RasterExteriorIngressPlan.directAerial(
+            new RasterExteriorIngressPlan.Point(
+                start.x, start.y, start.z
+            ),
+            new RasterExteriorIngressPlan.Point(
+                destination.x, destination.y, destination.z
+            ),
+            cruiseY
+        ).stream()
             .map(point -> new Vec3d(point.x(), point.y(), point.z()))
             .toList();
         if (!isRasterBoatFixedRouteClearToLanding(
-                boat, northAccess, route, southwestLanding.y
+                boat, start, route, destination.y
             )) {
+            Addon.LOG.warn(
+                "[Fullblock Printer] Staircased Printer direct aerial logistics route rejected: {}",
+                rasterBoatFixedRouteFailure(boat, start, route)
+            );
             return List.of();
         }
         Addon.LOG.info(
-            "[Fullblock Printer] Boat Raster selected flat west-exterior logistics route at Y={} with one final docking-height handoff",
-            String.format(Locale.ROOT, "%.2f", northAccess.y)
+            "[Fullblock Printer] Boat Raster selected direct aerial logistics route: rise to Y={}, cruise directly to the destination column, then descend",
+            String.format(Locale.ROOT, "%.2f", cruiseY)
         );
         return List.copyOf(route);
     }
@@ -21403,17 +21400,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             && !rasterBoatPath.isEmpty();
         List<Vec3d> route = retainedRoute
             ? List.of()
-            : returningToMap
-                ? createRasterExteriorIngressPath(
-                    boat,
-                    boat.getEntityPos(),
-                    target
-                )
-                : createRasterExteriorEgressPath(
-                    boat,
-                    boat.getEntityPos(),
-                    target
-                );
+            : createRasterDirectAerialLogisticsPath(
+                boat,
+                boat.getEntityPos(),
+                target
+            );
         if (!retainedRoute
             && route.isEmpty()
             && boat.getEntityPos().distanceTo(target) > 0.90) {
@@ -21425,10 +21416,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             route,
             BoatFlyAdapter.DriveMode.TRAVEL,
             returningToMap
-                ? "following flat west-exterior lines back to the retained Nerv route at 20.0 blocks/s"
-                : "following flat west-exterior lines to logistics at 20.0 blocks/s",
+                ? "flying up, directly to the retained route column, then down at 20.0 blocks/s"
+                : "flying up, directly to the restock platform column, then down at 20.0 blocks/s",
             true,
-            Math.min(boat.getY(), target.y)
+            target.y
         );
         return switch (status) {
             case ARRIVED -> RasterLogisticsRouteStatus.ARRIVED;
@@ -24256,21 +24247,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Vec3d dump,
         Set<RasterVoxelPathfinder.Cell> logisticsWalkCells
     ) {
-        ArrayList<BlockPos> candidates = new ArrayList<>();
-        for (int radius = 1; radius <= 2; radius++) {
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != radius) continue;
-                    BlockPos candidate = boatFeet.add(dx, 0, dz);
-                    RasterVoxelPathfinder.Cell cell = new RasterVoxelPathfinder.Cell(
-                        candidate.getX(),
-                        candidate.getY(),
-                        candidate.getZ()
-                    );
-                    if (logisticsWalkCells.contains(cell)) {
-                        candidates.add(candidate);
-                    }
+        // Vanilla can choose either lateral side and may use a diagonal at
+        // some boat yaws. A narrow edge landing is therefore not sufficient:
+        // require the complete immediate 3x3 ring to be supported, clear, and
+        // connected to the restock walking platform before accepting the boat
+        // center. Whichever vanilla candidate wins remains on the platform.
+        ArrayList<BlockPos> candidates = new ArrayList<>(8);
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) continue;
+                BlockPos candidate = boatFeet.add(dx, 0, dz);
+                RasterVoxelPathfinder.Cell cell = new RasterVoxelPathfinder.Cell(
+                    candidate.getX(),
+                    candidate.getY(),
+                    candidate.getZ()
+                );
+                if (!logisticsWalkCells.contains(cell)
+                    || !isRasterWalkCellSafe(cell)) {
+                    return null;
                 }
+                candidates.add(candidate);
             }
         }
         candidates.sort(Comparator.comparingDouble(candidate ->

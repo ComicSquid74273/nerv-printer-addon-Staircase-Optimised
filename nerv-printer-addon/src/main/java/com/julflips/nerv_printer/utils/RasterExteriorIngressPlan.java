@@ -154,6 +154,35 @@ public final class RasterExteriorIngressPlan {
         return new Candidate(Side.WEST, route);
     }
 
+    /** Rise vertically, cruise directly, then descend at the destination. */
+    public static List<Point> directAerial(
+        Point start,
+        Point destination,
+        double cruiseY
+    ) {
+        Objects.requireNonNull(start, "start");
+        Objects.requireNonNull(destination, "destination");
+        if (!Double.isFinite(cruiseY)
+            || cruiseY + EPSILON < start.y
+            || cruiseY + EPSILON < destination.y) {
+            throw new IllegalArgumentException(
+                "Direct aerial cruise height is invalid."
+            );
+        }
+        ArrayList<Point> route = new ArrayList<>(3);
+        appendDifferent(
+            route, start, new Point(start.x, cruiseY, start.z)
+        );
+        appendDifferent(
+            route,
+            start,
+            new Point(destination.x, cruiseY, destination.z)
+        );
+        appendDifferent(route, start, destination);
+        if (route.isEmpty()) route.add(destination);
+        return List.copyOf(route);
+    }
+
     /**
      * Flat exterior travel: leave/retain the west exterior column, travel
      * north/south without changing Y, cross X only at the exterior endpoint,

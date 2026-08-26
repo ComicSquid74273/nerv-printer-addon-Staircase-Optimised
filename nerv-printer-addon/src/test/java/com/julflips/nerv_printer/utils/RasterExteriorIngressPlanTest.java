@@ -36,6 +36,31 @@ class RasterExteriorIngressPlanTest {
     }
 
     @Test
+    void directAerialLogisticsRisesThenCruisesThenDescends() {
+        var start = new RasterExteriorIngressPlan.Point(
+            10.0, -32.7, -325.0
+        );
+        var landing = new RasterExteriorIngressPlan.Point(
+            -66.5, -35.0, -194.5
+        );
+
+        var route = RasterExteriorIngressPlan.directAerial(
+            start, landing, -10.0
+        );
+
+        assertEquals(3, route.size());
+        assertEquals(
+            new RasterExteriorIngressPlan.Point(10.0, -10.0, -325.0),
+            route.get(0)
+        );
+        assertEquals(
+            new RasterExteriorIngressPlan.Point(-66.5, -10.0, -194.5),
+            route.get(1)
+        );
+        assertEquals(landing, route.get(2));
+    }
+
+    @Test
     void deepExteriorRecoveryRisesToMapClearCruiseBeforeCrossing() {
         assertEquals(
             -14.0,
