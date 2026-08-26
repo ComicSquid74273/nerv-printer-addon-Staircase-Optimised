@@ -205,6 +205,49 @@ class CenteredNorthWalkwayLocatorTest {
         );
     }
 
+    @Test
+    void pinnedRecoveryKeepsSavedCornerAfterBothMiddleTilesExist() {
+        Set<Point> safe = new HashSet<>();
+        safe.addAll(row(-1088, 76, 2495));
+        safe.addAll(row(-960, 76, 2495));
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locatePinned(
+                2 * 128,
+                -1088,
+                76,
+                2496,
+                -960,
+                probe(safe)
+            );
+
+        assertTrue(resolution.resolved());
+        assertEquals(-1088, resolution.anchor().mapCornerX());
+        assertEquals(-960, resolution.anchor().centerStartX());
+        assertEquals(128, resolution.anchor().relativeStartX());
+    }
+
+    @Test
+    void pinnedRecoveryDoesNotSlideToAnAdjacentCompleteTile() {
+        Set<Point> safe = row(-832, 76, 2495);
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locatePinned(
+                2 * 128,
+                -1088,
+                76,
+                2496,
+                -960,
+                probe(safe)
+            );
+
+        assertEquals(
+            CenteredNorthWalkwayLocator.Status.NOT_FOUND,
+            resolution.status()
+        );
+        assertNull(resolution.anchor());
+    }
+
     private static Set<Point> row(int startX, int y, int z) {
         Set<Point> safe = new HashSet<>();
         for (int x = startX;

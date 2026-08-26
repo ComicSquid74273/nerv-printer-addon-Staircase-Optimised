@@ -188,6 +188,79 @@ public final class CenteredNorthWalkwayLocator {
         return new Resolution(Status.RESOLVED, nearest, safe.size());
     }
 
+    /**
+     * Validates one canonical middle-tile anchor without deriving a new map
+     * corner from the player's current position. Restart recovery uses this
+     * form so a printer-built extension cannot be reinterpreted as the
+     * player's original 128-block anchor.
+     */
+    public static Resolution locatePinned(
+        int mapWidth,
+        int mapCornerX,
+        int walkwayY,
+        int mapCornerZ,
+        int anchorStartX,
+        Probe probe
+    ) {
+        if (mapWidth < ANCHOR_LENGTH
+            || mapWidth % ANCHOR_LENGTH != 0) {
+            throw new IllegalArgumentException(
+                "Map width must be a positive multiple of 128."
+            );
+        }
+        Objects.requireNonNull(probe, "probe");
+        if (!isMapBoundary(mapCornerX)
+            || !isMapBoundary(mapCornerZ)
+            || !isMapBoundary(anchorStartX)) {
+            throw new IllegalArgumentException(
+                "Pinned map and anchor coordinates must use canonical map boundaries."
+            );
+        }
+
+        int mapColumns = mapWidth / ANCHOR_LENGTH;
+        int relativeColumn = Math.floorDiv(
+            Math.subtractExact(anchorStartX, mapCornerX),
+            ANCHOR_LENGTH
+        );
+        boolean middleColumn = mapColumns % 2 == 0
+            ? relativeColumn == mapColumns / 2 - 1
+                || relativeColumn == mapColumns / 2
+            : relativeColumn == mapColumns / 2;
+        if (!middleColumn
+            || anchorStartX != Math.addExact(
+                mapCornerX,
+                Math.multiplyExact(relativeColumn, ANCHOR_LENGTH)
+            )) {
+            throw new IllegalArgumentException(
+                "Pinned anchor must be a middle map tile of the saved grid."
+            );
+        }
+
+        ProbeResult result = probeAnchor(
+            anchorStartX,
+            walkwayY,
+            mapCornerZ - 1,
+            probe
+        );
+        if (!result.safe()) {
+            return new Resolution(
+                result.unavailable() ? Status.UNAVAILABLE : Status.NOT_FOUND,
+                null,
+                0
+            );
+        }
+        return new Resolution(
+            Status.RESOLVED,
+            new Anchor(
+                mapCornerX,
+                walkwayY,
+                mapCornerZ,
+                anchorStartX
+            ),
+            1
+        );
+    }
+
     public static boolean isMapBoundary(int coordinate) {
         return Math.floorMod(coordinate + 64, ANCHOR_LENGTH) == 0;
     }
