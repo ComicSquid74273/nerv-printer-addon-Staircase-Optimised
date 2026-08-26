@@ -48,6 +48,7 @@ import net.minecraft.network.packet.Packet;
 import net.minecraft.network.packet.c2s.play.*;
 import net.minecraft.network.packet.s2c.play.BlockUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.ChunkDeltaUpdateS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityPassengersSetS2CPacket;
 import net.minecraft.network.packet.s2c.play.InventoryS2CPacket;
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.network.packet.s2c.play.ScreenHandlerSlotUpdateS2CPacket;
@@ -1319,6 +1320,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     int rasterRestockBoatCountBefore;
     long rasterRestockBoatBreakLastAttemptTick = -1000L;
     long rasterRestockDismountRequestedTick = -1000L;
+    int rasterDismountBoatId = Integer.MIN_VALUE;
+    boolean rasterDismountServerConfirmed;
     int rasterRestockResumeRouteIndex = -1;
     BlockPos rasterStagingBlock;
     int rasterRestockSyncId = -1;
@@ -1650,6 +1653,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         rasterRestockBoatCountBefore = 0;
         rasterRestockBoatBreakLastAttemptTick = -1000L;
         rasterRestockDismountRequestedTick = -1000L;
+        rasterDismountBoatId = Integer.MIN_VALUE;
+        rasterDismountServerConfirmed = false;
         rasterRestockResumeRouteIndex = -1;
         rasterStagingBlock = null;
         rasterRestockSyncId = -1;
@@ -2168,6 +2173,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void handleReceivePacket(Packet<?> receivedPacket) {
         if (state == null) return;
+
+        if (receivedPacket instanceof EntityPassengersSetS2CPacket packet
+            && rasterRestockDismountRequestedTick >= 0L
+            && packet.getEntityId() == rasterDismountBoatId
+            && mc.player != null
+            && Arrays.stream(packet.getPassengerIds()).noneMatch(
+                passengerId -> passengerId == mc.player.getId()
+            )) {
+            rasterDismountServerConfirmed = true;
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer received authoritative vanilla dismount confirmation for boat {}",
+                rasterDismountBoatId
+            );
+        }
 
         if (RasterCorrectionPacketPolicy.requiresRouteRejoin(
             receivedPacket instanceof PlayerPositionLookS2CPacket,
@@ -19295,6 +19314,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         boatFlyAdapter.release();
         Utils.setSprintPressed(false);
         Utils.setSneakPressed(false);
+        resetRasterVanillaDismount();
         if (boatRasterActive) rasterStatus = "stopped: " + reason;
         boatRasterActive = false;
     }
@@ -23301,6 +23321,42 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private void runRasterReturnBoat() {
         if (!(mc.player.getVehicle() instanceof AbstractBoatEntity boat)) {
+            Utils.setSneakPressed(false);
+            if (rasterRestockDismountRequestedTick >= 0L
+                && (!rasterDismountServerConfirmed
+                    || clientActionTick
+                        - rasterRestockDismountRequestedTick < 4L)) {
+                if (clientActionTick
+                    - rasterRestockDismountRequestedTick > 30L) {
+                    failBoatRaster(
+                        "vanilla boat-return dismount was not confirmed and settled after 30 ticks"
+                    );
+                } else {
+                    rasterStatus = rasterDismountServerConfirmed
+                        ? "waiting for vanilla boat-return dismount position to settle"
+                        : "waiting for server-confirmed vanilla boat-return dismount";
+                }
+                return;
+            }
+            RasterVoxelPathfinder.Cell current =
+                new RasterVoxelPathfinder.Cell(
+                    mc.player.getBlockX(),
+                    mc.player.getBlockY(),
+                    mc.player.getBlockZ()
+                );
+            if (rasterRestockDismountRequestedTick >= 0L
+                && !isRasterWalkCellSafe(current)) {
+                if (clientActionTick
+                    - rasterRestockDismountRequestedTick <= 30L) {
+                    rasterStatus = "waiting for vanilla boat-return floor collision to settle";
+                    return;
+                }
+                failBoatRaster(
+                    "vanilla boat-return dismount did not settle on a supported clear walk cell"
+                );
+                return;
+            }
+            resetRasterVanillaDismount();
             enterRasterState(State.RasterRecoverBoat, "recovering boat item");
             return;
         }
@@ -23315,9 +23371,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
             return;
         }
-        boatFlyAdapter.stop();
-        mc.player.dismountVehicle();
-        enterRasterState(State.RasterRecoverBoat, "breaking and recovering boat");
+        requestRasterVanillaDismount(
+            boat,
+            "boat-return landing"
+        );
     }
 
     private void runRasterRecoverBoat() {
@@ -23944,12 +24001,49 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return mc.world.isBlockSpaceEmpty(mc.player, playerClearance);
     }
 
+    /**
+     * Requests dismount through Minecraft's normal sneak binding. Unlike
+     * Entity#dismountVehicle, this does not detach the local passenger graph;
+     * the server remains authoritative and confirms removal with an
+     * EntityPassengersSetS2CPacket before any boat-breaking action may begin.
+     */
+    private void requestRasterVanillaDismount(
+        AbstractBoatEntity boat,
+        String context
+    ) {
+        if (rasterRestockDismountRequestedTick < 0L) {
+            rasterBoatPosition = boat.getBlockPos();
+            boatFlyAdapter.release();
+            Utils.setForwardPressed(false);
+            Utils.setBackwardPressed(false);
+            Utils.setJumpPressed(false);
+            Utils.setSprintPressed(false);
+            rasterRestockDismountRequestedTick = clientActionTick;
+            rasterDismountBoatId = boat.getId();
+            rasterDismountServerConfirmed = false;
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer pressing the vanilla sneak binding to dismount boat {} at {}",
+                rasterDismountBoatId,
+                context
+            );
+        }
+        Utils.setSneakPressed(true);
+        rasterStatus = "holding vanilla sneak for server-confirmed "
+            + context + " dismount";
+    }
+
+    private void resetRasterVanillaDismount() {
+        rasterRestockDismountRequestedTick = -1000L;
+        rasterDismountBoatId = Integer.MIN_VALUE;
+        rasterDismountServerConfirmed = false;
+    }
+
     private void resetRasterRestockLandingState() {
         rasterRestockLanding = null;
         rasterRestockDismountCell = null;
         rasterRejectedRestockLandings.clear();
         rasterRestockLandingFailures = 0;
-        rasterRestockDismountRequestedTick = -1000L;
+        resetRasterVanillaDismount();
         rasterRestockDiscardPendingSlot = -1;
         rasterRestockDiscardPendingItem = null;
         rasterRestockDiscardPendingCount = 0;
@@ -24399,38 +24493,43 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         rasterRestockDismountCell = null;
                         rasterRestockLandingFailures++;
                         rasterRestockPhase = RasterRestockPhase.TRAVEL_SOURCE;
-                        rasterRestockDismountRequestedTick = -1000L;
+                        resetRasterVanillaDismount();
                         return;
                     }
                     if (rasterRestockDismountRequestedTick < 0L) {
-                        rasterBoatPosition = boat.getBlockPos();
                         mc.player.setYaw((float) Rotations.getYaw(
                             rasterRestockDismountCell.toCenterPos()
                         ));
-                        // Restore normal Entity Control settings before asking
-                        // Minecraft to choose and perform its vanilla dismount.
-                        // The landed boat remains untouched until the server's
-                        // resulting player position is settled and verified.
-                        boatFlyAdapter.release();
-                        mc.player.dismountVehicle();
-                        rasterRestockDismountRequestedTick = clientActionTick;
-                        rasterStatus = "waiting for vanilla dismount to settle before breaking boat";
-                    } else if (clientActionTick
+                    }
+                    requestRasterVanillaDismount(
+                        boat,
+                        "restock landing"
+                    );
+                    if (clientActionTick
                         - rasterRestockDismountRequestedTick > 30L) {
                         failBoatRaster(
                             "vanilla dismount request was not acknowledged after 30 ticks"
                         );
-                    } else {
-                        rasterStatus = "waiting for vanilla dismount acknowledgement";
                     }
                     return;
                 }
+                Utils.setSneakPressed(false);
                 long dismountAge = clientActionTick
                     - rasterRestockDismountRequestedTick;
                 if (rasterRestockDismountRequestedTick < 0L
+                    || !rasterDismountServerConfirmed
                     || dismountAge < 4L) {
                     stopMovement();
-                    rasterStatus = "waiting for authoritative vanilla dismount position";
+                    if (rasterRestockDismountRequestedTick >= 0L
+                        && dismountAge > 30L) {
+                        failBoatRaster(
+                            "server did not confirm the vanilla restock dismount after 30 ticks"
+                        );
+                    } else {
+                        rasterStatus = rasterDismountServerConfirmed
+                            ? "waiting for authoritative vanilla dismount position"
+                            : "waiting for server-confirmed vanilla dismount";
+                    }
                     return;
                 }
                 RasterVoxelPathfinder.Cell current =
@@ -24454,7 +24553,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 rasterWalkPathTarget = null;
                 rasterRestockBoatCountBefore = playerBoatItemCount();
                 rasterRestockBoatBreakLastAttemptTick = -1000L;
-                rasterRestockDismountRequestedTick = -1000L;
+                resetRasterVanillaDismount();
                 rasterRestockPhase = RasterRestockPhase.BREAK_BOAT;
                 rasterPhaseStartedTick = clientActionTick;
             }
