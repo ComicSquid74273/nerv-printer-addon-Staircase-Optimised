@@ -27,7 +27,7 @@ public final class CompactCircularNbtGenerator {
     private static final String MARKER_FORMAT = "compact_circular_u";
     private static final int MARKER_SCHEMA_VERSION = 1;
     private static final int MARKER_GEOMETRY_VERSION = 1;
-    private static final int MARKER_LIGHTING_VERSION = 1;
+    private static final int MARKER_LIGHTING_VERSION = 2;
     private static final String LIGHT_BLOCK_MARKER =
         "nerv_printer:generated_end_rod";
 

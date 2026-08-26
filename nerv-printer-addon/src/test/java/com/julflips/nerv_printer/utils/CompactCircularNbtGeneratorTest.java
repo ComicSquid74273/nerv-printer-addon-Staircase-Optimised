@@ -30,11 +30,11 @@ class CompactCircularNbtGeneratorTest {
         assertEquals(untouchedSource, source);
         assertNotEquals(source, generated.root());
         assertEquals(3, generated.root().getList("palette").orElseThrow().size());
-        assertEquals(16_656, generated.root().getList("blocks").orElseThrow().size());
+        assertEquals(16_681, generated.root().getList("blocks").orElseThrow().size());
         assertEquals(128, generated.plan().sizeX());
-        assertEquals(4, generated.plan().sizeY());
+        assertEquals(5, generated.plan().sizeY());
         assertEquals(129, generated.plan().sizeZ());
-        assertEquals(144, generated.plan().lightingBlocks().size());
+        assertEquals(169, generated.plan().lightingBlocks().size());
         assertTrue(generated.plan().minimumGuaranteedSurfaceLight() >= 1);
         CompoundTag marker = generated.root()
             .getCompound("nerv_printer:compact_circular_u")
@@ -42,8 +42,8 @@ class CompactCircularNbtGeneratorTest {
         assertEquals("compact_circular_u", marker.getString("format").orElseThrow());
         assertEquals(1, marker.getInt("schema_version").orElseThrow());
         assertEquals(1, marker.getInt("geometry_version").orElseThrow());
-        assertEquals(1, marker.getInt("lighting_version").orElseThrow());
-        assertEquals(3,
+        assertEquals(2, marker.getInt("lighting_version").orElseThrow());
+        assertEquals(4,
             marker.getInt("end_rod_height_above_surface").orElseThrow());
 
         Path destination = temporaryDirectory.resolve("flat_compact.nbt");
@@ -104,8 +104,8 @@ class CompactCircularNbtGeneratorTest {
         assertEquals(256, generated.plan().mapWidth());
         assertEquals(256, generated.plan().visibleRows());
         assertEquals(257, generated.plan().sourceDepth());
-        assertEquals(576, generated.plan().lightingBlocks().size());
-        assertEquals(66_368,
+        assertEquals(676, generated.plan().lightingBlocks().size());
+        assertEquals(66_468,
             generated.root().getList("blocks").orElseThrow().size());
         assertEquals(
             CompactCircularNbtGenerator.InputKind.MARKED_COMPACT,
@@ -129,7 +129,7 @@ class CompactCircularNbtGeneratorTest {
         assertEquals(257, generated.plan().sourceDepth());
         assertEquals(0, generated.plan().sourceTopY(0, 1));
         assertEquals(0, generated.plan().sourceTopState(0, 1));
-        assertEquals(66_368, generated.plan().generatedBlocks().size());
+        assertEquals(66_468, generated.plan().generatedBlocks().size());
     }
 
     @Test
@@ -206,8 +206,8 @@ class CompactCircularNbtGeneratorTest {
             CompactCircularNbtGenerator.InputKind.MARKED_COMPACT,
             loaded.inputKind()
         );
-        assertEquals(144, loaded.generated().plan().lightingBlocks().size());
-        assertEquals(4, loaded.generated().plan().sizeY());
+        assertEquals(169, loaded.generated().plan().lightingBlocks().size());
+        assertEquals(5, loaded.generated().plan().sizeY());
     }
 
     @Test

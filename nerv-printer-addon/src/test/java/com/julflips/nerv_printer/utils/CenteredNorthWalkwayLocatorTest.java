@@ -34,8 +34,8 @@ class CenteredNorthWalkwayLocatorTest {
     }
 
     @Test
-    void derivesEvenTwoMapCornerFromASeamCenteredAnchor() {
-        Set<Point> safe = row(-1024, 76, 2495);
+    void derivesEvenTwoMapCornerFromTheWestMiddleSeam() {
+        Set<Point> safe = row(-960, 76, 2495);
 
         CenteredNorthWalkwayLocator.Resolution resolution =
             CenteredNorthWalkwayLocator.locate(
@@ -51,16 +51,16 @@ class CenteredNorthWalkwayLocatorTest {
 
         assertTrue(resolution.resolved());
         assertEquals(-1088, resolution.anchor().mapCornerX());
-        assertEquals(-1024, resolution.anchor().centerStartX());
+        assertEquals(-960, resolution.anchor().centerStartX());
+        assertEquals(128, resolution.anchor().relativeStartX());
     }
 
     @Test
-    void doesNotAcceptA64BlockOrMisalignedRow() {
+    void doesNotAcceptA64BlockRow() {
         Set<Point> safe = new HashSet<>();
         for (int x = -960; x < -896; x++) {
             safe.add(new Point(x, 76, 2495));
         }
-        safe.addAll(row(-959, 75, 2495));
 
         CenteredNorthWalkwayLocator.Resolution resolution =
             CenteredNorthWalkwayLocator.locate(
@@ -79,6 +79,102 @@ class CenteredNorthWalkwayLocatorTest {
             resolution.status()
         );
         assertNull(resolution.anchor());
+    }
+
+    @Test
+    void derivesEvenTwoMapCornerFromTheEastMiddleSeam() {
+        Set<Point> safe = row(-960, 76, 2495);
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locate(
+                2 * 128,
+                -840,
+                77,
+                2495,
+                192,
+                3,
+                64,
+                probe(safe)
+            );
+
+        assertTrue(resolution.resolved());
+        assertEquals(-960, resolution.anchor().mapCornerX());
+        assertEquals(-960, resolution.anchor().centerStartX());
+        assertEquals(0, resolution.anchor().relativeStartX());
+    }
+
+    @Test
+    void rejectsACompleteNonCanonicalXRun() {
+        Set<Point> safe = row(-959, 76, 2495);
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locate(
+                2 * 128,
+                -951,
+                77,
+                2495,
+                192,
+                3,
+                64,
+                probe(safe)
+            );
+
+        assertEquals(
+            CenteredNorthWalkwayLocator.Status.NOT_FOUND,
+            resolution.status()
+        );
+        assertNull(resolution.anchor());
+    }
+
+    @Test
+    void asksForAnEvenGridSideWhenPlayerIsAtAnchorCenter() {
+        Set<Point> safe = row(-960, 76, 2495);
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locate(
+                2 * 128,
+                -896,
+                77,
+                2495,
+                192,
+                3,
+                64,
+                probe(safe)
+            );
+
+        assertEquals(
+            CenteredNorthWalkwayLocator.Status.AMBIGUOUS,
+            resolution.status()
+        );
+        assertNull(resolution.anchor());
+    }
+
+    @Test
+    void keepsSixMapGridAndItsMiddleSeamCanonical() {
+        Set<Point> safe = row(-960, 76, 2495);
+
+        CenteredNorthWalkwayLocator.Resolution resolution =
+            CenteredNorthWalkwayLocator.locate(
+                6 * 128,
+                -951,
+                77,
+                2495,
+                192,
+                3,
+                64,
+                probe(safe)
+            );
+
+        assertTrue(resolution.resolved());
+        assertEquals(-1344, resolution.anchor().mapCornerX());
+        assertEquals(384, resolution.anchor().relativeStartX());
+        assertEquals(
+            -960,
+            resolution.anchor().mapCornerX() + 6 * 64
+        );
+        assertTrue(CenteredNorthWalkwayLocator.isMapBoundary(
+            resolution.anchor().mapCornerX()
+        ));
     }
 
     @Test

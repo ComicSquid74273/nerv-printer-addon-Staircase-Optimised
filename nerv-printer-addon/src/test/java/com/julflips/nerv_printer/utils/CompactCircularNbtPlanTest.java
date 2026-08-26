@@ -20,10 +20,10 @@ class CompactCircularNbtPlanTest {
 
         assertEquals(CompactCircularNbtPlan.PAIR_COUNT, result.pairRoutes().size());
         assertEquals(0, result.connectorBlocks().size());
-        assertEquals(144, result.lightingBlocks().size());
+        assertEquals(169, result.lightingBlocks().size());
         assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
         assertEquals(CompactCircularNbtPlan.SOURCE_Z_SIZE, result.sizeZ());
-        assertEquals(4, result.sizeY());
+        assertEquals(5, result.sizeY());
         assertEquals(1, result.cobblestoneState());
         assertTrue(result.pairRoutes().stream().allMatch(route -> route.minimumEdges() == 1));
         assertTrue(result.pairRoutes().stream().allMatch(route -> route.routeFamily().equals("simple_u")));
@@ -130,9 +130,9 @@ class CompactCircularNbtPlanTest {
         assertEquals(128, result.pairCount());
         assertEquals(128, result.pairRoutes().size());
         assertEquals(0, result.connectorBlocks().size());
-        assertEquals(576, result.lightingBlocks().size());
+        assertEquals(676, result.lightingBlocks().size());
         assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
-        assertEquals(66_368, result.generatedBlocks().size());
+        assertEquals(66_468, result.generatedBlocks().size());
         assertEquals(257, result.sizeZ());
     }
 
@@ -156,8 +156,8 @@ class CompactCircularNbtPlanTest {
         assertEquals(640, result.visibleRows());
         assertEquals(641, result.sourceDepth());
         assertEquals(320, result.pairRoutes().size());
-        assertEquals(3_481, result.lightingBlocks().size());
-        assertEquals(413_721, result.generatedBlocks().size());
+        assertEquals(4_096, result.lightingBlocks().size());
+        assertEquals(414_336, result.generatedBlocks().size());
         assertTrue(result.minimumGuaranteedSurfaceLight() >= 1);
     }
 

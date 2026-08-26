@@ -21,7 +21,7 @@ You can find the full documentation [here](Documentation/CarpetGuide.md).
 
 ## Fullblock Printer
 The Fullblock Printer builds flat & staircased fullblock maps line by line.
-Printing-only mode is the default: it auto-detects combined single-NBT grids of `128x128` map tiles (including exact `2x2`, `5x5`, and larger footprints), derives the whole map area from a player-built centered `128x1` north cobblestone anchor, builds the missing outer walkway, automatically registers nearby shulker supplies, saves and live-revalidates that setup for later maps, adds verified suspended end-rod lighting, and leaves the completed structure in place. The module widget includes **Reset Printing Config** for starting a new platform setup. The legacy `1x1` map-item handoff and teardown cycle remains available when printing-only is disabled.
+Printing-only mode is the default: it auto-detects combined single-NBT grids of `128x128` map tiles (including exact `2x2`, `5x5`, and larger footprints), derives the whole map area from a player-built `128x1` north cobblestone anchor occupying one canonical Minecraft map tile, builds the missing outer walkway, automatically registers nearby shulker supplies, saves and live-revalidates that setup for later maps, adds verified suspended end-rod lighting, and leaves the completed structure in place. The module widget includes **Reset Printing Config** for starting a new platform setup. The legacy `1x1` map-item handoff and teardown cycle remains available when printing-only is disabled.
 This module **will not work on servers where placing blocks in the air is disabled**.
 You can find the full documentation [here](Documentation/StaircasedGuide.md).
 

@@ -16,7 +16,7 @@ import java.util.Set;
  */
 public final class EndRodLightingPlan {
     public static final int END_ROD_LIGHT_LEVEL = 14;
-    public static final int HEIGHT_ABOVE_SURFACE = 3;
+    public static final int HEIGHT_ABOVE_SURFACE = 4;
     public static final int MINIMUM_SURFACE_LIGHT = 1;
     public static final int MAXIMUM_LIGHT_PATH =
         END_ROD_LIGHT_LEVEL - MINIMUM_SURFACE_LIGHT;

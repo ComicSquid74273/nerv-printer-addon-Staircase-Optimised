@@ -170,6 +170,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final int TEARDOWN_PICKAXE_HOTBAR_COUNT = 2;
     private static final int TEARDOWN_AXE_HOTBAR_COUNT = 1;
     private static final int AUTOMATIC_SHULKER_LINE_Y_RADIUS = 2;
+    private static final int AUTOMATIC_SHULKER_INTERACTION_OFFSET = 2;
     private static final int AUTOMATIC_MAP_ANCHOR_HORIZONTAL_RADIUS = 192;
     private static final int AUTOMATIC_MAP_ANCHOR_VERTICAL_RADIUS = 3;
     private static final int AUTOMATIC_MAP_ANCHOR_DEPTH_RADIUS = 64;
@@ -1071,6 +1072,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     Tuple<Block, Integer>[][] map;
     CompactCircularNbtPlan.Result compactPlan;
     Integer northWalkwayRelativeY;
+    Integer automaticNorthWalkwayRelativeStartX;
     LinkedHashSet<BlockPos> northWalkwayBuildTargets;
     long automaticMapAreaNextScanTick;
     boolean automaticMapAreaScanNoticeShown;
@@ -1615,6 +1617,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             circularTeardownTargetReferences.clear();
         }
         northWalkwayRelativeY = null;
+        automaticNorthWalkwayRelativeStartX = null;
         generatedMapFile = null;
         currentMapArchived = false;
         activeMapName = null;
@@ -1851,17 +1854,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     case UNAVAILABLE ->
                         "part of the possible 128-block anchor is outside loaded chunks";
                     case AMBIGUOUS ->
-                        "two equally near centered anchors were found";
+                        "the map-grid anchor or even-grid middle side is ambiguous";
                     case NOT_FOUND ->
-                        "no complete aligned 128-block cobblestone anchor was found";
+                        "no complete 128-block cobblestone anchor was found";
                     case RESOLVED -> throw new IllegalStateException(
                         "Resolved automatic map anchor has no anchor."
                     );
                 };
                 warning(
                     "Automatic map-area detection is waiting: " + reason
-                        + ". Stand near the player-built center north row. "
-                        + "It must be exactly 128 cobblestone supports at "
+                        + ". Stand near the intended middle-seam end of the "
+                        + "player-built north row. It must occupy one complete "
+                        + "canonical 128-block map tile at "
                         + "map Z -1 with two air blocks above it; the printer "
                         + "will retry automatically."
                 );
@@ -1899,6 +1903,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             anchor.mapCornerZ()
         );
         northWalkwayRelativeY = relativeY;
+        automaticNorthWalkwayRelativeStartX = anchor.relativeStartX();
         resetMapAreaCache();
         installAutomaticNorthWalkwayBuildTargets();
 
@@ -1909,7 +1914,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         info(
             "Automatically detected the §a" + grid.columns() + "x"
                 + grid.rows() + "§r map at corner §a"
-                + mapCorner.toShortString() + "§r from the centered 128x1 "
+                + mapCorner.toShortString() + "§r from the canonical 128x1 "
                 + "cobblestone row at world Y " + anchor.walkwayY()
                 + ", Z " + anchor.walkwayZ() + "."
         );
@@ -1964,8 +1969,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (compactPlan == null) {
             throw new IllegalStateException("No compact NBT is loaded.");
         }
-        return (compactPlan.mapWidth()
-            - CenteredNorthWalkwayLocator.ANCHOR_LENGTH) / 2;
+        if (automaticNorthWalkwayRelativeStartX == null) {
+            throw new IllegalStateException(
+                "The automatic north-walkway map tile is unresolved."
+            );
+        }
+        return automaticNorthWalkwayRelativeStartX;
     }
 
     private boolean beginReconnectRecoveryIfPending() {
@@ -2140,7 +2149,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             case SelectingMapArea:
                 if (printingOnly.get()) {
                     // Printing-only map registration is derived from the
-                    // centered 128x1 cobblestone north anchor.
+                    // canonical 128x1 cobblestone north map tile.
                     return;
                 }
                 BlockPos hitPos = packet.getHitResult().getBlockPos().relative(packet.getHitResult().getDirection());
@@ -2148,6 +2157,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 int adjustedZ = Utils.getIntervalStart(hitPos.getZ());
                 mapCorner = new BlockPos(adjustedX, hitPos.getY(), adjustedZ);
                 northWalkwayRelativeY = null;
+                automaticNorthWalkwayRelativeStartX = null;
                 resetMapAreaCache();
                 MapGridLayout selectedGrid = new MapGridLayout(
                     mapColumns.get(),
@@ -2214,10 +2224,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 blockPos = packet.getHitResult().getBlockPos();
                 if (mc.level.getBlockState(blockPos).getBlock()
                     instanceof ShulkerBoxBlock) {
-                    beginAutomaticShulkerRegistration(
-                        blockPos,
-                        mc.player.position()
-                    );
+                    beginAutomaticShulkerRegistration(blockPos);
                 } else {
                     warning(
                         "Select the first shulker at either end of the supply "
@@ -4991,8 +4998,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         ArrayList<Tuple<BlockPos, Vec3>> remaining = new ArrayList<>();
         for (PrintingOnlyConfigStore.Station savedStation
             : snapshot.shulkerStations()) {
-            Tuple<BlockPos, Vec3> station =
-                automaticConfigStation(savedStation);
+            BlockPos shulker = automaticConfigBlockPos(
+                savedStation.block()
+            );
+            Vec3 openPosition = automaticShulkerSouthOpenPosition(shulker);
+            if (openPosition == null) {
+                automaticShulkerInaccessibleWarnings.add(shulker);
+                warning(
+                    "Cannot recheck saved shulker at "
+                        + shulker.toShortString()
+                        + ": its south-side standing cell at Z+2 is not "
+                        + "reachable with a solid floor and two air blocks."
+                );
+                continue;
+            }
+            Tuple<BlockPos, Vec3> station = new Tuple<>(
+                shulker,
+                openPosition
+            );
             automaticShulkerStations.put(station.getA(), station);
             remaining.add(station);
         }
@@ -5191,16 +5214,24 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
-    private void beginAutomaticShulkerRegistration(
-        BlockPos anchor,
-        Vec3 anchorOpenPosition
-    ) {
+    private void beginAutomaticShulkerRegistration(BlockPos anchor) {
         if (!printingOnly.get() || mc.player == null || mc.level == null
             || dumpStation == null || blockPaletteDict == null
             || anchor == null
             || !(mc.level.getBlockState(anchor).getBlock()
                 instanceof ShulkerBoxBlock)) {
             error("Automatic shulker discovery is not ready.");
+            stopMovement();
+            toggle();
+            return;
+        }
+        Vec3 anchorOpenPosition = automaticShulkerSouthOpenPosition(anchor);
+        if (anchorOpenPosition == null) {
+            error(
+                "The shulker-line anchor needs a reachable south-side "
+                    + "standing cell at Z+2 with a solid floor and two air "
+                    + "blocks."
+            );
             stopMovement();
             toggle();
             return;
@@ -5303,7 +5334,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                                 continue;
                             }
                             Vec3 openPosition =
-                                automaticShulkerOpenPosition(shulker);
+                                automaticShulkerSouthOpenPosition(shulker);
                             if (openPosition == null) {
                                 if (automaticShulkerInaccessibleWarnings.add(
                                         new BlockPos(shulker)
@@ -5311,9 +5342,9 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                                     warning(
                                         "Cannot inspect shulker at "
                                             + shulker.toShortString()
-                                            + ": it needs a reachable nearby "
-                                            + "standing cell with a solid "
-                                            + "floor and two air blocks."
+                                            + ": its south-side standing cell "
+                                            + "at Z+2 needs a solid floor and "
+                                            + "two air blocks."
                                     );
                                 }
                                 continue;
@@ -5373,68 +5404,27 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
     }
 
-    private Vec3 automaticShulkerOpenPosition(BlockPos shulker) {
-        Vec3 best = null;
-        double bestDistance = Double.MAX_VALUE;
-        for (Direction direction : Direction.Plane.HORIZONTAL) {
-            BlockPos feet = shulker.relative(direction);
-            Vec3 candidate = automaticShulkerStandingPosition(
-                shulker,
-                feet
-            );
-            if (candidate == null) continue;
-            double distance = candidate.distanceToSqr(dumpStation.getA());
-            if (best == null || distance < bestDistance) {
-                best = candidate;
-                bestDistance = distance;
-            }
-        }
-        if (best != null) return best;
-
-        // A dispenser bank or vertically stacked supply can occupy every
-        // immediately adjacent cell even though the box remains reachable
-        // from a nearby lane. Search a small, bounded standing volume before
-        // classifying the placed shulker as inaccessible.
-        for (int radius = 2; radius <= 4; radius++) {
-            for (int x = shulker.getX() - radius;
-                 x <= shulker.getX() + radius;
-                 x++) {
-                for (int z = shulker.getZ() - radius;
-                     z <= shulker.getZ() + radius;
-                     z++) {
-                    if (Math.max(
-                            Math.abs(x - shulker.getX()),
-                            Math.abs(z - shulker.getZ())
-                        ) != radius) {
-                        continue;
-                    }
-                    for (int y = shulker.getY() - 3;
-                         y <= shulker.getY() + 2;
-                         y++) {
-                        Vec3 candidate = automaticShulkerStandingPosition(
-                            shulker,
-                            new BlockPos(x, y, z)
-                        );
-                        if (candidate == null) continue;
-                        double distance = candidate.distanceToSqr(
-                            dumpStation.getA()
-                        );
-                        if (best == null || distance < bestDistance) {
-                            best = candidate;
-                            bestDistance = distance;
-                        }
-                    }
-                }
-            }
-            if (best != null) return best;
-        }
-        return best;
+    private Vec3 automaticShulkerSouthOpenPosition(BlockPos shulker) {
+        return automaticShulkerStandingPosition(
+            shulker,
+            shulker.relative(
+                Direction.SOUTH,
+                AUTOMATIC_SHULKER_INTERACTION_OFFSET
+            )
+        );
     }
 
     private Vec3 automaticShulkerStandingPosition(
         BlockPos shulker,
         BlockPos feet
     ) {
+        int deltaX = Math.abs(feet.getX() - shulker.getX());
+        int deltaZ = feet.getZ() - shulker.getZ();
+        if (deltaX != 0
+            || deltaZ != AUTOMATIC_SHULKER_INTERACTION_OFFSET
+            || feet.getY() != shulker.getY()) {
+            return null;
+        }
         if (!isAutomaticShulkerStandingCell(feet)) return null;
         Vec3 candidate = new Vec3(
             feet.getX() + 0.5,
@@ -5455,10 +5445,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
 
     private boolean isAutomaticShulkerStandingCell(BlockPos feet) {
         if (mc.player == null || mc.level == null) return false;
-        LogisticsDetourPlanner.Point horizontal =
-            new LogisticsDetourPlanner.Point(feet.getX(), feet.getZ());
-        if (isProtectedMapCell(horizontal)
-            || !mc.level.getChunkSource().hasChunk(
+        if (!mc.level.getChunkSource().hasChunk(
                 feet.getX() >> 4,
                 feet.getZ() >> 4
             )) {
@@ -21456,7 +21443,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + (resolution.candidates().size() == 1 ? " " : "s ")
                     + candidateWorldYs
                     + (printingOnly.get()
-                        ? ". The centered 128-block cobblestone anchor must be complete with two blocks of headroom."
+                        ? ". The canonical 128-block cobblestone map tile must be complete with two blocks of headroom."
                         : ". It must be a complete cobblestone row with two blocks of headroom.")
             );
             case RESOLVED -> throw new IllegalStateException(
@@ -21603,7 +21590,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     plannedExtension
                         ? "The planned outer north-walkway extension is blocked at "
                             + walkway.toShortString() + "."
-                        : "The centered 128-block north-walkway anchor is no longer safe at "
+                        : "The canonical 128-block north-walkway map tile is no longer safe at "
                             + walkway.toShortString() + "."
                 );
                 return false;
@@ -24537,6 +24524,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             this.dumpStation = data.dumpStation;
             this.mapCorner = data.mapCorner;
             this.northWalkwayRelativeY = null;
+            this.automaticNorthWalkwayRelativeStartX = null;
             resetMapAreaCache();
             this.materialDict = data.materialDict;
             this.toolSet = data.toolSet;
@@ -26008,6 +25996,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             mapCyclePhase = MapCyclePhase.IDLE;
             activeMapName = null;
             northWalkwayRelativeY = null;
+            automaticNorthWalkwayRelativeStartX = null;
             info("Loading NBT: §a" + mapFile.getName());
             activeSourceSha256 = FileFingerprint.sha256(mapFile.toPath());
             NbtAccounter sizeTracker = new NbtAccounter(0x20000000L, 100);

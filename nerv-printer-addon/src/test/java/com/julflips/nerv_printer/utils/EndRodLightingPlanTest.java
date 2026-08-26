@@ -9,19 +9,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class EndRodLightingPlanTest {
     @Test
-    void flatOneByOneMapUsesAnElevenBlockGrid() {
+    void flatOneByOneMapUsesATenBlockGridAtYPlusFour() {
         int[][] surface = new int[128][128];
 
         EndRodLightingPlan.Result result =
             EndRodLightingPlan.generate(surface);
 
-        assertEquals(144, result.rods().size());
+        assertEquals(169, result.rods().size());
         assertTrue(result.minimumGuaranteedLight() >= 1);
         assertEquals(
             result.rods().size(),
             new HashSet<>(result.rods()).size()
         );
-        assertTrue(result.rods().stream().allMatch(rod -> rod.y() == 3));
+        assertTrue(result.rods().stream().allMatch(rod -> rod.y() == 4));
     }
 
     @Test
@@ -41,7 +41,7 @@ class EndRodLightingPlanTest {
         assertTrue(result.minimumGuaranteedLight() >= 1);
         for (EndRodLightingPlan.Rod rod : result.rods()) {
             assertEquals(
-                surface[rod.x()][rod.z()] + 3,
+                surface[rod.x()][rod.z()] + 4,
                 rod.y()
             );
         }
