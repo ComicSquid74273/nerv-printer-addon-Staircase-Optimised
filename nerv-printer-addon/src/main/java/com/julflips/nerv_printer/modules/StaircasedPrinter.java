@@ -389,23 +389,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         .build()
     );
 
-    private final Setting<Boolean> useDefaultConfigFile = sgGeneral.add(new BoolSetting.Builder()
-        .name("use-default-config-file")
-        .description("Load a config file when the module is enabled.")
-        .defaultValue(false)
-        .build()
-    );
-
-    public final Setting<String> configFileName = sgGeneral.add(new StringSetting.Builder()
-        .name("config-file-name")
-        .description("The config file that is loaded  when the module is enabled.")
-        .defaultValue("carpet-printer-config.json")
-        .wide()
-        .renderer(StarscriptTextBoxRenderer.class)
-        .visible(() -> useDefaultConfigFile.get())
-        .build()
-    );
-
     //Advanced
 
     private final Setting<Integer> preRestockDelay = sgAdvanced.add(new IntSetting.Builder()
@@ -1882,30 +1865,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         }
 
         state = State.SelectingMapArea;
-        File configFolder = new File(mapFolder, "_configs");
-        File configuredPrinter = new File(configFolder, configFileName.get());
-        File boatRasterResumeConfig = new File(
-            configFolder,
-            "boatconfigcreative"
-        );
-        boolean autoResumeBoatRaster = boatRasterResumeConfig.isFile();
-        if (useDefaultConfigFile.get() || autoResumeBoatRaster) {
-            if (!useDefaultConfigFile.get()) {
-                configuredPrinter = boatRasterResumeConfig;
-            }
-            if (!loadConfig(configuredPrinter)) {
-                info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
-            } else if (validateStartRequirements()) {
-                info(
-                    "Boat Raster automatically loaded "
-                        + configuredPrinter.getName()
-                        + "; resuming from the authoritative checkpoint without a Start Block interaction."
-                );
-                startBuilding();
-            }
-        } else {
-            info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
-        }
+        info("Select the §aMap Building Area (128x128). (Right-click the edge from the inside)");
     }
 
     private boolean beginReconnectRecoveryIfPending() {
