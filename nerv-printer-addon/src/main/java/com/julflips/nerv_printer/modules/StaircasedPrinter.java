@@ -92,6 +92,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     private static final double RASTER_EXTERIOR_CRUISE_HEIGHT_ABOVE_MAP = 2.0;
     private static final double RASTER_INGRESS_MAX_EXTRA_CRUISE_HEIGHT = 12.0;
     private static final double RASTER_INGRESS_CRUISE_HEIGHT_STEP = 1.0;
+    private static final double RASTER_INGRESS_ESCAPE_RISE = 15.0;
     private static final double RASTER_LOCAL_RESUME_VERTICAL_TOLERANCE = 4.0;
     private static final int RASTER_WALK_MAX_FAILURES = 3;
     private static final int RASTER_SAFE_RETRY_COOLDOWN_TICKS = 100;
@@ -1292,6 +1293,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     boolean rasterRouteRejoinSnapshotAccepted;
     boolean rasterRouteValidated;
     boolean rasterRestockExteriorAcquired;
+    Vec3d rasterIngressEscapeTarget;
+    boolean rasterIngressEscapeAttempted;
     final StableRecoverySnapshotGate<BlockPos> rasterRecoverySnapshotGate =
         new StableRecoverySnapshotGate<>(3);
     Vec3d rasterStrictPlacementDetour;
@@ -1638,6 +1641,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         rasterRouteRejoinSnapshotAccepted = false;
         rasterRouteValidated = false;
         rasterRestockExteriorAcquired = false;
+        rasterIngressEscapeTarget = null;
+        rasterIngressEscapeAttempted = false;
         rasterRecoverySnapshotGate.reset();
         rasterStrictPlacementDetour = null;
         rasterStrictPlacementDetourTargetIndex = -1;
@@ -21091,6 +21096,25 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
             return false;
         }
+        if (rasterIngressEscapeTarget != null) {
+            RasterSetPathStatus escapeStatus = driveRasterFixedSetPath(
+                boat,
+                rasterIngressEscapeTarget,
+                List.of(rasterIngressEscapeTarget),
+                BoatFlyAdapter.DriveMode.TRAVEL,
+                "rising 15 blocks before retrying exterior ingress at 20.0 blocks/s",
+                true
+            );
+            if (escapeStatus != RasterSetPathStatus.ARRIVED) return false;
+            Addon.LOG.info(
+                "[Fullblock Printer] Staircased Printer completed one 15-block vertical ingress escape at {}; rebuilding exterior route from authoritative vehicle position",
+                boat.getEntityPos()
+            );
+            rasterIngressEscapeTarget = null;
+            rasterBoatPath.clear();
+            rasterBoatPathTarget = null;
+            resetRasterBoatPathProgress();
+        }
         RasterBuildRoutePlan.Point<BlockPos> accessPoint =
             rasterBuildRoutePlan.previousExteriorAccess(entryRouteIndex);
         RasterBuildRoutePlan.Point<BlockPos> retainedPoint =
@@ -21108,8 +21132,42 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         if (!retainedIngress
             && route.isEmpty()
             && boat.getEntityPos().distanceTo(retained) > 0.90) {
+            if (!rasterIngressEscapeAttempted) {
+                Vec3d escape = boat.getEntityPos().add(
+                    0.0,
+                    RASTER_INGRESS_ESCAPE_RISE,
+                    0.0
+                );
+                if (!isRasterBoatExteriorSeparatingLiftClear(
+                        boat,
+                        boat.getEntityPos(),
+                        escape
+                    )) {
+                    failBoatRaster(
+                        "no verified exterior route and the one bounded 15-block vertical escape is obstructed: "
+                            + rasterBoatSegmentFailure(
+                                boat,
+                                boat.getEntityPos(),
+                                escape
+                            )
+                    );
+                    return false;
+                }
+                rasterIngressEscapeAttempted = true;
+                rasterIngressEscapeTarget = escape;
+                rasterBoatPath.clear();
+                rasterBoatPathTarget = null;
+                resetRasterBoatPathProgress();
+                Addon.LOG.warn(
+                    "[Fullblock Printer] Staircased Printer found no flat exterior ingress from {}; performing one collision-validated 15-block vertical escape to {} before retrying",
+                    boat.getEntityPos(),
+                    escape
+                );
+                rasterStatus = "rising 15 blocks before one exterior path retry";
+                return false;
+            }
             failBoatRaster(
-                "no verified support-aware flat exterior route reaches the north/south entry column"
+                "no verified support-aware exterior route reaches the north/south entry column after one 15-block vertical escape"
             );
             return false;
         }
@@ -21133,6 +21191,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         rasterCompiledSegmentPath.clear();
         rasterCompiledSegmentDestination = -1;
         rasterLocalRecoveryRetainedDestination = -1;
+        rasterIngressEscapeTarget = null;
+        rasterIngressEscapeAttempted = false;
         return true;
     }
 
