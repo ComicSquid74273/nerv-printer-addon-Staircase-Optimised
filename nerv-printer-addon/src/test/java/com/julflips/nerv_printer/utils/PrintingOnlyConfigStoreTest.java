@@ -42,6 +42,9 @@ class PrintingOnlyConfigStoreTest {
                 )
             )
         );
+        assertTrue(
+            PrintingOnlyConfigStore.hasReusableShulkerRegistry(snapshot)
+        );
     }
 
     @Test
@@ -115,6 +118,7 @@ class PrintingOnlyConfigStoreTest {
                 valid.bed(),
                 valid.shulkerLineAnchor(),
                 List.of(valid.shulkerStations().getFirst(), outside),
+                valid.shulkerInventories(),
                 valid.savedAtMs()
             );
 
@@ -141,6 +145,7 @@ class PrintingOnlyConfigStoreTest {
                 valid.bed(),
                 new PrintingOnlyConfigStore.Position(90, 64, 200),
                 valid.shulkerStations(),
+                valid.shulkerInventories(),
                 valid.savedAtMs()
             );
 
@@ -161,6 +166,37 @@ class PrintingOnlyConfigStoreTest {
 
         assertTrue(store.read().isEmpty());
         assertFalse(Files.exists(temporary));
+    }
+
+    @Test
+    void geometryOnlyLegacyConfigRequiresOneUpgradeInspection()
+        throws IOException {
+        PrintingOnlyConfigStore.Snapshot current = validSnapshot();
+        PrintingOnlyConfigStore.Snapshot legacy =
+            new PrintingOnlyConfigStore.Snapshot(
+                current.schemaVersion(),
+                current.server(),
+                current.dimension(),
+                current.mapColumns(),
+                current.mapRows(),
+                current.scanRadius(),
+                current.mapCorner(),
+                current.dumpStation(),
+                current.bed(),
+                current.shulkerLineAnchor(),
+                current.shulkerStations(),
+                current.savedAtMs()
+            );
+        PrintingOnlyConfigStore store =
+            PrintingOnlyConfigStore.open(temporaryDirectory);
+
+        store.save(legacy);
+
+        PrintingOnlyConfigStore.Snapshot loaded =
+            store.read().orElseThrow();
+        assertFalse(
+            PrintingOnlyConfigStore.hasReusableShulkerRegistry(loaded)
+        );
     }
 
     private static PrintingOnlyConfigStore.Snapshot validSnapshot() {
@@ -191,7 +227,43 @@ class PrintingOnlyConfigStoreTest {
                 anchor,
                 station(140, 66, 200, 140.5, 66, 201.5)
             ),
+            List.of(
+                inventory(anchor.block(), "minecraft:cobblestone", 1728),
+                inventory(
+                    new PrintingOnlyConfigStore.Position(140, 66, 200),
+                    "minecraft:diamond_pickaxe",
+                    1,
+                    5
+                )
+            ),
             1_700_000_000_000L
+        );
+    }
+
+    private static PrintingOnlyConfigStore.StationInventory inventory(
+        PrintingOnlyConfigStore.Position block,
+        String itemId,
+        int count
+    ) {
+        return new PrintingOnlyConfigStore.StationInventory(
+            block,
+            List.of(new PrintingOnlyConfigStore.StoredItem(itemId, count)),
+            List.of()
+        );
+    }
+
+    private static PrintingOnlyConfigStore.StationInventory inventory(
+        PrintingOnlyConfigStore.Position block,
+        String itemId,
+        int count,
+        int efficiency
+    ) {
+        return new PrintingOnlyConfigStore.StationInventory(
+            block,
+            List.of(new PrintingOnlyConfigStore.StoredItem(itemId, count)),
+            List.of(
+                new PrintingOnlyConfigStore.StoredTool(itemId, efficiency)
+            )
         );
     }
 

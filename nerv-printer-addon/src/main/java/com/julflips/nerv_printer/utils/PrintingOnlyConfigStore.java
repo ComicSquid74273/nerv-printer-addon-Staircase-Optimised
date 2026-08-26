@@ -16,13 +16,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 
-/**
- * Durable geometry for printing-only automatic shulker registration.
- *
- * <p>Inventory contents are deliberately not persisted. The printer uses the
- * saved station geometry to reopen every shulker and rebuild its registry from
- * current server-authoritative container snapshots for each NBT.</p>
- */
+/** Durable printing-only station geometry and verified shulker registry. */
 public final class PrintingOnlyConfigStore {
     public static final int SCHEMA_VERSION = 1;
     public static final String DIRECTORY_NAME = "_configs";
@@ -52,6 +46,23 @@ public final class PrintingOnlyConfigStore {
     public record Station(Position block, Point openPosition) {
     }
 
+    public record StoredItem(String itemId, int count) {
+    }
+
+    public record StoredTool(String itemId, int minimumEfficiency) {
+    }
+
+    public record StationInventory(
+        Position block,
+        List<StoredItem> items,
+        List<StoredTool> tools
+    ) {
+        public StationInventory {
+            if (items != null) items = List.copyOf(items);
+            if (tools != null) tools = List.copyOf(tools);
+        }
+    }
+
     public record Snapshot(
         int schemaVersion,
         String server,
@@ -64,12 +75,48 @@ public final class PrintingOnlyConfigStore {
         Station bed,
         Position shulkerLineAnchor,
         List<Station> shulkerStations,
+        List<StationInventory> shulkerInventories,
         long savedAtMs
     ) {
         public Snapshot {
             if (shulkerStations != null) {
                 shulkerStations = List.copyOf(shulkerStations);
             }
+            if (shulkerInventories != null) {
+                shulkerInventories = List.copyOf(shulkerInventories);
+            }
+        }
+
+        /** Backward-compatible constructor for geometry-only schema-1 files. */
+        public Snapshot(
+            int schemaVersion,
+            String server,
+            String dimension,
+            int mapColumns,
+            int mapRows,
+            int scanRadius,
+            Position mapCorner,
+            DumpStation dumpStation,
+            Station bed,
+            Position shulkerLineAnchor,
+            List<Station> shulkerStations,
+            long savedAtMs
+        ) {
+            this(
+                schemaVersion,
+                server,
+                dimension,
+                mapColumns,
+                mapRows,
+                scanRadius,
+                mapCorner,
+                dumpStation,
+                bed,
+                shulkerLineAnchor,
+                shulkerStations,
+                null,
+                savedAtMs
+            );
         }
     }
 
@@ -177,6 +224,16 @@ public final class PrintingOnlyConfigStore {
             && snapshot.mapRows() == mapRows;
     }
 
+    public static boolean hasReusableShulkerRegistry(
+        Snapshot snapshot
+    ) {
+        return snapshot != null
+            && snapshot.shulkerStations() != null
+            && snapshot.shulkerInventories() != null
+            && snapshot.shulkerInventories().size()
+                == snapshot.shulkerStations().size();
+    }
+
     private static void validate(Snapshot snapshot) throws IOException {
         if (snapshot == null) {
             throw new IOException("Printing-only config is empty.");
@@ -243,10 +300,85 @@ public final class PrintingOnlyConfigStore {
                 "Printing-only config does not contain its shulker anchor."
             );
         }
+        validateShulkerInventories(snapshot, unique);
         if (snapshot.savedAtMs() <= 0) {
             throw new IOException(
                 "Printing-only config has an invalid save timestamp."
             );
+        }
+    }
+
+    private static void validateShulkerInventories(
+        Snapshot snapshot,
+        Set<Position> stationPositions
+    ) throws IOException {
+        List<StationInventory> inventories =
+            snapshot.shulkerInventories();
+        // Older schema-1 files contain geometry only. They remain readable so
+        // the runtime can inspect them once and atomically upgrade the file.
+        if (inventories == null) return;
+        if (inventories.size() != stationPositions.size()) {
+            throw new IOException(
+                "Printing-only config does not have one registry entry per "
+                    + "shulker station."
+            );
+        }
+
+        Set<Position> registeredPositions = new HashSet<>();
+        for (StationInventory inventory : inventories) {
+            if (inventory == null) {
+                throw new IOException(
+                    "Printing-only config contains an empty shulker registry entry."
+                );
+            }
+            Position block = requirePosition(
+                inventory.block(),
+                "shulker inventory block"
+            );
+            if (!stationPositions.contains(block)
+                || !registeredPositions.add(block)) {
+                throw new IOException(
+                    "Printing-only config contains an unmatched or duplicate "
+                        + "shulker registry entry."
+                );
+            }
+            if (inventory.items() == null || inventory.tools() == null) {
+                throw new IOException(
+                    "Printing-only config contains an incomplete shulker registry."
+                );
+            }
+            Set<String> itemIds = new HashSet<>();
+            for (StoredItem item : inventory.items()) {
+                if (item == null) {
+                    throw new IOException(
+                        "Printing-only config contains an empty stored item."
+                    );
+                }
+                requireIdentity(item.itemId(), "stored item id", 256);
+                if (item.count() <= 0 || !itemIds.add(item.itemId())) {
+                    throw new IOException(
+                        "Printing-only config contains an invalid or duplicate "
+                            + "stored item."
+                    );
+                }
+            }
+            Set<String> toolIds = new HashSet<>();
+            for (StoredTool tool : inventory.tools()) {
+                if (tool == null) {
+                    throw new IOException(
+                        "Printing-only config contains an empty stored tool."
+                    );
+                }
+                requireIdentity(tool.itemId(), "stored tool id", 256);
+                if (tool.minimumEfficiency() < 0
+                    || !toolIds.add(tool.itemId())
+                    || !itemIds.contains(tool.itemId())) {
+                    throw new IOException(
+                        "Printing-only config contains an invalid, duplicate, "
+                            + "or uncounted stored tool."
+                    );
+                }
+            }
         }
     }
 

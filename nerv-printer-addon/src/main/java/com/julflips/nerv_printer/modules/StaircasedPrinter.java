@@ -55,6 +55,7 @@ import net.minecraft.network.protocol.game.ServerboundPlayerCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundSwingPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemOnPacket;
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket;
+import net.minecraft.resources.Identifier;
 import net.minecraft.tags.ItemTags;
 import com.julflips.nerv_printer.utils.Tuple;
 import net.minecraft.world.InteractionHand;
@@ -1030,6 +1031,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     HashMap<Item, Integer> automaticRegisteredItemCounts;
     HashMap<BlockPos, HashMap<Item, Integer>> automaticShulkerContentCounts;
     HashMap<BlockPos, ArrayList<ItemStack>> automaticShulkerToolStacks;
+    HashMap<BlockPos, HashMap<Item, Integer>>
+        automaticShulkerToolMinimumEfficiency;
     HashSet<BlockPos> automaticShulkerInaccessibleWarnings;
     BlockPos automaticShulkerLineAnchor;
     BlockPos automaticShulkerRegistrationTarget;
@@ -1160,6 +1163,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     MiningHotbarSwapContext miningHotbarSwapContext;
     HashMap<Integer, RepairToolShadow> repairToolShadows;
     PendingInventoryMetadataSwap pendingInventoryMetadataSwap;
+    boolean buildInventoryResyncPending;
     RepairToolSwapStaging repairToolSwapStaging;
     RepairMineController<BlockPos> buildRepairController;
     boolean buildMovementBlockedThisTick;
@@ -1387,6 +1391,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         automaticRegisteredItemCounts = new HashMap<>();
         automaticShulkerContentCounts = new HashMap<>();
         automaticShulkerToolStacks = new HashMap<>();
+        automaticShulkerToolMinimumEfficiency = new HashMap<>();
         automaticShulkerInaccessibleWarnings = new HashSet<>();
         automaticShulkerLineAnchor = null;
         automaticShulkerRegistrationTarget = null;
@@ -1503,6 +1508,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         miningHotbarSwapContext = MiningHotbarSwapContext.NONE;
         repairToolShadows = new HashMap<>();
         pendingInventoryMetadataSwap = null;
+        buildInventoryResyncPending = false;
         repairToolSwapStaging = null;
         buildRepairController = new RepairMineController<>(
             new RepairMineController.RetryPolicy(2, 20, 80, 1200)
@@ -2125,6 +2131,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     @Override
     public void onDeactivate() {
         freezeForRecoveryClassification();
+        buildInventoryResyncPending = false;
         if (mapCyclePhase != null
             && mapCyclePhase.isInProgress()
             && !fileMasterRecoveryLoaded
@@ -2180,6 +2187,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
     @EventHandler(priority = EventPriority.HIGHEST)
     private void onGameLeft(GameLeftEvent event) {
         freezeForRecoveryClassification();
+        buildInventoryResyncPending = false;
         if (mapCyclePhase != null
             && mapCyclePhase.isInProgress()
             && !fileMasterRecoveryLoaded
@@ -2460,13 +2468,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 serverPlayerInventorySnapshotSequence =
                     serverInventoryUpdateSequence;
             }
-            if (!acknowledgePendingInventoryMetadataSwap(packet)) {
-                return;
-            }
+            boolean inventorySwapConsistent =
+                acknowledgePendingInventoryMetadataSwap(packet);
             recordFullInventoryHotbarObservations(packet);
             recordRestockFullInventorySnapshot(packet);
             refreshPlannedRepairToolKeepSlots(packet);
             recordDumpFullInventoryObservation(packet);
+            if (!inventorySwapConsistent) return;
         } else if (receivedPacket
             instanceof ClientboundContainerSetSlotPacket packet) {
             serverInventoryUpdateSequence++;
@@ -5116,6 +5124,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         automaticRegisteredItemCounts.clear();
         automaticShulkerContentCounts.clear();
         automaticShulkerToolStacks.clear();
+        automaticShulkerToolMinimumEfficiency.clear();
         automaticShulkerInaccessibleWarnings.clear();
         automaticShulkerRegistrationTarget = null;
         automaticShulkerRegistrationComplete = false;
@@ -5129,11 +5138,52 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             BlockPos shulker = automaticConfigBlockPos(
                 savedStation.block()
             );
-            Vec3 openPosition = automaticShulkerSouthOpenPosition(shulker);
+            boolean shulkerChunkLoaded = mc.level.getChunkSource().hasChunk(
+                    shulker.getX() >> 4,
+                    shulker.getZ() >> 4
+                );
+            if (shulkerChunkLoaded
+                && !(mc.level.getBlockState(shulker).getBlock()
+                    instanceof ShulkerBoxBlock)) {
+                warning(
+                    "Cannot reuse saved shulker at "
+                        + shulker.toShortString()
+                        + " because the loaded world no longer contains a "
+                        + "shulker there."
+                );
+                continue;
+            }
+            Vec3 savedOpenPosition = automaticConfigVec3(
+                savedStation.openPosition()
+            );
+            BlockPos savedFeet = BlockPos.containing(savedOpenPosition);
+            BlockPos requiredFeet = shulker.relative(
+                Direction.SOUTH,
+                AUTOMATIC_SHULKER_INTERACTION_OFFSET
+            );
+            if (!savedFeet.equals(requiredFeet)
+                || !savedOpenPosition.equals(Vec3.atBottomCenterOf(
+                    requiredFeet
+                ))) {
+                warning(
+                    "Cannot reuse saved shulker at "
+                        + shulker.toShortString()
+                        + " because its stored access point is not the "
+                        + "required south-side Z+2 standing cell."
+                );
+                continue;
+            }
+            boolean standingChunkLoaded = mc.level.getChunkSource().hasChunk(
+                savedFeet.getX() >> 4,
+                savedFeet.getZ() >> 4
+            );
+            Vec3 openPosition = standingChunkLoaded
+                ? automaticShulkerSouthOpenPosition(shulker)
+                : savedOpenPosition;
             if (openPosition == null) {
                 automaticShulkerInaccessibleWarnings.add(shulker);
                 warning(
-                    "Cannot recheck saved shulker at "
+                    "Cannot reuse saved shulker at "
                         + shulker.toShortString()
                         + ": its south-side standing cell at Z+2 is not "
                         + "reachable with a solid floor and two air blocks."
@@ -5147,6 +5197,26 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             automaticShulkerStations.put(station.getA(), station);
             remaining.add(station);
         }
+        boolean restoredRegistry =
+            restoreSavedAutomaticShulkerRegistry(snapshot);
+        if (restoredRegistry
+            && validateAutomaticShulkerCoverage(false)) {
+            automaticShulkerRegistrationComplete = true;
+            activeConfigSha256 =
+                automaticShulkerConfigurationFingerprint();
+            state = State.SelectingChests;
+            info(
+                "Loaded the verified Printing Only setup and shulker "
+                    + "registry; no shulker re-registration is needed for "
+                    + "this NBT."
+            );
+            automaticallyStartPrintingAfterRegistration(
+                "saved shulker configuration"
+            );
+            return true;
+        }
+
+        clearAutomaticShulkerRegistryContents();
         Vec3 cursor = mc.player.position();
         while (!remaining.isEmpty()) {
             Vec3 nearestFrom = cursor;
@@ -5181,6 +5251,96 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         return true;
     }
 
+    private boolean restoreSavedAutomaticShulkerRegistry(
+        PrintingOnlyConfigStore.Snapshot snapshot
+    ) {
+        if (!PrintingOnlyConfigStore.hasReusableShulkerRegistry(snapshot)) {
+            return false;
+        }
+        try {
+            for (PrintingOnlyConfigStore.StationInventory inventory
+                : snapshot.shulkerInventories()) {
+                BlockPos shulker = automaticConfigBlockPos(
+                    inventory.block()
+                );
+                Tuple<BlockPos, Vec3> station =
+                    automaticShulkerStations.get(shulker);
+                if (station == null) return false;
+
+                HashMap<Item, Integer> counts = new HashMap<>();
+                for (PrintingOnlyConfigStore.StoredItem savedItem
+                    : inventory.items()) {
+                    Item item = BuiltInRegistries.ITEM.getValue(
+                        Identifier.parse(savedItem.itemId())
+                    );
+                    if (item == Items.AIR) return false;
+                    counts.put(item, savedItem.count());
+                    automaticRegisteredItemCounts.merge(
+                        item,
+                        savedItem.count(),
+                        Math::addExact
+                    );
+                    materialDict.computeIfAbsent(
+                        item,
+                        ignored -> new ArrayList<>()
+                    ).add(station);
+                }
+
+                ArrayList<ItemStack> tools = new ArrayList<>();
+                HashMap<Item, Integer> toolEfficiencies =
+                    new HashMap<>();
+                for (PrintingOnlyConfigStore.StoredTool savedTool
+                    : inventory.tools()) {
+                    Item item = BuiltInRegistries.ITEM.getValue(
+                        Identifier.parse(savedTool.itemId())
+                    );
+                    ItemStack template = new ItemStack(item);
+                    if (item == Items.AIR
+                        || !template.is(ItemTags.PICKAXES)) {
+                        return false;
+                    }
+                    tools.add(template);
+                    toolEfficiencies.put(
+                        item,
+                        savedTool.minimumEfficiency()
+                    );
+                }
+                automaticShulkerContentCounts.put(
+                    new BlockPos(shulker),
+                    counts
+                );
+                automaticShulkerToolStacks.put(
+                    new BlockPos(shulker),
+                    tools
+                );
+                automaticShulkerToolMinimumEfficiency.put(
+                    new BlockPos(shulker),
+                    toolEfficiencies
+                );
+            }
+            rebuildAutomaticToolRegistry();
+            return true;
+        } catch (RuntimeException malformedRegistry) {
+            warning(
+                "The saved shulker item registry could not be restored: "
+                    + malformedRegistry.getMessage()
+                    + ". Rechecking the saved stations once."
+            );
+            return false;
+        }
+    }
+
+    private void clearAutomaticShulkerRegistryContents() {
+        materialDict.clear();
+        toolSet.clear();
+        registeredToolMinimumEfficiency.clear();
+        automaticRegisteredItemCounts.clear();
+        automaticShulkerContentCounts.clear();
+        automaticShulkerToolStacks.clear();
+        automaticShulkerToolMinimumEfficiency.clear();
+        registerCarriedAutomaticTools();
+    }
+
     private void saveAutomaticPrintingConfig() {
         if (!printingOnly.get()
             || automaticConfigPersistenceSuppressed
@@ -5208,6 +5368,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         station.block().x())
                     .thenComparingInt(station -> station.block().y())
                 .thenComparingInt(station -> station.block().z()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        ArrayList<PrintingOnlyConfigStore.StationInventory>
+            stationInventories = stations.stream()
+                .map(station -> automaticConfigStationInventory(
+                    automaticConfigBlockPos(station.block())
+                ))
                 .collect(Collectors.toCollection(ArrayList::new));
         int savedScanRadius = stations.stream()
             .mapToInt(station -> Math.max(
@@ -5243,6 +5409,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 bed == null ? null : automaticConfigStation(bed),
                 automaticConfigPosition(automaticShulkerLineAnchor),
                 stations,
+                stationInventories,
                 System.currentTimeMillis()
             );
         try {
@@ -5342,6 +5509,43 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         );
     }
 
+    private PrintingOnlyConfigStore.StationInventory
+        automaticConfigStationInventory(BlockPos shulker) {
+        ArrayList<PrintingOnlyConfigStore.StoredItem> items =
+            automaticShulkerContentCounts.getOrDefault(
+                shulker,
+                new HashMap<>()
+            ).entrySet().stream()
+                .sorted(Comparator.comparing(entry ->
+                    BuiltInRegistries.ITEM.getKey(entry.getKey())
+                        .toString()))
+                .map(entry -> new PrintingOnlyConfigStore.StoredItem(
+                    BuiltInRegistries.ITEM.getKey(entry.getKey())
+                        .toString(),
+                    entry.getValue()
+                ))
+                .collect(Collectors.toCollection(ArrayList::new));
+        ArrayList<PrintingOnlyConfigStore.StoredTool> tools =
+            automaticShulkerToolMinimumEfficiency.getOrDefault(
+                shulker,
+                new HashMap<>()
+            ).entrySet().stream()
+                .sorted(Comparator.comparing(entry ->
+                    BuiltInRegistries.ITEM.getKey(entry.getKey())
+                        .toString()))
+                .map(entry -> new PrintingOnlyConfigStore.StoredTool(
+                    BuiltInRegistries.ITEM.getKey(entry.getKey())
+                        .toString(),
+                    entry.getValue()
+                ))
+                .collect(Collectors.toCollection(ArrayList::new));
+        return new PrintingOnlyConfigStore.StationInventory(
+            automaticConfigPosition(shulker),
+            items,
+            tools
+        );
+    }
+
     private void beginAutomaticShulkerRegistration(BlockPos anchor) {
         if (!printingOnly.get() || mc.player == null || mc.level == null
             || dumpStation == null || blockPaletteDict == null
@@ -5372,6 +5576,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         automaticRegisteredItemCounts.clear();
         automaticShulkerContentCounts.clear();
         automaticShulkerToolStacks.clear();
+        automaticShulkerToolMinimumEfficiency.clear();
         automaticShulkerInaccessibleWarnings.clear();
         automaticShulkerLineAnchor = new BlockPos(anchor);
         automaticShulkerRegistrationTarget = new BlockPos(anchor);
@@ -5649,15 +5854,18 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             : null;
         if (complete) saveAutomaticPrintingConfig();
         state = State.SelectingChests;
-        validateAutomaticShulkerCoverage(true);
         if (complete) {
             automaticShulkerNextRescanTick = -1L;
             automaticShulkerRescanPass = 0;
             info(
-                "Automatic shulker registration complete. Interact with a "
-                    + "configured Start Block to begin printing."
+                "Automatic shulker registration complete. Printing will "
+                    + "start automatically."
+            );
+            automaticallyStartPrintingAfterRegistration(
+                "completed automatic shulker registration"
             );
         } else {
+            validateAutomaticShulkerCoverage(true);
             automaticShulkerNextRescanTick =
                 AutomaticShulkerRescanPolicy.nextRetryTick(
                     clientActionTick
@@ -5677,6 +5885,39 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     + " around the selected line anchor."
             );
         }
+    }
+
+    private boolean automaticallyStartPrintingAfterRegistration(
+        String source
+    ) {
+        if (!isActive()
+            || !printingOnly.get()
+            || state != State.SelectingChests
+            || buildingActive) {
+            return false;
+        }
+        if (fileMasterRecoveryLoaded
+            && isPrinterConfigurationReady()) {
+            info(
+                "Continuing the persisted Printing Only lifecycle "
+                    + "automatically from phase "
+                    + fileMasterRecoveredPhase + " after " + source + "."
+            );
+            freezeForRecoveryClassification();
+            state = State.AwaitFileRecovery;
+            resumeRecoveredFileMasterCycle();
+            return true;
+        }
+        if (mapCyclePhase != MapCyclePhase.IDLE) return false;
+        if (!validateStartRequirements()) return false;
+        info(
+            "Starting Printing Only automatically from the "
+                + source + "."
+        );
+        startBuilding();
+        return buildingActive
+            || state == State.AwaitFileSlaves
+            || state == State.AwaitCompactWorkspace;
     }
 
     private boolean tickAutomaticShulkerRescan() {
@@ -5755,6 +5996,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         LinkedHashSet<Item> foundItems = new LinkedHashSet<>();
         HashMap<Item, Integer> stationCounts = new HashMap<>();
         ArrayList<ItemStack> stationTools = new ArrayList<>();
+        HashMap<Item, Integer> stationToolMinimumEfficiency =
+            new HashMap<>();
         Set<Item> requiredMaterials = automaticRequiredMaterialCounts().keySet();
         clearAutomaticShulkerContents(shulker);
         for (int slot = 0; slot < containerSlots; slot++) {
@@ -5777,6 +6020,11 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
             if (repairPickaxe) {
                 stationTools.add(stack.copy());
+                stationToolMinimumEfficiency.merge(
+                    item,
+                    getEfficiencyLevel(stack),
+                    Math::max
+                );
             }
             if (requiredMaterials.contains(item)
                 || repairPickaxe
@@ -5799,6 +6047,10 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         automaticShulkerToolStacks.put(
             new BlockPos(shulker),
             stationTools
+        );
+        automaticShulkerToolMinimumEfficiency.put(
+            new BlockPos(shulker),
+            stationToolMinimumEfficiency
         );
         rebuildAutomaticToolRegistry();
         if (foundItems.isEmpty()) {
@@ -5841,6 +6093,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             }
         }
         automaticShulkerToolStacks.remove(shulker);
+        automaticShulkerToolMinimumEfficiency.remove(shulker);
         Iterator<Map.Entry<Item, ArrayList<Tuple<BlockPos, Vec3>>>>
             iterator = materialDict.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -5876,6 +6129,16 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                     Math::max
                 );
             }
+        }
+        for (HashMap<Item, Integer> efficiencies :
+            automaticShulkerToolMinimumEfficiency.values()) {
+            efficiencies.forEach((item, efficiency) ->
+                registeredToolMinimumEfficiency.merge(
+                    item,
+                    efficiency,
+                    Math::max
+                )
+            );
         }
     }
 
@@ -6946,11 +7209,20 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         String owner = pending.owner();
         MiningHotbarSwapContext failedContext =
             miningHotbarSwapContext;
-        boolean failedDuringBuild =
+        boolean failedBuildMaterialSwap =
+            buildingActive && confirmedBuildHotbarSwap.isPending();
+        boolean failedBuildRepairSwap =
             buildingActive
-                && (confirmedBuildHotbarSwap.isPending()
-                    || failedContext
-                        == MiningHotbarSwapContext.BUILD_REPAIR);
+                && failedContext
+                    == MiningHotbarSwapContext.BUILD_REPAIR;
+        boolean failedDuringBuild =
+            failedBuildMaterialSwap || failedBuildRepairSwap;
+        BuildInventoryConflictPolicy.Action recoveryAction =
+            BuildInventoryConflictPolicy.decide(
+                buildingActive,
+                failedBuildMaterialSwap,
+                failedBuildRepairSwap
+            );
         debugLog(
             "HotbarSwap",
             "conflicting authoritative state owner=" + owner
@@ -6961,15 +7233,36 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         confirmedBuildHotbarSwap.clear();
         confirmedMiningHotbarSwap.clear();
         miningHotbarSwapContext = MiningHotbarSwapContext.NONE;
+        if (recoveryAction
+            == BuildInventoryConflictPolicy.Action.RESYNC_IN_PLACE) {
+            buildInventoryResyncPending = true;
+            warning(
+                "Authoritative inventory state differed from the pending "
+                    + owner + " swap; discarding only the unconfirmed "
+                    + "swap and continuing the current U from the "
+                    + "server inventory snapshot."
+            );
+            stopBuildForAction(
+                CircularBuildMovementPolicy.HoldReason
+                    .HOTBAR_SWAP_CONFIRMATION
+            );
+            return false;
+        }
+        if (recoveryAction
+            == BuildInventoryConflictPolicy.Action.RECOVER_BUILD) {
+            warning(
+                "Authoritative inventory state made the pending repair-tool "
+                    + "identity ambiguous; using grounded build recovery "
+                    + "before another repair swap."
+            );
+            beginBuildRecovery(true);
+            return false;
+        }
         error(
             "Authoritative inventory state conflicted with the pending "
                 + owner + " swap."
         );
-        if (failedDuringBuild) {
-            stopBuildForAction();
-        } else {
-            stopForMiningHotbarSwap(failedContext);
-        }
+        stopForMiningHotbarSwap(failedContext);
         toggle();
         return false;
     }
@@ -7009,7 +7302,12 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             return;
         }
         drainReceivedPackets();
-        if (state == null) return;
+        if (state == null || !isActive()) return;
+        if (buildInventoryResyncPending) {
+            buildInventoryResyncPending = false;
+            stopMovement();
+            return;
+        }
         clientActionTick++;
         buildMovementBlockedThisTick = false;
         buildMovementHoldReasonThisTick =
@@ -7755,21 +8053,33 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 ensureActiveOrderedUNextSupport(
                     activeOrderedUTraversal
                 );
+                if (!isActive()
+                    || buildRecoveryPending
+                    || activeOrderedUTraversal() == null) {
+                    return;
+                }
                 if (!buildRecoveryPending
                     && state == State.Walking) {
                     runBuildActionScheduler();
+                }
+                if (!isActive()
+                    || buildRecoveryPending
+                    || activeOrderedUTraversal() == null) {
+                    return;
                 }
             } else if (activeOrderedUTraversal.owner()
                 == OrderedUTraversalOwner.TEARDOWN_SCAFFOLD
                 && teardownScaffoldPhase
                     == TeardownScaffoldPhase.BUILDING_OUTBOUND) {
                 runTeardownScaffoldPlacementScheduler();
+                if (!isActive()) return;
             }
             if (!activeCircularBuildMovement
                 && !buildMovementBlockedThisTick) {
                 ensureActiveOrderedUNextSupport(
                     activeOrderedUTraversal
                 );
+                if (!isActive()) return;
             }
             if (activeContinuousTeardownMovement
                 && !buildMovementBlockedThisTick
@@ -7870,6 +8180,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             activeOrderedUTraversal,
             checkpointGoal
         );
+        if (!isActive() || buildRecoveryPending) return;
         if (activeOrderedUMovement
             || followingCircularConnector
             || state == State.MiningUTraversal
@@ -10325,12 +10636,27 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             );
             return false;
         }
-        error(
-            "Server did not confirm the required hotbar swap for "
-                + Utils.itemName(expected) + "."
+        if (activeCircularBuildPair >= 0) {
+            buildInventoryResyncPending = true;
+            warning(
+                "Server did not confirm the required hotbar swap for "
+                    + Utils.itemName(expected)
+                    + "; keeping the current U, re-evaluating its inventory "
+                    + "view, and continuing every reachable block still "
+                    + "available."
+            );
+            stopBuildForAction(
+                CircularBuildMovementPolicy.HoldReason
+                    .HOTBAR_SWAP_CONFIRMATION
+            );
+            return true;
+        }
+        warning(
+            "Server did not confirm the required pre-traversal hotbar swap "
+                + "for " + Utils.itemName(expected)
+                + "; rebuilding the inventory plan from the safe area."
         );
-        stopBuildForAction();
-        toggle();
+        beginBuildRecovery(true);
         return true;
     }
 
@@ -10444,10 +10770,6 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             activeRoute == null
                 ? new HashMap<>()
                 : activeCircularPrimaryMaterialReserve(activeRoute);
-        if (activeRoute != null
-            && recoverFromActiveCircularMaterialShortfall(activeRoute)) {
-            return;
-        }
         if (!dispatchDuePlacementRetries(
             currentPrimaryWorld,
             primaryReserve,
@@ -10512,6 +10834,13 @@ public class StaircasedPrinter extends Module implements MapPrinter {
             if (!executePlacementPlan(optionalPlan)) return;
         }
 
+        if (activeRoute != null
+            && recoverFromBlockedActiveCircularMaterialShortfall(
+                activeRoute,
+                primaryTargets
+            )) {
+            return;
+        }
         if (activeRoute != null
             && enforceDeferredMandatoryCoverage(activeRoute)) {
             return;
@@ -10726,11 +11055,21 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                 CircularBuildMovementPolicy.HoldReason
                     .NEXT_ROUTE_SUPPORT_CONFIRMATION
             );
-            error(
-                "Active ordered U traversal lost its horizontal route cursor; "
-                    + "stopping before unsafe forward movement."
-            );
-            toggle();
+            if (traversal.owner()
+                == OrderedUTraversalOwner.PRINTING) {
+                warning(
+                    "Active circular printing lost its horizontal route "
+                        + "cursor; freezing and reconstructing it from the "
+                        + "confirmed support under the player."
+                );
+                beginBuildRecovery(false);
+            } else {
+                error(
+                    "Active teardown lost its horizontal route cursor; "
+                        + "stopping before unsafe forward movement."
+                );
+                toggle();
+            }
             return false;
         }
         int movementDirection =
@@ -14061,61 +14400,63 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         confirmedPrimaryMaterialUses.put(material, confirmed + 1);
     }
 
-    private boolean recoverFromActiveCircularMaterialShortfall(
-        CompactCircularNbtPlan.PairRoute route
+    private boolean recoverFromBlockedActiveCircularMaterialShortfall(
+        CompactCircularNbtPlan.PairRoute route,
+        List<PrioritizedPlacementPlanner.Target<BlockPos, Item>>
+            primaryTargets
     ) {
-        HashMap<Item, Integer> outstanding =
-            outstandingUnsubmittedPrimaryMaterialDemand(route);
+        BlockPos requiredSupport = buildMovementRequiredSupportThisTick;
+        if (requiredSupport == null || mapCorner == null) return false;
+
+        Block expected = buildTargets.get(
+            requiredSupport.subtract(mapCorner)
+        );
+        if (expected == null
+            || latestKnownBuildBlock(requiredSupport) == expected
+            || pendingPlacementLedger.isPending(requiredSupport)) {
+            return false;
+        }
+
         HashMap<Item, Integer> onHand = usableInventoryCounts();
-        for (Map.Entry<Item, Integer> entry : outstanding.entrySet()) {
-            int available = onHand.getOrDefault(entry.getKey(), 0);
-            if (available >= entry.getValue()) continue;
-
-            warning(
-                "Circular pair " + route.pairIndex() + " needs "
-                    + entry.getValue() + " more "
-                    + Utils.itemName(entry.getKey())
-                    + " but only " + available
-                    + " remain; safely leaving the U to refill and "
-                    + "resume its missing blocks."
+        int available = onHand.getOrDefault(expected.asItem(), 0);
+        boolean otherReachableMandatoryWork =
+            hasReachableSelectablePrimaryTarget(primaryTargets);
+        ActiveUInventoryRecoveryPolicy.Action action =
+            ActiveUInventoryRecoveryPolicy.decide(
+                true,
+                true,
+                available,
+                otherReachableMandatoryWork
             );
-            debugLog(
-                "InventoryPlan",
-                "active-U shortfall pair=" + route.pairIndex()
-                    + " item=" + BuiltInRegistries.ITEM.getKey(entry.getKey())
-                    + " outstanding=" + entry.getValue()
-                    + " onHand=" + available
-                    + " frozenReserve="
-                        + activeCircularPrimaryMaterialReserve(route)
-                            .getOrDefault(entry.getKey(), 0)
-            );
-            stopBuildForAction(
-                CircularBuildMovementPolicy.HoldReason
-                    .NEXT_ROUTE_SUPPORT_CONFIRMATION
-            );
-            beginBuildRecovery(true);
-            return true;
+        if (action
+            == ActiveUInventoryRecoveryPolicy.Action.CONTINUE_IN_PLACE) {
+            return false;
         }
-        return false;
-    }
 
-    private HashMap<Item, Integer>
-        outstandingUnsubmittedPrimaryMaterialDemand(
-            CompactCircularNbtPlan.PairRoute route
-        ) {
-        HashMap<Item, Integer> outstanding = new HashMap<>();
-        for (BlockPos relative :
-            currentMandatoryBuildTargets(route)) {
-            Block expected = buildTargets.get(relative);
-            if (expected == null) continue;
-            BlockPos world = mapCorner.offset(relative);
-            if (latestKnownBuildBlock(world) == expected
-                || pendingPlacementLedger.isPending(world)) {
-                continue;
-            }
-            outstanding.merge(expected.asItem(), 1, Integer::sum);
-        }
-        return outstanding;
+        warning(
+            "Circular pair " + route.pairIndex() + " used its carried "
+                + Utils.itemName(expected.asItem()) + " at the blocked "
+                + "walking frontier " + requiredSupport.toShortString()
+                + "; all other reachable required blocks were consumed, "
+                + "so it is now safely leaving the U to refill."
+        );
+        debugLog(
+            "InventoryPlan",
+            "active-U blocked-frontier shortfall pair="
+                + route.pairIndex()
+                + " support=" + requiredSupport.toShortString()
+                + " item="
+                    + BuiltInRegistries.ITEM.getKey(expected.asItem())
+                + " onHand=" + available
+                + " otherReachableMandatoryWork="
+                    + otherReachableMandatoryWork
+        );
+        stopBuildForAction(
+            CircularBuildMovementPolicy.HoldReason
+                .NEXT_ROUTE_SUPPORT_CONFIRMATION
+        );
+        beginBuildRecovery(true);
+        return true;
     }
 
     private List<BlockPos> currentMandatoryBuildTargets(
@@ -14410,8 +14751,8 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         Vec3 checkpointGoal
     ) {
         if (traversal == null) return checkpointGoal;
-        if (traversal.owner() == OrderedUTraversalOwner.PRINTING
-            && CircularBuildCheckpointPlan.checkpointOwnsSteering(
+        if (traversal.owner() == OrderedUTraversalOwner.PRINTING) {
+            CircularBuildCheckpointPlan.TraversalPhase traversalPhase =
                 switch (circularBuildPhase) {
                     case OUTBOUND ->
                         CircularBuildCheckpointPlan.TraversalPhase.OUTBOUND;
@@ -14419,13 +14760,36 @@ public class StaircasedPrinter extends Module implements MapPrinter {
                         CircularBuildCheckpointPlan.TraversalPhase.CONNECTOR;
                     case RETURN ->
                         CircularBuildCheckpointPlan.TraversalPhase.RETURN;
-                    default -> throw new IllegalStateException(
-                        "Active circular printing has no traversal phase."
-                    );
-                },
+                    default -> null;
+                };
+            if (traversalPhase == null) {
+                warning(
+                    "Circular traversal phase changed while movement was "
+                        + "being evaluated; freezing and rebuilding the "
+                        + "route cursor instead of continuing stale motion."
+                );
+                beginBuildRecovery(false);
+                return mc.player == null
+                    ? checkpointGoal
+                    : mc.player.position();
+            }
+            if (CircularBuildCheckpointPlan.checkpointOwnsSteering(
+                traversalPhase,
                 activeOrderedUMovementDirection(traversal)
-            )) {
-            return checkpointGoal;
+            )) return checkpointGoal;
+        }
+        if (activeCircularRouteSupportIndex < 0
+            || activeCircularRouteSupportIndex
+                >= traversal.supports().size()) {
+            if (traversal.owner()
+                == OrderedUTraversalOwner.PRINTING) {
+                beginBuildRecovery(false);
+            } else {
+                beginMiningRecovery(false);
+            }
+            return mc.player == null
+                ? checkpointGoal
+                : mc.player.position();
         }
         return currentActiveOrderedUMovementGoal(traversal);
     }
@@ -20672,6 +21036,7 @@ public class StaircasedPrinter extends Module implements MapPrinter {
         confirmedBuildHotbarSwap.clear();
         confirmedMiningHotbarSwap.clear();
         clearPendingInventorySwapState();
+        buildInventoryResyncPending = false;
         repairToolShadows.clear();
         miningHotbarSwapContext = MiningHotbarSwapContext.NONE;
         releaseBuildRepairSpeedMine();
